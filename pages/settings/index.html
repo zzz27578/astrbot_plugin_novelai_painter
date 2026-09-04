@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NovelAI Painter 设置</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div class="brand"><div class="brand-mark">N</div><div><div class="eyebrow">ASTRBOT EXTENSION</div><h1>NovelAI Painter</h1><p>安全、可控的生图入口与参考图工作台</p></div></div>
+      <div class="actions"><span id="dirty" class="dirty">未修改</span><button id="save" class="btn primary" type="button"><span class="icon">✓</span>保存配置</button></div>
+    </header>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <section class="status-row" aria-label="运行状态">
+      <div class="status-card"><span class="status-dot" id="provider-dot"></span><div><span class="label">当前后端</span><strong id="provider-status">读取中</strong></div></div>
+      <div class="status-card"><span class="metric-icon">↯</span><div><span class="label">入口策略</span><strong id="mode-status">读取中</strong></div></div>
+      <div class="status-card"><span class="metric-icon">1</span><div><span class="label">单任务请求上限</span><strong>1 次 / 1 张图</strong></div></div>
+      <div class="status-card"><span class="metric-icon">⌁</span><div><span class="label">队列与去重</span><strong id="guard-status">读取中</strong></div></div>
+    </section>
+    <nav class="tabs" role="tablist">
+      <button class="tab active" data-tab="provider" role="tab">连接与模型</button>
+      <button class="tab" data-tab="access" role="tab">入口与权限</button>
+      <button class="tab" data-tab="presets" role="tab">人物 / 画风预设</button>
+      <button class="tab" data-tab="reference" role="tab">参考图与图生图</button>
+      <button class="tab" data-tab="jobs" role="tab">任务记录</button>
+    </nav>
+    <section class="panel active" data-panel="provider">
+      <div class="section-head"><div><span class="kicker">01 / PROVIDER</span><h2>连接与模型</h2><p>选择官方 NovelAI 或 OpenAI / NewAPI 兼容后端。密钥只在插件配置中保存，不会显示在日志或接口响应里。</p></div><button id="test-provider" class="btn secondary" type="button">测试连接</button></div>
+      <div class="grid two">
+        <label class="field"><span>后端类型</span><select data-config="provider"><option value="novelai_official">NovelAI 官方</option><option value="openai_compatible">OpenAI / NewAPI 兼容</option></select></label>
+        <label class="field"><span>模型 ID</span><input data-config="model" type="text" placeholder="nai-diffusion-5-full" /><small>可填写任意后端实际支持的模型 ID。</small></label>
+        <label class="field official-only"><span>官方 Base URL</span><input data-config="base_url" type="url" placeholder="https://image.novelai.net" /></label>
+        <label class="field official-only"><span>NovelAI Persistent Token</span><input data-config="api_token" type="password" placeholder="留空则保留已保存 Token" autocomplete="off" /><small>保存后以掩码显示。</small></label>
+        <label class="field compatible-only"><span>兼容 Base URL</span><input data-config="openai_base_url" type="url" placeholder="https://your-newapi.example.com" /></label>
+        <label class="field compatible-only"><span>API Key</span><input data-config="api_key" type="password" placeholder="留空则保留已保存 Key" autocomplete="off" /></label>
+        <label class="field compatible-only"><span>图片生成端点</span><input data-config="openai_image_endpoint" type="text" placeholder="/v1/images/generations" /></label>
+        <label class="field compatible-only"><span>图生图端点</span><input data-config="openai_edit_endpoint" type="text" placeholder="/v1/images/edits" /></label>
+      </div>
+      <div class="capability" id="capability"></div>
+      <div class="divider"></div>
+      <div class="section-head compact"><div><span class="kicker">基础参数</span><h3>生成默认值</h3></div></div>
+      <div class="grid four">
+        <label class="field"><span>宽度</span><input data-config="width" type="number" min="64" max="2048" step="64" /></label>
+        <label class="field"><span>高度</span><input data-config="height" type="number" min="64" max="2048" step="64" /></label>
+        <label class="field"><span>Steps</span><input data-config="steps" type="number" min="1" max="50" /></label>
+        <label class="field"><span>Scale</span><input data-config="scale" type="number" min="1" max="20" step="0.1" /></label>
+      </div>
+      <div class="grid two">
+        <label class="field"><span>Sampler</span><select data-config="sampler"><option>k_euler_ancestral</option><option>k_euler</option><option>k_dpmpp_2s_ancestral</option><option>k_dpmpp_2m</option><option>k_dpmpp_sde</option></select></label>
+        <label class="switch-row"><input data-config="quality_toggle" type="checkbox" /><span><b>自动加入质量前缀</b><small>在用户提示词前加入 masterpiece, best quality, highres。</small></span></label>
+        <label class="field full"><span>全局负面提示词</span><textarea data-config="negative_prompt" rows="4" placeholder="lowres, blurry ..."></textarea></label>
+      </div>
+    </section>
+    <section class="panel" data-panel="access">
+      <div class="section-head"><div><span class="kicker">02 / ACCESS</span><h2>入口与权限</h2><p>默认只开放固定命令，群聊仅管理员可用。无论命令还是 LLM 工具，都会经过同一套权限检查。</p></div></div>
+      <div class="notice info"><span class="notice-icon">i</span><div><b>安全默认值</b><p>固定命令和自主调用可以四选一；群聊策略默认管理员；一次任务最多发起一次 API 请求并返回一张图片。</p></div></div>
+      <div class="grid two">
+        <label class="field"><span>入口模式</span><select data-config="invoke_mode"><option value="disabled">全部禁用</option><option value="command_only">仅固定命令</option><option value="llm_tool_only">仅 LLM 自主调用</option><option value="both">命令 + LLM 工具</option></select></label>
+        <label class="field"><span>私聊权限</span><select data-config="private_access"><option value="all">所有人</option><option value="admin_only">仅管理员</option><option value="allowlist">白名单</option><option value="disabled">禁用</option></select></label>
+        <label class="field"><span>群聊权限</span><select data-config="group_access"><option value="admin_only">仅管理员</option><option value="all">所有成员</option><option value="allowlist">白名单</option><option value="disabled">禁用</option></select></label>
+        <label class="switch-row"><input data-config="admin_bypass" type="checkbox" /><span><b>管理员绕过策略</b><small>管理员不受白名单限制，但仍受入口模式限制。</small></span></label>
+        <label class="field full"><span>用户白名单</span><textarea data-config="allowed_users" rows="3" placeholder="每行一个用户 ID，也可用逗号分隔"></textarea></label>
+        <label class="field full"><span>群聊白名单</span><textarea data-config="allowed_groups" rows="3" placeholder="每行一个群 ID，也可用逗号分隔"></textarea></label>
+      </div>
+      <div class="divider"></div>
+      <div class="grid two">
+        <label class="switch-row"><input data-config="legacy_command_enabled" type="checkbox" /><span><b>兼容 /nai &lt;描述&gt;</b><small>关闭后要求使用 /nai draw、/nai img2img、/nai reference。</small></span></label>
+        <label class="switch-row"><input data-config="show_queue_notice" type="checkbox" /><span><b>发送排队提示</b><small>任务等待锁时发送一条提示。</small></span></label>
+      </div>
+    </section>
+    <section class="panel" data-panel="presets">
+      <div class="section-head"><div><span class="kicker">03 / PRESETS</span><h2>人物与画风预设</h2><p>将人物锚定词和画风锚定词独立保存，按默认预设或当前 AstrBot 人设映射自动应用。不会把完整系统人格发送给图片服务。</p></div><button id="add-preset" class="btn primary" type="button">新建预设</button></div>
+      <label class="field" style="margin-bottom:16px;max-width:420px"><span>默认预设</span><select id="default-preset"><option value="">不使用默认预设</option></select><small>当前 AstrBot 人设映射未命中时使用。</small></label><div id="preset-list" class="preset-list"></div><div class="divider"></div><div class="section-head compact"><div><span class="kicker">人设匹配</span><h3>按 AstrBot 人设自动选择预设</h3><p>只保存人设 ID 到预设 ID 的映射，不会读取或上传完整系统人格内容。</p></div></div><div id="persona-mappings" class="preset-list"></div>
+      <div id="preset-editor" class="editor hidden">
+        <div class="editor-head"><div><span class="kicker">编辑预设</span><h3 id="preset-editor-title">新建预设</h3></div><button id="close-editor" class="icon-btn" type="button" aria-label="关闭">×</button></div>
+        <input id="preset-id" type="hidden" />
+        <div class="grid two"><label class="field"><span>名称</span><input id="preset-name" type="text" /></label><label class="field"><span>绑定人设 ID（可选）</span><input id="preset-persona" type="text" placeholder="填写 AstrBot 人设 ID" /></label><label class="field"><span>参考图 ID（可选）</span><input id="preset-reference" type="text" placeholder="从参考图列表复制 ID" /></label><label class="field"><span>参考类型</span><select id="preset-reference-type"><option value="character">人物参考</option><option value="style">画风参考</option><option value="both">人物 + 画风</option></select></label><label class="field full"><span>说明</span><input id="preset-description" type="text" /></label><label class="field full"><span>画风锚定词</span><textarea id="preset-style" rows="4" placeholder="anime illustration, soft lighting ..."></textarea></label><label class="field full"><span>人物锚定词</span><textarea id="preset-character" rows="4" placeholder="silver hair, blue eyes ..."></textarea></label><label class="field full"><span>预设负面词</span><textarea id="preset-negative" rows="3"></textarea></label></div>
+        <div class="editor-actions"><button id="delete-preset" class="btn danger ghost" type="button">删除预设</button><span></span><button id="cancel-preset" class="btn secondary" type="button">取消</button><button id="save-preset" class="btn primary" type="button">保存预设</button></div>
+      </div>
+    </section>
+    <section class="panel" data-panel="reference">
+      <div class="section-head"><div><span class="kicker">04 / REFERENCE</span><h2>参考图与图生图</h2><p>官方 NovelAI 后端支持图生图和 Precise Reference。先上传图片，再绑定到预设；OpenAI 兼容后端使用标准 images/edits，参考图增强能力由上游决定。</p></div></div>
+      <div class="reference-upload"><label class="upload-box"><input id="reference-file" type="file" accept="image/png,image/jpeg,image/webp" /><span class="upload-icon">＋</span><b>选择参考图</b><small>PNG / JPEG / WebP，最大 12MB</small></label><button id="upload-reference" class="btn secondary" type="button">上传参考图</button></div>
+      <div id="reference-list" class="reference-list"></div>
+      <div class="divider"></div>
+      <div class="grid three"><label class="field"><span>图生图强度</span><input data-config="img2img_strength" type="number" min="0" max="1" step="0.05" /><small>官方 strength。</small></label><label class="field"><span>图生图噪声</span><input data-config="img2img_noise" type="number" min="0" max="1" step="0.05" /></label><label class="switch-row"><input data-config="img2img_color_correct" type="checkbox" /><span><b>颜色校正</b><small>保持输入图的色彩倾向。</small></span></label><label class="field"><span>参考图 Strength</span><input data-config="reference_strength" type="number" min="0" max="1" step="0.05" /></label><label class="field"><span>参考图 Fidelity</span><input data-config="reference_fidelity" type="number" min="0" max="1" step="0.05" /></label><label class="field"><span>信息提取程度</span><input data-config="reference_information_extracted" type="number" min="0" max="1" step="0.05" /></label></div>
+      <div class="notice warn"><span class="notice-icon">!</span><div><b>Precise Reference 提示</b><p>参考图会增加服务消耗；Strength 越高越贴近参考图，Fidelity 越高越难被提示词覆盖。多张人物参考图可能被融合为一个角色。</p></div></div>
+    </section>
+    <section class="panel" data-panel="jobs">
+      <div class="section-head"><div><span class="kicker">05 / JOBS</span><h2>任务记录</h2><p>仅显示本次插件运行期间的最近任务，不保存提示词原文和密钥。</p></div><button id="refresh-jobs" class="btn secondary" type="button">刷新记录</button></div>
+      <div id="job-list" class="job-list"></div>
+    </section>
+    <footer class="footer"><span>保存后会立即更新运行配置。</span><button id="save-bottom" class="btn primary" type="button">保存配置</button></footer>
+  </main>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

@@ -1,65 +1,176 @@
 {
+  "config_version": {
+    "type": "int",
+    "default": 2,
+    "invisible": true
+  },
+  "provider": {
+    "description": "生图后端",
+    "type": "string",
+    "default": "novelai_official",
+    "options": [
+      "novelai_official",
+      "openai_compatible"
+    ],
+    "hint": "官方 NovelAI 或 OpenAI / NewAPI 兼容模式。",
+    "labels": {
+      "novelai_official": "NovelAI 官方",
+      "openai_compatible": "OpenAI / NewAPI 兼容"
+    }
+  },
   "api_token": {
-    "description": "NovelAI Persistent API Token (设置 -> Account 获取)",
+    "description": "NovelAI Persistent Token",
     "type": "string",
     "default": "",
-    "hint": "持久 API Token，请求头会自动带 Authorization: Bearer <Token>"
+    "secret": true,
+    "obvious_hint": true,
+    "hint": "仅官方模式使用；不会在页面回显。"
+  },
+  "api_key": {
+    "description": "OpenAI / NewAPI API Key",
+    "type": "string",
+    "default": "",
+    "secret": true,
+    "obvious_hint": true,
+    "hint": "仅兼容模式使用；不会在页面回显。"
   },
   "base_url": {
-    "description": "NovelAI 生图端点 Base URL",
+    "description": "NovelAI 官方 Base URL",
     "type": "string",
-    "default": "https://image.novelai.net",
-    "hint": "官方生图端点通常为 https://image.novelai.net 或反代地址"
+    "default": "https://image.novelai.net"
+  },
+  "openai_base_url": {
+    "description": "OpenAI / NewAPI Base URL",
+    "type": "string",
+    "default": ""
+  },
+  "openai_image_endpoint": {
+    "description": "兼容模式文生图端点",
+    "type": "string",
+    "default": "/v1/images/generations"
+  },
+  "openai_edit_endpoint": {
+    "description": "兼容模式图生图端点",
+    "type": "string",
+    "default": "/v1/images/edits"
   },
   "model": {
-    "description": "生成模型选择 (2026最新 V5 系列已支持)",
+    "description": "模型 ID",
     "type": "string",
-    "default": "nai-diffusion-5-full",
-    "options": [
-      "nai-diffusion-5-full",
-      "nai-diffusion-5-curated",
-      "nai-diffusion-4-5-full",
-      "nai-diffusion-4-full",
-      "nai-diffusion-3",
-      "nai-diffusion-furry-3",
-      "custom"
-    ],
-    "hint": "默认推荐最新 2026 V5 Full 模型；若选 custom 请在下方填入自定义 ID"
+    "default": "nai-diffusion-5-full"
   },
   "custom_model": {
-    "description": "自定义模型 ID (留空则以上方下拉为准)",
+    "description": "自定义模型 ID",
     "type": "string",
-    "default": "",
-    "hint": "用于后续新版本或未列出模型的手动输入"
+    "default": ""
+  },
+  "invoke_mode": {
+    "description": "入口模式",
+    "type": "string",
+    "default": "command_only",
+    "options": [
+      "disabled",
+      "command_only",
+      "llm_tool_only",
+      "both"
+    ],
+    "labels": {
+      "disabled": "全部禁用",
+      "command_only": "仅固定命令",
+      "llm_tool_only": "仅 LLM 工具",
+      "both": "命令 + LLM 工具"
+    }
+  },
+  "private_access": {
+    "description": "私聊权限",
+    "type": "string",
+    "default": "all",
+    "options": [
+      "all",
+      "admin_only",
+      "allowlist",
+      "disabled"
+    ],
+    "labels": {
+      "all": "所有人",
+      "admin_only": "仅管理员",
+      "allowlist": "白名单",
+      "disabled": "禁用"
+    }
+  },
+  "group_access": {
+    "description": "群聊权限",
+    "type": "string",
+    "default": "admin_only",
+    "options": [
+      "admin_only",
+      "all",
+      "allowlist",
+      "disabled"
+    ],
+    "labels": {
+      "admin_only": "仅管理员",
+      "all": "所有成员",
+      "allowlist": "白名单",
+      "disabled": "禁用"
+    }
+  },
+  "allowed_users": {
+    "description": "用户白名单",
+    "type": "list",
+    "default": [],
+    "items": {
+      "type": "string"
+    }
+  },
+  "allowed_groups": {
+    "description": "群聊白名单",
+    "type": "list",
+    "default": [],
+    "items": {
+      "type": "string"
+    }
+  },
+  "admin_bypass": {
+    "description": "管理员绕过白名单",
+    "type": "bool",
+    "default": true
+  },
+  "legacy_command_enabled": {
+    "description": "兼容 /nai <描述>",
+    "type": "bool",
+    "default": true
   },
   "width": {
-    "description": "画布宽度 (Width)",
+    "description": "默认宽度",
     "type": "int",
     "default": 832,
-    "hint": "标准竖图: 832，方图: 1024，横图: 1216"
+    "min": 64,
+    "max": 2048
   },
   "height": {
-    "description": "画布高度 (Height)",
+    "description": "默认高度",
     "type": "int",
     "default": 1216,
-    "hint": "标准竖图: 1216，方图: 1024，横图: 832"
+    "min": 64,
+    "max": 2048
   },
   "steps": {
-    "description": "迭代步数 (Steps)",
+    "description": "采样步数",
     "type": "int",
     "default": 28,
     "min": 1,
-    "max": 50,
-    "hint": "推荐 28，范围 1-50"
+    "max": 50
   },
   "scale": {
-    "description": "提示词引导强度 (Prompt Guidance / Scale)",
+    "description": "提示词引导强度",
     "type": "float",
-    "default": 5.0,
-    "hint": "推荐 5.0，范围 1.0 - 10.0"
+    "default": 5,
+    "min": 1,
+    "max": 20
   },
   "sampler": {
-    "description": "采样器 (Sampler)",
+    "description": "采样器",
     "type": "string",
     "default": "k_euler_ancestral",
     "options": [
@@ -68,45 +179,147 @@
       "k_dpmpp_2s_ancestral",
       "k_dpmpp_2m",
       "k_dpmpp_sde"
-    ],
-    "hint": "推荐 k_euler_ancestral"
+    ]
   },
   "negative_prompt": {
-    "description": "屏蔽词 / 负面提示词 (Negative Prompt)",
+    "description": "全局负面提示词",
     "type": "text",
-    "default": "lowres, blurry, bad anatomy, bad hands, text, watermark, error, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality, normal quality, jpeg artifacts, signature, username",
-    "hint": "排除的特征或质感词，英文逗号分隔"
+    "default": "lowres, blurry, bad anatomy, bad hands, text, watermark, error, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality, jpeg artifacts, signature, username"
   },
   "quality_toggle": {
-    "description": "画质增强开关 (Quality Toggle)",
+    "description": "自动加入质量前缀",
     "type": "bool",
-    "default": true,
-    "hint": "自动附加官方推荐的高画质前缀"
+    "default": true
   },
-  "max_retries": {
-    "description": "429/异常最大重试次数 (Max Retries)",
+  "images_per_request": {
+    "description": "一次任务图片数（强制上限为 1）",
     "type": "int",
-    "default": 3,
+    "default": 1,
     "min": 1,
-    "max": 10,
-    "hint": "遭遇 429 Too Many Requests 时最大自动退避重试次数，超过则强制中断"
+    "max": 1,
+    "invisible": true
   },
-  "retry_delay": {
-    "description": "429 基础退避等待时长 (秒)",
-    "type": "float",
-    "default": 5.0,
-    "hint": "遭遇 429 后的基础避让等待秒数，每次重试将阶梯递增"
+  "max_api_requests_per_job": {
+    "description": "一次任务 API 请求数（强制上限为 1）",
+    "type": "int",
+    "default": 1,
+    "min": 1,
+    "max": 1,
+    "invisible": true
+  },
+  "dedupe_window_seconds": {
+    "description": "重复事件去重窗口（秒）",
+    "type": "int",
+    "default": 30,
+    "min": 1,
+    "max": 300
   },
   "queue_timeout": {
-    "description": "排队等待最大超时 (秒)",
+    "description": "排队超时（秒）",
     "type": "int",
     "default": 120,
-    "hint": "单并发排队锁最大等待时间，超时后自动取消并释放队列"
+    "min": 1,
+    "max": 600
+  },
+  "retry_mode": {
+    "description": "重试策略",
+    "type": "string",
+    "default": "none",
+    "options": [
+      "none"
+    ],
+    "labels": {
+      "none": "关闭自动重试（防止重复生图）"
+    }
+  },
+  "retry_delay": {
+    "description": "兼容字段：重试等待（秒）",
+    "type": "float",
+    "default": 5,
+    "invisible": true
+  },
+  "error_notify_mode": {
+    "description": "错误提示",
+    "type": "string",
+    "default": "final_only",
+    "options": [
+      "silent",
+      "final_only",
+      "admin_only"
+    ],
+    "labels": {
+      "silent": "静默，仅日志",
+      "final_only": "发送最终结果",
+      "admin_only": "仅管理员可见"
+    }
+  },
+  "show_queue_notice": {
+    "description": "发送排队提示",
+    "type": "bool",
+    "default": true
+  },
+  "show_retry_notice": {
+    "description": "兼容字段：发送重试提示",
+    "type": "bool",
+    "default": false,
+    "invisible": true
   },
   "auto_clean_delay": {
-    "description": "临时图片留存自动清理延迟 (秒)",
+    "description": "临时图片清理延迟（秒）",
     "type": "int",
-    "default": 60,
-    "hint": "图片发送后自动清理临时文件的延迟时间，避免占用服务器硬盘空间"
+    "default": 300,
+    "min": 0,
+    "max": 86400
+  },
+  "default_preset_id": {
+    "description": "默认预设 ID",
+    "type": "string",
+    "default": ""
+  },
+  "persona_preset_map": {
+    "description": "AstrBot 人设到预设的映射",
+    "type": "dict",
+    "default": {},
+    "invisible": true
+  },
+  "img2img_strength": {
+    "description": "图生图强度",
+    "type": "float",
+    "default": 0.7,
+    "min": 0,
+    "max": 1
+  },
+  "img2img_noise": {
+    "description": "图生图噪声",
+    "type": "float",
+    "default": 0.1,
+    "min": 0,
+    "max": 1
+  },
+  "img2img_color_correct": {
+    "description": "图生图颜色校正",
+    "type": "bool",
+    "default": true
+  },
+  "reference_strength": {
+    "description": "Precise Reference Strength",
+    "type": "float",
+    "default": 0.6,
+    "min": 0,
+    "max": 1
+  },
+  "reference_fidelity": {
+    "description": "Precise Reference Fidelity",
+    "type": "float",
+    "default": 0.6,
+    "min": 0,
+    "max": 1
+  },
+  "reference_information_extracted": {
+    "description": "参考图信息提取程度",
+    "type": "float",
+    "default": 1,
+    "min": 0,
+    "max": 1
   }
 }
