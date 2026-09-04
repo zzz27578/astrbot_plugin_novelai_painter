@@ -4,9 +4,9 @@
 
 ## 主要能力
 
-- NovelAI 官方后端：文生图、图生图、V4/V4.5/V5 参数、Precise Reference / Character Reference / Style Reference。
+- NovelAI 官方后端：文生图、图生图、V5 / V4.5 / V4 / V3 官方模型下拉选择、Precise Reference / Character Reference / Style Reference。
 - OpenAI / NewAPI 兼容后端：/v1/images/generations 与 /v1/images/edits。
-- 入口四选一：全部禁用、仅固定命令、仅 LLM 工具、两者都启用。
+- 入口四选一：全部禁用、仅固定命令、仅 LLM 工具、两者都启用；固定命令名可在 WebUI 修改，默认是 /nai。
 - 私聊 / 群聊权限：所有人、仅管理员、白名单、禁用；管理员绕过白名单可单独控制。
 - 严格安全上限：默认一次事件最多一个任务、一次 API 请求、一次一张图片；超时和 429 默认不自动重试，避免重复扣费或重复生图。
 - 消息去重：按消息 ID 或事件指纹做短窗口去重。
@@ -40,13 +40,13 @@ LLM 工具名称为 novelai_generate_image。只有在入口模式启用、用�
 
 页面中的设置分为：
 
-1. 连接与模型：NovelAI 官方或 OpenAI/NewAPI 兼容模式、地址、密钥、模型、尺寸、Steps、Scale、Sampler、负面提示词。
+1. 连接与模型：NovelAI 官方模型下拉列表、OpenAI/NewAPI 兼容模式、地址、密钥、鉴权请求头/前缀、尺寸、Steps、Scale、Sampler、负面提示词。
 2. 入口与权限：命令 / LLM 工具开关、私聊和群聊策略、白名单、管理员绕过、排队提示。
 3. 人物 / 画风预设：创建、编辑、删除、绑定 AstrBot 人设 ID、保存人物锚定词和画风锚定词。
-4. 参考图与图生图：上传、删除、图生图 Strength/Noise、Precise Reference Strength/Fidelity。
+4. 参考图与图生图：总开关、上传、删除、绑定、图生图 Strength/Noise、颜色校正、Precise Reference Strength/Fidelity。
 5. 任务记录：查看本次运行期间的最近任务状态，不保存完整提示词和密钥。
 
-点击顶部或底部“保存配置”后会立即写入插件配置，并通过页面提示保存结果。
+点击顶部或底部“保存配置”后会立即写入插件配置，并通过页面提示保存结果。保存失败也会返回可读的中文错误，不依赖 Dashboard 的原始错误响应。
 
 ## 安全行为
 

@@ -17,3 +17,5 @@
 @media (max-width:640px) { .shell { padding:20px 14px 40px; } .topbar,.section-head,.footer { flex-direction:column; align-items:stretch; } .actions { justify-content:space-between; } .status-row,.grid.two,.grid.three,.grid.four { grid-template-columns:1fr; } .panel { padding:20px 16px; } .tabs { margin-left:-2px; margin-right:-2px; } .reference-upload,.editor-actions { flex-wrap:wrap; } .reference-upload .btn { flex:1; } .preset-card,.reference-card,.job-card { flex-direction:column; align-items:stretch; } .card-actions { justify-content:flex-end; } }
 @media (prefers-reduced-motion:reduce) { *,*::before,*::after { transition-duration:.01ms !important; animation-duration:.01ms !important; } }
 .empty { padding:24px; color:var(--muted); text-align:center; border:1px dashed var(--line); border-radius:12px; background:var(--surface-2); }
+.custom-model-only { display:none; } body.custom-model .custom-model-only { display:flex; } .preset-columns { display:grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap:24px; } @media (max-width:900px) { .preset-columns { grid-template-columns:1fr; } }
+body.compatible .custom-model-only { display:flex; }

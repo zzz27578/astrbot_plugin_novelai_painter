@@ -34,7 +34,7 @@ except ImportError:
 from astrbot.core.message.message_event_result import MessageChain
 
 PLUGIN_NAME = "astrbot_plugin_novelai_painter"
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 DEFAULT_MODEL = "nai-diffusion-5-full"
 DEFAULT_NEGATIVE = (
     "lowres, blurry, bad anatomy, bad hands, text, watermark, error, missing fingers, "
@@ -92,8 +92,11 @@ class NovelAIPainterPlugin(Star):
             "openai_base_url": "",
             "openai_image_endpoint": "/v1/images/generations",
             "openai_edit_endpoint": "/v1/images/edits",
+            "openai_auth_header": "Authorization",
+            "openai_auth_prefix": "Bearer",
             "model": DEFAULT_MODEL,
             "custom_model": "",
+            "command_prefix": "nai",
             "invoke_mode": "command_only",
             "private_access": "all",
             "group_access": "admin_only",
@@ -116,10 +119,13 @@ class NovelAIPainterPlugin(Star):
             "retry_delay": 5.0,
             "error_notify_mode": "final_only",
             "show_queue_notice": True,
+            "notify_429": True,
             "show_retry_notice": False,
             "auto_clean_delay": 300,
             "default_preset_id": "",
             "persona_preset_map": {},
+            "img2img_enabled": True,
+            "reference_enabled": True,
             "img2img_strength": 0.7,
             "img2img_noise": 0.1,
             "img2img_color_correct": True,
@@ -161,9 +167,18 @@ class NovelAIPainterPlugin(Star):
         return []
 
     def _active_model(self) -> str:
+        model = str(self._cfg("model", DEFAULT_MODEL) or DEFAULT_MODEL).strip()
         custom = str(self._cfg("custom_model", "") or "").strip()
-        model = custom or str(self._cfg("model", DEFAULT_MODEL) or DEFAULT_MODEL).strip()
-        return DEFAULT_MODEL if model == "custom" or not model else model
+        if model == "custom":
+            return custom or DEFAULT_MODEL
+        return model or custom or DEFAULT_MODEL
+
+    def _openai_headers(self, key: str) -> dict[str, str]:
+        header = str(self._cfg("openai_auth_header", "Authorization") or "Authorization").strip() or "Authorization"
+        prefix = str(self._cfg("openai_auth_prefix", "Bearer") or "").strip()
+        if prefix and key.lower().startswith(prefix.lower() + " "):
+            return {header: key}
+        return {header: f"{prefix} {key}".strip()}
 
     def _provider_name(self) -> str:
         provider = str(self._cfg("provider", "novelai_official") or "novelai_official").strip()
@@ -227,7 +242,11 @@ class NovelAIPainterPlugin(Star):
         if self._as_bool(self._cfg("quality_toggle", True)):
             parts.append("masterpiece, best quality, highres")
         if preset:
-            parts.extend([str(preset.get("style_prompt", "")).strip(), str(preset.get("character_prompt", "")).strip()])
+            style_prompt = str(preset.get("style_prompt", "")).strip()
+            character_prompt = str(preset.get("character_prompt", "")).strip()
+            parts.extend([style_prompt, character_prompt])
+            if character_prompt and preset.get("lock_character", True):
+                parts.append("keep the same character identity, facial features, hairstyle, outfit details and accessories; only change the requested action, pose, expression or scene")
         parts.append(prompt.strip())
         composed = ", ".join(part for part in parts if part)
         preset_negative = str(preset.get("negative_prompt", "")).strip() if preset else ""
@@ -331,7 +350,8 @@ class NovelAIPainterPlugin(Star):
 
     def _official_parameters(self, prompt: str, operation: str, image_b64: str | None, reference: dict[str, Any] | None, negative_override: str = "") -> dict[str, Any]:
         model = self._active_model()
-        negative = str(negative_override or self._cfg("negative_prompt", DEFAULT_NEGATIVE) or "").strip()
+        negative_parts = [str(self._cfg("negative_prompt", DEFAULT_NEGATIVE) or "").strip(), str(negative_override or "").strip()]
+        negative = ", ".join(dict.fromkeys(part for part in negative_parts if part))
         params: dict[str, Any] = {
             "params_version": 3,
             "width": max(64, min(2048, int(self._cfg("width", 832) or 832))),
@@ -387,7 +407,7 @@ class NovelAIPainterPlugin(Star):
         endpoint_key = "openai_edit_endpoint" if image_bytes else "openai_image_endpoint"
         endpoint = str(self._cfg(endpoint_key, "/v1/images/edits" if image_bytes else "/v1/images/generations") or "")
         url = endpoint if endpoint.startswith("http") else f"{base_url}/{endpoint.lstrip('/')}"
-        headers = {"Authorization": api_key if api_key.lower().startswith("bearer ") else f"Bearer {api_key}"}
+        headers = self._openai_headers(api_key)
         timeout = aiohttp.ClientTimeout(total=180)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             try:
@@ -463,6 +483,13 @@ class NovelAIPainterPlugin(Star):
             return GenerationResult(False, job_id, provider, error_code="permission", message=reason)
         if not prompt.strip():
             return GenerationResult(False, job_id, provider, error_code="invalid_prompt", message="请输入要生成的画面描述。")
+        if operation == "img2img" and not self._as_bool(self._cfg("img2img_enabled", True)):
+            return GenerationResult(False, job_id, provider, error_code="img2img_disabled", message="图生图功能当前已关闭。")
+        if operation == "reference":
+            if not self._as_bool(self._cfg("reference_enabled", True)):
+                return GenerationResult(False, job_id, provider, error_code="reference_disabled", message="参考图功能当前已关闭。")
+            if provider != "novelai_official":
+                return GenerationResult(False, job_id, provider, error_code="unsupported", message="当前兼容后端不支持 NovelAI Precise Reference。")
         self._cleanup_expired()
         composed_prompt, active_preset_id, preset_negative = self._compose_prompt(prompt, event, preset_id)
         key = self._event_key(event, composed_prompt, operation)
@@ -492,6 +519,10 @@ class NovelAIPainterPlugin(Star):
             else:
                 reference_type = "character"
             image_bytes, reference = await self._load_reference(reference_id)
+            if operation in {"img2img", "reference"} and not image_bytes:
+                result = GenerationResult(False, job_id, provider, error_code="missing_reference", message="请先在 WebUI 上传参考图并绑定到默认预设。", attempts=0)
+                self._recent_jobs[key] = (time.time(), result)
+                return result
             if reference:
                 reference["reference_type"] = reference_type
             image_b64 = base64.b64encode(image_bytes).decode("ascii") if image_bytes and provider == "novelai_official" else None
@@ -526,7 +557,8 @@ class NovelAIPainterPlugin(Star):
 
     async def _finish_event(self, event: AstrMessageEvent, result: GenerationResult) -> str:
         if not result.ok:
-            await self._notify(event, result.message, "error")
+            if not (result.error_code == "429" and not self._as_bool(self._cfg("notify_429", True))):
+                await self._notify(event, result.message, "error")
             return f"图片生成未完成：{result.message}"
         if not result.path:
             return "图片生成未完成：未找到图片文件。"
@@ -562,13 +594,17 @@ class NovelAIPainterPlugin(Star):
         result = await self._run_job(event, prompt, "generate")
         return await self._finish_event(event, result)
 
-    @filter.command("nai")
-    async def cmd_draw(self, event: AstrMessageEvent, *, prompt: str = ""):
+    @filter.regex(r"^/[A-Za-z][A-Za-z0-9_-]*(?:@[A-Za-z0-9_-]+)?(?:\s|$)")
+    async def cmd_draw(self, event: AstrMessageEvent):
         """NovelAI 命令入口：/nai draw <描述>、/nai img2img <描述>、/nai reference <character|style|both> <描述>。"""
         if not self._mode_allows("command"):
             yield event.plain_result("当前未启用固定命令生图入口。")
             return
-        text = prompt.strip()
+        raw_message = event.get_message_str().strip()
+        match = re.match(r"^/(?P<name>[A-Za-z][A-Za-z0-9_-]*)(?:@[A-Za-z0-9_-]+)?(?:\s+(?P<body>.*))?$", raw_message, re.S)
+        if not match or match.group("name").lower() != str(self._cfg("command_prefix", "nai") or "nai").strip().lstrip("/").lower():
+            return
+        text = (match.group("body") or "").strip()
         if not text or text.lower() in {"help", "?", "菜单"}:
             yield event.plain_result("用法：/nai draw <画面描述>；/nai img2img <画面描述>；/nai reference <character|style|both> <画面描述>；/nai preset list")
             return
@@ -631,6 +667,11 @@ class NovelAIPainterPlugin(Star):
         for suffix, handler, methods in routes:
             self.context.register_web_api(f"/{PLUGIN_NAME}/{suffix}", handler, methods, f"NovelAI Painter {suffix}")
 
+    @staticmethod
+    def _page_error(message: str, status_code: int = 400):
+        # 返回 200 + JSON，避免不同版本 Dashboard 对非 UTF-8 错误响应显示乱码。
+        return json_response({"ok": False, "error": message, "status_code": status_code})
+
     def _public_config(self) -> dict[str, Any]:
         data = dict(self.config)
         for key in ("api_token", "api_key"):
@@ -650,7 +691,7 @@ class NovelAIPainterPlugin(Star):
     async def page_save_config(self):
         payload = await request.json(default={})
         if not isinstance(payload, dict):
-            return error_response("配置格式错误")
+            return self._page_error("配置格式错误")
         fields = {key: value for key, value in payload.items() if key not in {"api_token", "api_key"}}
         for key in ("api_token", "api_key"):
             if str(payload.get(key, "")).strip() and payload.get(key) != "********":
@@ -660,13 +701,13 @@ class NovelAIPainterPlugin(Star):
                 try:
                     fields[key] = int(fields[key])
                 except (TypeError, ValueError):
-                    return error_response(f"{key} 必须是整数")
+                    return self._page_error(f"{key} 必须是整数")
         for key in ("scale", "retry_delay", "img2img_strength", "img2img_noise", "reference_strength", "reference_fidelity", "reference_information_extracted"):
             if key in fields:
                 try:
                     fields[key] = float(fields[key])
                 except (TypeError, ValueError):
-                    return error_response(f"{key} 必须是数字")
+                    return self._page_error(f"{key} 必须是数字")
         fields["images_per_request"] = 1
         fields["max_api_requests_per_job"] = 1
         fields["width"] = min(2048, max(64, int(fields.get("width", self._cfg("width", 832)))))
@@ -675,8 +716,15 @@ class NovelAIPainterPlugin(Star):
         for key in ("allowed_users", "allowed_groups"):
             if key in fields:
                 fields[key] = self._as_list(fields[key])
+        if "command_prefix" in fields:
+            prefix = str(fields["command_prefix"] or "nai").strip().lstrip("/")
+            if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,30}", prefix):
+                return self._page_error("固定命令只能使用字母开头的 1-31 位名称")
+            fields["command_prefix"] = prefix
+        if "openai_auth_header" in fields and fields["openai_auth_header"] not in {"Authorization", "x-api-key"}:
+            return self._page_error("兼容后端鉴权请求头不受支持")
         if "persona_preset_map" in fields and not isinstance(fields["persona_preset_map"], dict):
-            return error_response("persona_preset_map 必须是对象")
+            return self._page_error("persona_preset_map 必须是对象")
         allowed_enums = {
             "provider": {"novelai_official", "openai_compatible"},
             "invoke_mode": {"disabled", "command_only", "llm_tool_only", "both"},
@@ -687,7 +735,7 @@ class NovelAIPainterPlugin(Star):
         }
         for key, options in allowed_enums.items():
             if key in fields and fields[key] not in options:
-                return error_response(f"{key} 的值不受支持")
+                return self._page_error(f"{key} 的值不受支持")
         self.config.update(fields)
         self.config["config_version"] = 2
         saver = getattr(self.config, "save_config", None)
@@ -703,11 +751,17 @@ class NovelAIPainterPlugin(Star):
             url = str(payload.get("base_url", self._cfg("openai_base_url", ""))).rstrip("/") + "/models"
             key = str(payload.get("api_key", self._cfg("api_key", "")))
         else:
-            url = str(payload.get("base_url", self._cfg("base_url", "https://image.novelai.net"))).rstrip("/") + "/user/information"
+            base = str(payload.get("base_url", self._cfg("base_url", "https://image.novelai.net"))).rstrip("/")
+            url = "https://api.novelai.net/user/information" if "image.novelai.net" in base else base.replace("/ai/generate-image", "") + "/user/information"
             key = str(payload.get("api_token", self._cfg("api_token", "")))
         if not url or not key or key == "********":
-            return error_response("请先填写完整的服务地址和密钥")
-        headers = {"Authorization": key if key.lower().startswith("bearer ") else f"Bearer {key}"}
+            return self._page_error("请先填写完整的服务地址和密钥")
+        if provider == "openai_compatible":
+            auth_header = str(payload.get("auth_header", self._cfg("openai_auth_header", "Authorization")) or "Authorization")
+            auth_prefix = str(payload.get("auth_prefix", self._cfg("openai_auth_prefix", "Bearer")) or "").strip()
+            headers = {auth_header: f"{auth_prefix} {key}".strip()}
+        else:
+            headers = {"Authorization": key if key.lower().startswith("bearer ") else f"Bearer {key}"}
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
                 async with session.get(url, headers=headers) as response:
@@ -725,7 +779,7 @@ class NovelAIPainterPlugin(Star):
     async def page_create_preset(self):
         payload = await request.json(default={})
         if not isinstance(payload, dict) or not str(payload.get("name", "")).strip():
-            return error_response("预设名称不能为空")
+            return self._page_error("预设名称不能为空")
         preset = {
             "id": uuid.uuid4().hex[:10],
             "name": str(payload.get("name")).strip()[:80],
@@ -735,6 +789,7 @@ class NovelAIPainterPlugin(Star):
             "negative_prompt": str(payload.get("negative_prompt", "")).strip()[:4000],
             "reference_id": str(payload.get("reference_id", "")).strip(),
             "reference_type": str(payload.get("reference_type", "character")),
+            "lock_character": bool(payload.get("lock_character", True)),
             "persona_id": str(payload.get("persona_id", "")).strip(),
             "enabled": bool(payload.get("enabled", True)),
         }
@@ -746,27 +801,27 @@ class NovelAIPainterPlugin(Star):
     async def page_manage_preset(self):
         payload = await request.json(default={})
         if not isinstance(payload, dict):
-            return error_response("预设格式错误")
+            return self._page_error("预设格式错误")
         action = str(payload.get("action", "")).lower()
         preset_id = str(payload.get("id", ""))
         if action == "delete":
             before = len(self.presets)
             self.presets = [p for p in self.presets if p.get("id") != preset_id]
             if len(self.presets) == before:
-                return error_response("预设不存在", status_code=404)
+                return self._page_error("预设不存在", status_code=404)
             self._save_presets()
             return json_response({"saved": True, "message": "预设已删除"})
         if action == "update":
             preset = self._get_preset(preset_id)
             if not preset:
-                return error_response("预设不存在", status_code=404)
-            for key in ("name", "description", "style_prompt", "character_prompt", "negative_prompt", "reference_id", "reference_type", "persona_id", "enabled"):
+                return self._page_error("预设不存在", status_code=404)
+            for key in ("name", "description", "style_prompt", "character_prompt", "negative_prompt", "reference_id", "reference_type", "lock_character", "persona_id", "enabled"):
                 if key in payload:
                     preset[key] = payload[key]
             self._save_presets()
             return json_response({"saved": True, "message": "预设已更新", "preset": preset})
         if not str(payload.get("name", "")).strip():
-            return error_response("预设名称不能为空")
+            return self._page_error("预设名称不能为空")
         preset = {
             "id": uuid.uuid4().hex[:10],
             "name": str(payload.get("name")).strip()[:80],
@@ -776,6 +831,7 @@ class NovelAIPainterPlugin(Star):
             "negative_prompt": str(payload.get("negative_prompt", "")).strip()[:4000],
             "reference_id": str(payload.get("reference_id", "")).strip(),
             "reference_type": str(payload.get("reference_type", "character")),
+            "lock_character": bool(payload.get("lock_character", True)),
             "persona_id": str(payload.get("persona_id", "")).strip(),
             "enabled": bool(payload.get("enabled", True)),
         }
@@ -786,11 +842,11 @@ class NovelAIPainterPlugin(Star):
     async def page_update_preset(self, preset_id: str):
         preset = self._get_preset(preset_id)
         if not preset:
-            return error_response("预设不存在", status_code=404)
+            return self._page_error("预设不存在", status_code=404)
         payload = await request.json(default={})
         if not isinstance(payload, dict):
-            return error_response("预设格式错误")
-        for key in ("name", "description", "style_prompt", "character_prompt", "negative_prompt", "reference_id", "reference_type", "persona_id", "enabled"):
+            return self._page_error("预设格式错误")
+        for key in ("name", "description", "style_prompt", "character_prompt", "negative_prompt", "reference_id", "reference_type", "lock_character", "persona_id", "enabled"):
             if key in payload:
                 preset[key] = payload[key]
         self._save_presets()
@@ -800,7 +856,7 @@ class NovelAIPainterPlugin(Star):
         before = len(self.presets)
         self.presets = [p for p in self.presets if p.get("id") != preset_id]
         if len(self.presets) == before:
-            return error_response("预设不存在", status_code=404)
+            return self._page_error("预设不存在", status_code=404)
         self._save_presets()
         return json_response({"saved": True, "message": "预设已删除"})
 
@@ -821,17 +877,17 @@ class NovelAIPainterPlugin(Star):
         files = await request.files()
         upload = files.get("file") if files else None
         if upload is None:
-            return error_response("请选择图片文件")
+            return self._page_error("请选择图片文件")
         filename = str(upload.filename or "reference.png")
         content_type = str(upload.content_type or mimetypes.guess_type(filename)[0] or "")
         if content_type not in {"image/png", "image/jpeg", "image/webp"}:
-            return error_response("仅支持 PNG、JPEG、WebP 图片")
+            return self._page_error("仅支持 PNG、JPEG、WebP 图片")
         data = await upload.read()
         if len(data) > 12 * 1024 * 1024:
-            return error_response("图片不能超过 12MB")
+            return self._page_error("图片不能超过 12MB")
         magic_ok = (content_type == "image/png" and data.startswith(b"\x89PNG")) or (content_type == "image/jpeg" and data.startswith(b"\xff\xd8")) or (content_type == "image/webp" and data[:4] == b"RIFF" and data[8:12] == b"WEBP")
         if not magic_ok:
-            return error_response("图片内容与文件类型不匹配")
+            return self._page_error("图片内容与文件类型不匹配")
         ref_id = uuid.uuid4().hex[:10]
         ext = ".png" if content_type == "image/png" else ".jpg" if content_type == "image/jpeg" else ".webp"
         stored_name = f"{ref_id}{ext}"
@@ -844,16 +900,23 @@ class NovelAIPainterPlugin(Star):
     async def page_manage_reference(self):
         payload = await request.json(default={})
         if not isinstance(payload, dict) or str(payload.get("action", "")).lower() != "delete":
-            return error_response("不支持的参考图操作")
+            return self._page_error("不支持的参考图操作")
         return await self.page_delete_reference(str(payload.get("id", "")))
 
     async def page_delete_reference(self, reference_id: str):
         _, meta = await self._load_reference(reference_id)
         if not meta:
-            return error_response("参考图不存在", status_code=404)
+            return self._page_error("参考图不存在", status_code=404)
         try:
             (self.reference_dir / str(meta["filename"])).unlink(missing_ok=True)
             (self.reference_dir / f"{Path(reference_id).name}.json").unlink(missing_ok=True)
+            changed = False
+            for preset in self.presets:
+                if preset.get("reference_id") == reference_id:
+                    preset["reference_id"] = ""
+                    changed = True
+            if changed:
+                self._save_presets()
         except Exception:
             pass
         return json_response({"saved": True, "message": "参考图已删除"})

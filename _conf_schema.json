@@ -54,15 +54,62 @@
     "type": "string",
     "default": "/v1/images/edits"
   },
+  "openai_auth_header": {
+    "description": "兼容后端鉴权请求头",
+    "type": "string",
+    "default": "Authorization",
+    "options": [
+      "Authorization",
+      "x-api-key"
+    ],
+    "labels": {
+      "Authorization": "Authorization",
+      "x-api-key": "x-api-key"
+    }
+  },
+  "openai_auth_prefix": {
+    "description": "兼容后端鉴权前缀",
+    "type": "string",
+    "default": "Bearer",
+    "hint": "Authorization 通常填写 Bearer；x-api-key 通常留空。"
+  },
   "model": {
     "description": "模型 ID",
     "type": "string",
-    "default": "nai-diffusion-5-full"
+    "default": "nai-diffusion-5-full",
+    "options": [
+      "nai-diffusion-5-full",
+      "nai-diffusion-5-curated",
+      "nai-diffusion-4-5-full",
+      "nai-diffusion-4-5-curated",
+      "nai-diffusion-4-full",
+      "nai-diffusion-4-curated-preview",
+      "nai-diffusion-3",
+      "nai-diffusion-furry-3",
+      "custom"
+    ],
+    "labels": {
+      "nai-diffusion-5-full": "V5 Full",
+      "nai-diffusion-5-curated": "V5 Curated",
+      "nai-diffusion-4-5-full": "V4.5 Full",
+      "nai-diffusion-4-5-curated": "V4.5 Curated",
+      "nai-diffusion-4-full": "V4 Full",
+      "nai-diffusion-4-curated-preview": "V4 Curated Preview",
+      "nai-diffusion-3": "V3 Anime",
+      "nai-diffusion-furry-3": "V3 Furry",
+      "custom": "自定义模型 ID"
+    }
   },
   "custom_model": {
     "description": "自定义模型 ID",
     "type": "string",
     "default": ""
+  },
+  "command_prefix": {
+    "description": "固定命令名",
+    "type": "string",
+    "default": "nai",
+    "hint": "只填写命令名，不含斜杠。默认使用 /nai。"
   },
   "invoke_mode": {
     "description": "入口模式",
@@ -282,6 +329,16 @@
     "default": {},
     "invisible": true
   },
+  "img2img_enabled": {
+    "description": "启用图生图",
+    "type": "bool",
+    "default": true
+  },
+  "reference_enabled": {
+    "description": "启用参考图 / Precise Reference",
+    "type": "bool",
+    "default": true
+  },
   "img2img_strength": {
     "description": "图生图强度",
     "type": "float",
@@ -321,5 +378,11 @@
     "default": 1,
     "min": 0,
     "max": 1
+  },
+  "notify_429": {
+    "description": "429 频率限制提示",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后仅记录日志，不向用户发送 429 提示。"
   }
 }
