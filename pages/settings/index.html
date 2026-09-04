@@ -13,6 +13,19 @@
       <div class="actions"><span id="dirty" class="dirty">未修改</span><button id="save" class="btn primary" type="button"><span class="icon">✓</span>保存配置</button></div>
     </header>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <div id="confirm-dialog" class="dialog-backdrop hidden" aria-hidden="true">
+      <section class="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-message">
+        <div class="confirm-icon" aria-hidden="true">!</div>
+        <div class="confirm-copy">
+          <h2 id="confirm-title">确认操作</h2>
+          <p id="confirm-message">请确认是否继续。</p>
+        </div>
+        <div class="confirm-actions">
+          <button id="confirm-cancel" class="btn secondary" type="button">取消</button>
+          <button id="confirm-accept" class="btn danger" type="button">确认删除</button>
+        </div>
+      </section>
+    </div>
     <section class="status-row" aria-label="运行状态">
       <div class="status-card"><span class="status-dot" id="provider-dot"></span><div><span class="label">当前后端</span><strong id="provider-status">读取中</strong></div></div>
       <div class="status-card"><span class="metric-icon">↯</span><div><span class="label">入口策略</span><strong id="mode-status">读取中</strong></div></div>

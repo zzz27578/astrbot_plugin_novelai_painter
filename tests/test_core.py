@@ -2,6 +2,7 @@ import asyncio
 import base64
 import io
 import json
+import tempfile
 import zipfile
 import unittest
 from unittest.mock import AsyncMock, Mock
@@ -19,6 +20,7 @@ class FakeEvent:
     def is_admin(self): return True
     def get_sender_id(self): return "u-1"
     def get_group_id(self): return "g-1"
+    def get_message_str(self): return "1girl, silver hair, blue eyes, night city"
 
 
 class CoreTests(unittest.TestCase):
@@ -29,7 +31,9 @@ class CoreTests(unittest.TestCase):
         p._recent_jobs = {}
         p._jobs = []
         p.lock = asyncio.Lock()
-        p.temp_dir = Path(".")
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        p.temp_dir = Path(temp_dir.name)
         p._get_preset = lambda pid: next((x for x in p.presets if x.get("id") == pid), None)
         p._resolve_persona_id = lambda event=None: ""
         return p
@@ -115,6 +119,44 @@ class CoreTests(unittest.TestCase):
         self.assertIsNone(re.search(r"(?<!\$)\$\('\[data-delete\]'\)\.forEach", script))
         self.assertIn("$$('[data-config]').forEach", script)
         self.assertIn("$$('[data-delete]'", script)
+
+    def test_llm_tool_declares_prompt_and_handles_missing_argument(self):
+        doc = NovelAIPainterPlugin.novelai_generate_image.__doc__ or ""
+        self.assertIn("Args:", doc)
+        self.assertIn("prompt(string):", doc)
+
+        from astrbot.core.provider.register import llm_tools
+        tool = next(item for item in llm_tools.func_list if item.name == "novelai_generate_image")
+        prompt_schema = tool.parameters.get("properties", {}).get("prompt", {})
+        self.assertEqual(prompt_schema.get("type"), "string")
+
+        async def run():
+            p = self.make_plugin()
+            p._mode_allows = lambda mode: mode == "llm_tool"
+            p._run_job = AsyncMock(return_value=GenerationResult(True, "job-1", "novelai_official"))
+            p._finish_event = AsyncMock(return_value="ok")
+            event = FakeEvent()
+            result = await p.novelai_generate_image(event)
+            self.assertEqual(result, "ok")
+            p._run_job.assert_awaited_once_with(
+                event,
+                "1girl, silver hair, blue eyes, night city",
+                "generate",
+            )
+
+        asyncio.run(run())
+
+    def test_webui_uses_embedded_confirmation_and_wraps_long_text(self):
+        script = Path("pages/settings/app.js").read_text(encoding="utf-8")
+        html = Path("pages/settings/index.html").read_text(encoding="utf-8")
+        css = Path("pages/settings/style.css").read_text(encoding="utf-8")
+        self.assertNotIn("window.confirm(", script)
+        self.assertIn("askConfirmation", script)
+        self.assertIn('role="alertdialog"', html)
+        self.assertIn("overflow-wrap: anywhere", css)
+        self.assertIn("width: min(420px, calc(100vw - 32px))", css)
+        self.assertIn(".field > span", css)
+        self.assertIn("word-break: break-word", css)
 
 
 if __name__ == "__main__":

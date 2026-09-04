@@ -12,6 +12,38 @@ const EMPTY_STATE = {
 
 let state = { ...EMPTY_STATE };
 let editingPreset = null;
+let confirmResolver = null;
+let confirmPreviousFocus = null;
+
+function closeConfirmation(accepted = false) {
+  const dialog = $("#confirm-dialog");
+  if (!dialog || !confirmResolver) return;
+  const resolve = confirmResolver;
+  confirmResolver = null;
+  dialog.classList.add("hidden");
+  dialog.setAttribute("aria-hidden", "true");
+  document.body.classList.remove("dialog-open");
+  if (confirmPreviousFocus?.isConnected) confirmPreviousFocus.focus();
+  confirmPreviousFocus = null;
+  resolve(Boolean(accepted));
+}
+
+function askConfirmation({ title, message, confirmText = "确认" }) {
+  const dialog = $("#confirm-dialog");
+  if (!dialog) return Promise.resolve(false);
+  if (confirmResolver) closeConfirmation(false);
+  confirmPreviousFocus = document.activeElement;
+  $("#confirm-title").textContent = title;
+  $("#confirm-message").textContent = message;
+  $("#confirm-accept").textContent = confirmText;
+  dialog.classList.remove("hidden");
+  dialog.setAttribute("aria-hidden", "false");
+  document.body.classList.add("dialog-open");
+  return new Promise((resolve) => {
+    confirmResolver = resolve;
+    window.requestAnimationFrame(() => $("#confirm-cancel")?.focus());
+  });
+}
 
 function esc(value) {
   return String(value ?? "").replace(/[&<>"']/g, (char) => ({
@@ -397,9 +429,13 @@ function cleanDeletedPresetFromClient(presetId) {
 }
 
 async function deletePreset(id, trigger = null) {
-  if (!id || !window.confirm("确定删除这个预设吗？相关默认项和人设映射也会一并清理。")) {
-    return false;
-  }
+  if (!id) return false;
+  const confirmed = await askConfirmation({
+    title: "删除这个预设？",
+    message: "删除后无法恢复；相关默认预设和 AstrBot 人设映射会一并清理。",
+    confirmText: "删除预设",
+  });
+  if (!confirmed) return false;
   if (trigger) trigger.disabled = true;
   try {
     const data = ensureOk(await withTimeout(
@@ -424,9 +460,13 @@ async function deletePreset(id, trigger = null) {
 }
 
 async function deleteReference(id, trigger = null) {
-  if (!id || !window.confirm("确定删除这张参考图吗？绑定该图片的预设会自动解除引用。")) {
-    return false;
-  }
+  if (!id) return false;
+  const confirmed = await askConfirmation({
+    title: "删除这张参考图？",
+    message: "删除后无法恢复；绑定该图片的预设会自动解除引用。",
+    confirmText: "删除参考图",
+  });
+  if (!confirmed) return false;
   if (trigger) trigger.disabled = true;
   try {
     const data = ensureOk(await withTimeout(
@@ -560,6 +600,14 @@ $("#delete-preset").addEventListener("click", () => {
   if (editingPreset) deletePreset(editingPreset.id, $("#delete-preset"));
 });
 $("#refresh-jobs").addEventListener("click", () => renderJobs());
+$("#confirm-cancel").addEventListener("click", () => closeConfirmation(false));
+$("#confirm-accept").addEventListener("click", () => closeConfirmation(true));
+$("#confirm-dialog").addEventListener("click", (event) => {
+  if (event.target === $("#confirm-dialog")) closeConfirmation(false);
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && confirmResolver) closeConfirmation(false);
+});
 
 try {
   if (!bridge || typeof bridge.ready !== "function") {

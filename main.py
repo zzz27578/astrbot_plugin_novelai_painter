@@ -34,7 +34,7 @@ except ImportError:
 from astrbot.core.message.message_event_result import MessageChain
 
 PLUGIN_NAME = "astrbot_plugin_novelai_painter"
-VERSION = "2.1.1"
+VERSION = "2.1.2"
 DEFAULT_MODEL = "nai-diffusion-5-full"
 DEFAULT_NEGATIVE = (
     "lowres, blurry, bad anatomy, bad hands, text, watermark, error, missing fingers, "
@@ -621,11 +621,25 @@ class NovelAIPainterPlugin(Star):
 
     # --------------------------- AstrBot handlers ---------------------------
     @filter.llm_tool(name="novelai_generate_image")
-    async def novelai_generate_image(self, event: AstrMessageEvent, prompt: str):
-        """仅在用户明确要求生成、绘制或修改图片时调用。根据用户需求生成一张图片并发送到当前会话。不要因为可能适合配图而主动调用；不要把内部错误、API Key 或内部路径写入回复。"""
+    async def novelai_generate_image(self, event: AstrMessageEvent, prompt: str = ""):
+        """仅在用户明确要求生成、绘制或修改图片时调用；生成一张图片并发送到当前会话。不要仅因为内容适合配图就主动调用，也不要在回复中泄露内部错误、密钥、文件路径或完整提示词。
+
+        Args:
+            prompt(string): 必须传入用户要求的画面描述。优先整理为完整、具体的英文 NovelAI / Danbooru 风格标签，不得省略该参数。
+        """
         if not self._mode_allows("llm_tool"):
             return "当前未启用自然语言生图入口。"
-        result = await self._run_job(event, prompt, "generate")
+
+        normalized_prompt = str(prompt or "").strip()
+        if not normalized_prompt:
+            try:
+                normalized_prompt = str(event.get_message_str() or "").strip()
+            except Exception:
+                normalized_prompt = ""
+        if not normalized_prompt:
+            return "生图工具缺少画面描述，请根据用户请求重新调用并传入 prompt 参数。"
+
+        result = await self._run_job(event, normalized_prompt, "generate")
         return await self._finish_event(event, result)
 
     @filter.regex(r"^/[A-Za-z][A-Za-z0-9_-]*(?:@[A-Za-z0-9_-]+)?(?:\s|$)")
