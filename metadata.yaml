@@ -1,0 +1,6 @@
+name: astrbot_plugin_novelai_painter
+display_name: NovelAI 灵动画师
+desc: NovelAI 专用生图插件，支持 LLM 自主工具调用与指令生图，原生支持 V5/V4.5 接口与 ZIP 解包直发。
+version: 1.1.0
+author: 小莫
+repo: "https://github.com/zzz27578/astrbot_plugin_novelai_painter"

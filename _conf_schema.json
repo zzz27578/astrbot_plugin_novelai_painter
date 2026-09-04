@@ -1,0 +1,112 @@
+{
+  "api_token": {
+    "description": "NovelAI Persistent API Token (设置 -> Account 获取)",
+    "type": "string",
+    "default": "",
+    "hint": "持久 API Token，请求头会自动带 Authorization: Bearer <Token>"
+  },
+  "base_url": {
+    "description": "NovelAI 生图端点 Base URL",
+    "type": "string",
+    "default": "https://image.novelai.net",
+    "hint": "官方生图端点通常为 https://image.novelai.net 或反代地址"
+  },
+  "model": {
+    "description": "生成模型选择 (2026最新 V5 系列已支持)",
+    "type": "string",
+    "default": "nai-diffusion-5-full",
+    "options": [
+      "nai-diffusion-5-full",
+      "nai-diffusion-5-curated",
+      "nai-diffusion-4-5-full",
+      "nai-diffusion-4-full",
+      "nai-diffusion-3",
+      "nai-diffusion-furry-3",
+      "custom"
+    ],
+    "hint": "默认推荐最新 2026 V5 Full 模型；若选 custom 请在下方填入自定义 ID"
+  },
+  "custom_model": {
+    "description": "自定义模型 ID (留空则以上方下拉为准)",
+    "type": "string",
+    "default": "",
+    "hint": "用于后续新版本或未列出模型的手动输入"
+  },
+  "width": {
+    "description": "画布宽度 (Width)",
+    "type": "int",
+    "default": 832,
+    "hint": "标准竖图: 832，方图: 1024，横图: 1216"
+  },
+  "height": {
+    "description": "画布高度 (Height)",
+    "type": "int",
+    "default": 1216,
+    "hint": "标准竖图: 1216，方图: 1024，横图: 832"
+  },
+  "steps": {
+    "description": "迭代步数 (Steps)",
+    "type": "int",
+    "default": 28,
+    "min": 1,
+    "max": 50,
+    "hint": "推荐 28，范围 1-50"
+  },
+  "scale": {
+    "description": "提示词引导强度 (Prompt Guidance / Scale)",
+    "type": "float",
+    "default": 5.0,
+    "hint": "推荐 5.0，范围 1.0 - 10.0"
+  },
+  "sampler": {
+    "description": "采样器 (Sampler)",
+    "type": "string",
+    "default": "k_euler_ancestral",
+    "options": [
+      "k_euler_ancestral",
+      "k_euler",
+      "k_dpmpp_2s_ancestral",
+      "k_dpmpp_2m",
+      "k_dpmpp_sde"
+    ],
+    "hint": "推荐 k_euler_ancestral"
+  },
+  "negative_prompt": {
+    "description": "屏蔽词 / 负面提示词 (Negative Prompt)",
+    "type": "text",
+    "default": "lowres, blurry, bad anatomy, bad hands, text, watermark, error, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality, normal quality, jpeg artifacts, signature, username",
+    "hint": "排除的特征或质感词，英文逗号分隔"
+  },
+  "quality_toggle": {
+    "description": "画质增强开关 (Quality Toggle)",
+    "type": "bool",
+    "default": true,
+    "hint": "自动附加官方推荐的高画质前缀"
+  },
+  "max_retries": {
+    "description": "429/异常最大重试次数 (Max Retries)",
+    "type": "int",
+    "default": 3,
+    "min": 1,
+    "max": 10,
+    "hint": "遭遇 429 Too Many Requests 时最大自动退避重试次数，超过则强制中断"
+  },
+  "retry_delay": {
+    "description": "429 基础退避等待时长 (秒)",
+    "type": "float",
+    "default": 5.0,
+    "hint": "遭遇 429 后的基础避让等待秒数，每次重试将阶梯递增"
+  },
+  "queue_timeout": {
+    "description": "排队等待最大超时 (秒)",
+    "type": "int",
+    "default": 120,
+    "hint": "单并发排队锁最大等待时间，超时后自动取消并释放队列"
+  },
+  "auto_clean_delay": {
+    "description": "临时图片留存自动清理延迟 (秒)",
+    "type": "int",
+    "default": 60,
+    "hint": "图片发送后自动清理临时文件的延迟时间，避免占用服务器硬盘空间"
+  }
+}
