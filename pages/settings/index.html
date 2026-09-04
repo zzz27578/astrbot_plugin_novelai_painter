@@ -68,7 +68,13 @@
       <div class="divider"></div>
       <div class="grid two">
         <label class="switch-row"><input data-config="img2img_enabled" type="checkbox" /><span><b>启用图生图</b><small>关闭后 /nai img2img 将被拒绝。</small></span></label><label class="switch-row"><input data-config="reference_enabled" type="checkbox" /><span><b>启用参考图 / Precise Reference</b><small>关闭后参考图操作将被拒绝。</small></span></label><label class="switch-row"><input data-config="legacy_command_enabled" type="checkbox" /><span><b>兼容 /nai &lt;描述&gt;</b><small>关闭后要求使用 /nai draw、/nai img2img、/nai reference。</small></span></label>
-        <label class="switch-row"><input data-config="show_queue_notice" type="checkbox" /><span><b>发送排队提示</b><small>任务等待锁时发送一条提示。</small></span></label><label class="field"><span>队列超时（秒）</span><input data-config="queue_timeout" type="number" min="1" max="600" /></label><label class="field"><span>重复事件去重窗口（秒）</span><input data-config="dedupe_window_seconds" type="number" min="1" max="300" /></label><label class="field"><span>错误提示策略</span><select data-config="error_notify_mode"><option value="silent">静默，仅日志</option><option value="final_only">发送最终结果</option><option value="admin_only">仅管理员可见</option></select></label><label class="switch-row"><input data-config="notify_429" type="checkbox" /><span><b>提示 429 频率限制</b><small>关闭后仍会记录日志，但不会向用户发送 429 提示。</small></span></label>
+        <label class="switch-row"><input data-config="show_queue_notice" type="checkbox" /><span><b>发送排队提示</b><small>任务等待锁时发送一条提示。</small></span></label>
+        <label class="field"><span>队列超时（秒）</span><input data-config="queue_timeout" type="number" min="1" max="600" /></label>
+        <label class="field"><span>重复事件去重窗口（秒）</span><input data-config="dedupe_window_seconds" type="number" min="1" max="300" /></label>
+        <label class="field"><span>自动重试策略</span><select data-config="retry_mode"><option value="none">关闭自动重试（防止重复扣费与重复生图）</option></select><small>当前版本严格限制一次任务只请求一次 API。</small></label>
+        <label class="field"><span>临时图片清理延迟（秒）</span><input data-config="auto_clean_delay" type="number" min="0" max="86400" /><small>设为 0 时会在发送后尽快清理。</small></label>
+        <label class="field"><span>错误提示策略</span><select data-config="error_notify_mode"><option value="silent">静默，仅日志</option><option value="final_only">发送最终结果</option><option value="admin_only">仅管理员可见</option></select></label>
+        <label class="switch-row"><input data-config="notify_429" type="checkbox" /><span><b>提示 429 频率限制</b><small>关闭后仍会记录日志，但不会向用户发送 429 提示。</small></span></label>
       </div>
     </section>
     <section class="panel" data-panel="presets">

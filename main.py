@@ -34,7 +34,7 @@ except ImportError:
 from astrbot.core.message.message_event_result import MessageChain
 
 PLUGIN_NAME = "astrbot_plugin_novelai_painter"
-VERSION = "2.1.0"
+VERSION = "2.1.1"
 DEFAULT_MODEL = "nai-diffusion-5-full"
 DEFAULT_NEGATIVE = (
     "lowres, blurry, bad anatomy, bad hands, text, watermark, error, missing fingers, "
@@ -203,6 +203,40 @@ class NovelAIPainterPlugin(Star):
         tmp = self.presets_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(self.presets, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(tmp, self.presets_path)
+
+    def _save_config(self) -> None:
+        saver = getattr(self.config, "save_config", None)
+        if callable(saver):
+            saver()
+
+    def _delete_preset_record(self, preset_id: str) -> bool:
+        """Delete a preset and remove every configuration reference to it."""
+        preset_id = str(preset_id or "").strip()
+        if not preset_id or not self._get_preset(preset_id):
+            return False
+
+        self.presets = [p for p in self.presets if str(p.get("id", "")) != preset_id]
+
+        config_changed = False
+        if str(self._cfg("default_preset_id", "")) == preset_id:
+            self.config["default_preset_id"] = ""
+            config_changed = True
+
+        mapping = self._cfg("persona_preset_map", {})
+        if isinstance(mapping, dict):
+            cleaned_mapping = {
+                str(persona_id): str(mapped_id)
+                for persona_id, mapped_id in mapping.items()
+                if str(mapped_id) != preset_id
+            }
+            if cleaned_mapping != mapping:
+                self.config["persona_preset_map"] = cleaned_mapping
+                config_changed = True
+
+        self._save_presets()
+        if config_changed:
+            self._save_config()
+        return True
 
     def _get_preset(self, preset_id: str | None) -> dict[str, Any] | None:
         if not preset_id:
@@ -736,11 +770,16 @@ class NovelAIPainterPlugin(Star):
         for key, options in allowed_enums.items():
             if key in fields and fields[key] not in options:
                 return self._page_error(f"{key} 的值不受支持")
+        previous_config = dict(self.config)
         self.config.update(fields)
         self.config["config_version"] = 2
-        saver = getattr(self.config, "save_config", None)
-        if callable(saver):
-            saver()
+        try:
+            self._save_config()
+        except Exception as exc:
+            self.config.clear()
+            self.config.update(previous_config)
+            logger.exception(f"[{PLUGIN_NAME}] WebUI 保存配置失败: {exc}")
+            return self._page_error("配置写入失败，已撤销本次修改，请检查 AstrBot 日志")
         return json_response({"saved": True, "message": "配置已保存", "config": self._public_config()})
 
     async def page_test_provider(self):
@@ -804,13 +843,22 @@ class NovelAIPainterPlugin(Star):
             return self._page_error("预设格式错误")
         action = str(payload.get("action", "")).lower()
         preset_id = str(payload.get("id", ""))
+        if action not in {"create", "update", "delete"}:
+            return self._page_error("不支持的预设操作")
         if action == "delete":
-            before = len(self.presets)
-            self.presets = [p for p in self.presets if p.get("id") != preset_id]
-            if len(self.presets) == before:
+            try:
+                deleted = self._delete_preset_record(preset_id)
+            except Exception as exc:
+                logger.exception(f"[{PLUGIN_NAME}] 删除预设失败: {exc}")
+                return self._page_error("删除预设失败，请检查插件数据目录权限和 AstrBot 日志")
+            if not deleted:
                 return self._page_error("预设不存在", status_code=404)
-            self._save_presets()
-            return json_response({"saved": True, "message": "预设已删除"})
+            return json_response({
+                "saved": True,
+                "message": "预设已删除，相关默认项和人设映射已清理",
+                "presets": self.presets,
+                "config": self._public_config(),
+            })
         if action == "update":
             preset = self._get_preset(preset_id)
             if not preset:
@@ -853,12 +901,19 @@ class NovelAIPainterPlugin(Star):
         return json_response({"saved": True, "message": "预设已更新", "preset": preset})
 
     async def page_delete_preset(self, preset_id: str):
-        before = len(self.presets)
-        self.presets = [p for p in self.presets if p.get("id") != preset_id]
-        if len(self.presets) == before:
+        try:
+            deleted = self._delete_preset_record(preset_id)
+        except Exception as exc:
+            logger.exception(f"[{PLUGIN_NAME}] 删除预设失败: {exc}")
+            return self._page_error("删除预设失败，请检查插件数据目录权限和 AstrBot 日志")
+        if not deleted:
             return self._page_error("预设不存在", status_code=404)
-        self._save_presets()
-        return json_response({"saved": True, "message": "预设已删除"})
+        return json_response({
+            "saved": True,
+            "message": "预设已删除，相关默认项和人设映射已清理",
+            "presets": self.presets,
+            "config": self._public_config(),
+        })
 
     def _reference_list(self) -> list[dict[str, Any]]:
         refs = []
@@ -907,19 +962,21 @@ class NovelAIPainterPlugin(Star):
         _, meta = await self._load_reference(reference_id)
         if not meta:
             return self._page_error("参考图不存在", status_code=404)
+        safe_id = Path(str(reference_id)).name
         try:
             (self.reference_dir / str(meta["filename"])).unlink(missing_ok=True)
-            (self.reference_dir / f"{Path(reference_id).name}.json").unlink(missing_ok=True)
+            (self.reference_dir / f"{safe_id}.json").unlink(missing_ok=True)
             changed = False
             for preset in self.presets:
-                if preset.get("reference_id") == reference_id:
+                if str(preset.get("reference_id", "")) == safe_id:
                     preset["reference_id"] = ""
                     changed = True
             if changed:
                 self._save_presets()
-        except Exception:
-            pass
-        return json_response({"saved": True, "message": "参考图已删除"})
+        except Exception as exc:
+            logger.exception(f"[{PLUGIN_NAME}] 删除参考图失败: {exc}")
+            return self._page_error("删除参考图失败，请检查插件数据目录权限和 AstrBot 日志")
+        return json_response({"saved": True, "message": "参考图已删除，相关预设引用已清理"})
 
     async def page_jobs(self):
         return json_response({"jobs": self._jobs[-50:]})

@@ -4,7 +4,7 @@ import io
 import json
 import zipfile
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -84,6 +84,37 @@ class CoreTests(unittest.TestCase):
         p = self.make_plugin(); e = FakeEvent()
         self.assertEqual(p._event_key(e, "x", "generate"), p._event_key(e, "x", "generate"))
         self.assertNotEqual(p._event_key(e, "x", "generate"), p._event_key(e, "x", "img2img"))
+
+    def test_delete_preset_cleans_all_config_references(self):
+        p = self.make_plugin()
+        p.config["default_preset_id"] = "p1"
+        p.config["persona_preset_map"] = {"persona-a": "p1", "persona-b": "other"}
+        p._save_presets = Mock()
+        p._save_config = Mock()
+
+        self.assertTrue(p._delete_preset_record("p1"))
+        self.assertEqual(p.presets, [])
+        self.assertEqual(p.config["default_preset_id"], "")
+        self.assertEqual(p.config["persona_preset_map"], {"persona-b": "other"})
+        p._save_presets.assert_called_once_with()
+        p._save_config.assert_called_once_with()
+
+    def test_delete_unknown_preset_does_not_write(self):
+        p = self.make_plugin()
+        p._save_presets = Mock()
+        p._save_config = Mock()
+
+        self.assertFalse(p._delete_preset_record("missing"))
+        p._save_presets.assert_not_called()
+        p._save_config.assert_not_called()
+
+    def test_webui_uses_multi_selector_for_foreach(self):
+        script = Path("pages/settings/app.js").read_text(encoding="utf-8")
+        import re
+        self.assertIsNone(re.search(r"(?<!\$)\$\('\[data-config\]'\)\.forEach", script))
+        self.assertIsNone(re.search(r"(?<!\$)\$\('\[data-delete\]'\)\.forEach", script))
+        self.assertIn("$$('[data-config]').forEach", script)
+        self.assertIn("$$('[data-delete]'", script)
 
 
 if __name__ == "__main__":
