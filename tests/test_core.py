@@ -36,6 +36,7 @@ class CoreTests(unittest.TestCase):
         p.presets = [{"id":"p1", "name":"P1", "positive_prompt":"watercolor, blue eyes, blonde hair, side ponytail, black bodysuit", "negative_prompt":"extra arms", "reference_id":"r1", "reference_type":"style", "lock_positive":True, "positive_strength":1.35, "quality_override":"off"}]
         p._recent_jobs = {}
         p._delivered_jobs = {}
+        p._llm_tool_claims = {}
         p._jobs = []
         p.lock = asyncio.Lock()
         temp_dir = tempfile.TemporaryDirectory()
@@ -120,10 +121,12 @@ class CoreTests(unittest.TestCase):
         p.config["group_access"] = "disabled"
         self.assertFalse(p._can_use(event)[0])
 
-    def test_embedded_persona_binding_resolves_and_disabled_preset_does_not(self):
+    def test_stale_embedded_persona_binding_does_not_bypass_canonical_mapping(self):
         p = self.make_plugin()
         p.presets[0]["persona_id"] = "persona-a"
         p._resolve_persona_id = lambda event=None: "persona-a"
+        self.assertIsNone(p._resolve_preset(FakeEvent()))
+        p.config["persona_preset_map"] = {"persona-a": "p1"}
         self.assertEqual(p._resolve_preset(FakeEvent())["id"], "p1")
         p.presets[0]["enabled"] = False
         self.assertIsNone(p._resolve_preset(FakeEvent()))
@@ -510,7 +513,97 @@ class CoreTests(unittest.TestCase):
             second = await p.novelai_generate_image(event, "full body, standing")
             self.assertIn("reply to the user once", first)
             self.assertIn("reply to the user once", second)
+            self.assertIn("ENTRY_GATE_BLOCKED_DUPLICATE", second)
             self.assertEqual(p._call_official.await_count, 1)
+        asyncio.run(run())
+
+    def test_llm_entry_gate_blocks_before_role_card_resolution_and_job_creation(self):
+        async def run():
+            p = self.make_plugin()
+            p._resolve_active_preset = AsyncMock(return_value=None)
+            p._run_job = AsyncMock(
+                return_value=GenerationResult(True, "job-1", "novelai_official", send_image=False)
+            )
+            p._finish_event = AsyncMock(return_value="图片已发送")
+            event = FakeEvent("给我画一张你现在的样子")
+            first, second = await asyncio.gather(
+                p.novelai_generate_image(event, "full body, standing"),
+                p.novelai_generate_image(event, "different prompt"),
+            )
+            self.assertIn("FINAL_IMAGE_TOOL_RESULT", first)
+            self.assertIn("ENTRY_GATE_BLOCKED_DUPLICATE", second)
+            self.assertEqual(p._resolve_active_preset.await_count, 1)
+            self.assertEqual(p._run_job.await_count, 1)
+
+        asyncio.run(run())
+
+    def test_role_card_command_can_list_show_switch_and_clear_persona_binding(self):
+        async def run():
+            p = self.make_plugin()
+            p._save_config = Mock()
+            p._resolve_active_persona_id = AsyncMock(return_value="persona-a")
+            listing = await p._handle_role_card_command(FakeEvent(), "list")
+            self.assertIn("P1", listing)
+            switched = await p._handle_role_card_command(FakeEvent(), "use P1")
+            self.assertIn("已将", switched)
+            self.assertEqual(p.config["persona_preset_map"]["persona-a"], "p1")
+            current = await p._handle_role_card_command(FakeEvent(), "current")
+            self.assertIn("正向 Tag", current)
+            cleared = await p._handle_role_card_command(FakeEvent(), "clear")
+            self.assertIn("已解除", cleared)
+            self.assertNotIn("persona-a", p.config["persona_preset_map"])
+            p.config["default_preset_id"] = "p1"
+            fallback = await p._handle_role_card_command(FakeEvent(), "current")
+            self.assertIn("未单独绑定", fallback)
+            no_binding = await p._handle_role_card_command(FakeEvent(), "clear")
+            self.assertIn("默认角色卡未更改", no_binding)
+
+        asyncio.run(run())
+
+    def test_model_command_lists_and_persists_supported_nai_model(self):
+        p = self.make_plugin()
+        p._save_config = Mock()
+        listing = p._handle_model_command("list")
+        self.assertIn("nai-diffusion-5-full", listing)
+        result = p._handle_model_command("use v4.5-curated")
+        self.assertIn("V4.5 Curated", result)
+        self.assertEqual(p.config["model"], "nai-diffusion-4-5-curated")
+        p._save_config.assert_called_once()
+
+    def test_nai_without_arguments_shows_all_commands_and_obeys_command_permission(self):
+        async def collect(plugin, event):
+            return [item async for item in plugin.cmd_draw(event)]
+
+        async def run():
+            p = self.make_plugin()
+            help_results = await collect(p, FakeEvent("/nai"))
+            self.assertEqual(len(help_results), 1)
+            self.assertIn("card current", help_results[0])
+            self.assertIn("model use", help_results[0])
+
+            denied_event = FakeEvent("/nai card list")
+            denied_event.role = "member"
+            denied_results = await collect(p, denied_event)
+            self.assertIn("仅允许管理员", denied_results[0])
+
+            p.config["invoke_mode"] = "llm_tool_only"
+            unrelated = await collect(p, FakeEvent("/help"))
+            self.assertEqual(unrelated, [])
+
+        asyncio.run(run())
+
+    def test_job_records_can_be_deleted_individually_or_cleared(self):
+        async def run():
+            p = self.make_plugin()
+            p._jobs = [{"job_id": "one"}, {"job_id": "two"}]
+            with patch("main.request", SimpleNamespace(json=AsyncMock(return_value={"action": "delete", "job_id": "one"}))):
+                await p.page_manage_jobs()
+            self.assertEqual([job["job_id"] for job in p._jobs], ["two"])
+
+            with patch("main.request", SimpleNamespace(json=AsyncMock(return_value={"action": "clear"}))):
+                await p.page_manage_jobs()
+            self.assertEqual(p._jobs, [])
+
         asyncio.run(run())
 
     def test_command_keeps_complete_prompt_and_does_not_mutate_reference_type(self):
@@ -547,6 +640,9 @@ class CoreTests(unittest.TestCase):
         self.assertIn('id="preset-lock-positive"', html)
         self.assertIn('id="preset-positive"', html)
         self.assertIn('id="preset-negative"', html)
+        self.assertIn('id="clear-jobs"', html)
+        self.assertIn("data-job-delete", script)
+        self.assertIn('bridge.apiPost("jobs/manage"', script)
         self.assertNotIn('id="preset-lock-style"', html)
         self.assertNotIn('id="preset-character"', html)
         self.assertIn("preset-badges", script)

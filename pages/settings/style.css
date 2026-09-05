@@ -633,7 +633,7 @@ body.custom-model .custom-model-only {
 }
 
 .small-btn {
-  min-height: 40px;
+  min-height: 44px;
   padding: 0 12px;
   border: 1px solid var(--line);
   border-radius: 9px;
@@ -730,6 +730,18 @@ body.custom-model .custom-model-only {
   max-width: 100%;
   color: var(--muted);
   overflow-wrap: anywhere;
+}
+
+.job-meta {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 10px;
+}
+
+.job-meta small {
+  width: 100%;
+  text-align: right;
 }
 
 .job-ok,
@@ -917,6 +929,14 @@ body.custom-model .custom-model-only {
   .reference-meta,
   .job-card > div {
     width: 100%;
+  }
+
+  .job-meta {
+    align-items: stretch;
+  }
+
+  .job-meta small {
+    text-align: left;
   }
 
   .card-actions {

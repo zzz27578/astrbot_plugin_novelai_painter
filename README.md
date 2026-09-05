@@ -20,7 +20,7 @@
 
     git clone https://github.com/zzz27578/astrbot_plugin_novelai_painter.git
 
-安装后进入 AstrBot WebUI 的插件详情页，打开 NovelAI Painter 设置页面完成配置。2.3.0 要求 AstrBot >= 4.27.3，并使用该版本起提供的统一人设解析接口，确保会话强制人设、Conversation 人设和默认人设与 AstrBot 主 Agent 的选择结果一致。
+安装后进入 AstrBot WebUI 的插件详情页，打开 NovelAI Painter 设置页面完成配置。2.3.1 要求 AstrBot >= 4.27.3，并使用该版本起提供的统一人设解析接口，确保会话强制人设、Conversation 人设和默认人设与 AstrBot 主 Agent 的选择结果一致。
 
 ## 命令
 
@@ -31,9 +31,17 @@
     /nai reference character <画面描述>
     /nai reference style <画面描述>
     /nai reference both <画面描述>
-    /nai preset list
+    /nai card current
+    /nai card list
+    /nai card use <角色卡 ID 或完整名称>
+    /nai card clear
+    /nai model current
+    /nai model list
+    /nai model use <模型 ID 或别名>
 
-/nai <描述> 旧格式默认兼容，可在 WebUI 关闭。参考图需要先在 WebUI 上传并绑定到角色卡；图生图优先使用绑定的参考图。固定命令成功时只发送图片，不追加一次 Agent 聊天回复。
+只发送 `/nai` 或 `/nai help` 会列出全部可执行命令。`/nai <描述>` 旧格式默认兼容，可在 WebUI 关闭。参考图需要先在 WebUI 上传并绑定到角色卡；图生图优先使用绑定的参考图。固定命令成功时只发送图片，不追加一次 Agent 聊天回复。
+
+`card use` 会优先修改当前 AstrBot 人设到角色卡的持久映射；会话未启用人设时修改默认角色卡。`card clear` 按相同作用域解除映射。`model use` 只允许切换 WebUI 列出的 NovelAI 官方模型，支持 `v5`、`v4.5`、`v4`、`v3` 等别名。帮助、查看、切换角色卡和切换模型都归入固定命令入口，并统一受 WebUI 的入口模式、私聊/群聊权限和白名单控制。
 
 LLM 工具名称为 novelai_generate_image。只有在入口模式启用、用户通过权限检查，并且用户明确要求生成/绘制/修改图片时才会执行。
 
@@ -47,15 +55,25 @@ AstrBot 日志中的“使用工具…参数”只会显示 LLM 为本次要求�
 
 1. 连接与模型：NovelAI 官方模型下拉列表、OpenAI/NewAPI 兼容模式、地址、密钥、鉴权请求头/前缀、尺寸、Steps、Scale、Sampler、负面提示词。
 2. 入口与权限：命令 / LLM 工具开关、私聊和群聊策略、白名单、管理员绕过、排队提示、429 提示、错误通知、去重窗口、临时文件清理，以及三档 429 自动重试策略。
-3. 角色卡：创建、编辑、删除、启用/禁用、绑定 AstrBot 人设 ID，保存统一的角色卡正向 Tag、角色卡负面 Tag、锁定开关和锚定强度。
+3. 角色卡：创建、编辑、删除、启用/禁用、绑定 AstrBot 人设 ID，保存统一的角色卡正向 Tag、角色卡负面 Tag、一致性保护开关和锚定强度。
 4. 参考图与图生图：总开关、上传、删除、绑定、图生图 Strength/Noise、颜色校正、Precise Reference Strength/Fidelity。
-5. 任务记录：查看本次运行期间的最近任务状态，不保存完整提示词和密钥。
+5. 任务记录：查看和删除本次运行期间的最近任务状态，可删除单条或清空全部；不保存完整提示词和密钥。
 
 点击顶部或底部“保存配置”后会立即写入插件配置，并通过页面提示保存结果。保存失败也会返回可读的中文错误，不依赖 Dashboard 的原始错误响应。
 
 角色卡编辑器内的“绑定人设 ID”和下方的人设映射表使用同一份 `persona_preset_map`。保存角色卡后绑定立即生效；旧版只写入预设 `persona_id` 的数据会在启动时自动迁移。禁用的角色卡会保留配置，但不会参与默认角色卡、人设映射或提示词合成。
 
 最终正向提示词的顺序固定为“角色卡正向 Tag → 一致性约束 → LLM 本次请求 Tag”。最终负面提示词由“全局负面提示词 + 角色卡负面 Tag”组成。用户明确要求换装、改发型、改发色、改眼睛、改种族、改主体或改画风时，插件只对该次请求移除角色卡中对应类别的正向与负向 Tag，其他人物/画风特征继续锁定，存储的角色卡不会被改写。
+
+## 2.3.1 修复
+
+- 新增 LLM 工具入口闸门：同一条消息第一次调用在任何异步角色卡解析、参考图读取或后端准备之前完成抢占；后续调用立即返回 `ENTRY_GATE_BLOCKED_DUPLICATE`，不会进入 NovelAI 官网请求路径。原事件 claim、inflight map、短窗口缓存和 Job ID 发图去重继续作为后续保险。
+- 将“锁定角色卡主体与画风”改名为“保护未指定的角色与画风特征”，明确该开关不会禁止用户主动换衣、改发型或改画风。补充“换/改/替换”等修改意图识别，允许 LLM 翻译出的对应 Tag 仅在本次请求覆盖角色卡。
+- 角色卡运行时只认 `persona_preset_map` 权威映射；旧 `persona_id` 仅用于一次性启动迁移，不再在用户解除绑定后偷偷重新生效。
+- 新增 `card current/list/use/clear` 与 `model current/list/use` 固定命令；仅输入 `/nai` 即显示完整帮助。所有管理命令与生图命令共用 WebUI 入口模式和权限策略。
+- WebUI 任务记录新增单条删除和全部清空，使用可键盘操作的确认对话框、忙碌状态和成功/错误提示；删除只影响内存记录，不删除已发送图片。
+
+完整验证说明见 [UPDATE_REPORT_2.3.1.md](UPDATE_REPORT_2.3.1.md)。
 
 ## 2.3.0 重构
 
@@ -80,7 +98,7 @@ AstrBot 日志中的“使用工具…参数”只会显示 LLM 为本次要求�
 - 预设启用状态真正参与解析，并在 WebUI 明确显示；补齐服务端预设字段校验和失败回滚。
 - API 重试遵守硬上限；429 等待期间释放全局通道；增加响应、图片和 ZIP 解压大小限制，并隐藏任务记录中的本地文件路径。
 
-完整历史验证与兼容说明见 [UPDATE_REPORT_2.2.0.md](UPDATE_REPORT_2.2.0.md)，当前行为以 2.3.0 为准。
+完整历史验证与兼容说明见 [UPDATE_REPORT_2.2.0.md](UPDATE_REPORT_2.2.0.md)，当前行为以 2.3.1 为准。
 
 ## 2.1.3 修复
 

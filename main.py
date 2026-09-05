@@ -34,10 +34,34 @@ except ImportError:
 from astrbot.core.message.message_event_result import MessageChain
 
 PLUGIN_NAME = "astrbot_plugin_novelai_painter"
-VERSION = "2.3.0"
+VERSION = "2.3.1"
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 MAX_RESPONSE_BYTES = 48 * 1024 * 1024
 DEFAULT_MODEL = "nai-diffusion-5-full"
+NAI_MODELS = {
+    "nai-diffusion-5-full": "V5 Full",
+    "nai-diffusion-5-curated": "V5 Curated",
+    "nai-diffusion-4-5-full": "V4.5 Full",
+    "nai-diffusion-4-5-curated": "V4.5 Curated",
+    "nai-diffusion-4-full": "V4 Full",
+    "nai-diffusion-4-curated-preview": "V4 Curated Preview",
+    "nai-diffusion-3": "V3 Anime",
+    "nai-diffusion-furry-3": "V3 Furry",
+}
+NAI_MODEL_ALIASES = {
+    "v5": "nai-diffusion-5-full",
+    "v5-full": "nai-diffusion-5-full",
+    "v5-curated": "nai-diffusion-5-curated",
+    "v4.5": "nai-diffusion-4-5-full",
+    "v4.5-full": "nai-diffusion-4-5-full",
+    "v4.5-curated": "nai-diffusion-4-5-curated",
+    "v4": "nai-diffusion-4-full",
+    "v4-full": "nai-diffusion-4-full",
+    "v4-curated": "nai-diffusion-4-curated-preview",
+    "v3": "nai-diffusion-3",
+    "v3-anime": "nai-diffusion-3",
+    "v3-furry": "nai-diffusion-furry-3",
+}
 DEFAULT_NEGATIVE = (
     "lowres, blurry, bad anatomy, bad hands, text, watermark, error, missing fingers, "
     "extra digit, fewer digits, cropped, worst quality, low quality, jpeg artifacts, "
@@ -101,6 +125,7 @@ class NovelAIPainterPlugin(Star):
         self.lock = asyncio.Lock()
         self._recent_jobs: dict[str, tuple[float, GenerationResult]] = {}
         self._inflight_jobs: dict[str, str] = {}
+        self._llm_tool_claims: dict[str, float] = {}
         self._delivered_jobs: dict[str, float] = {}
         self._jobs: list[dict[str, Any]] = []
         self._preset_schema_migrated = False
@@ -518,27 +543,12 @@ class NovelAIPainterPlugin(Star):
             mapped = self._get_preset(str(mapping.get(persona_id, "")))
             if mapped:
                 return mapped
-        if persona_id:
-            embedded = next(
-                (
-                    preset
-                    for preset in self.presets
-                    if str(preset.get("persona_id", "") or "").strip() == persona_id
-                    and self._as_bool(preset.get("enabled", True), True)
-                ),
-                None,
-            )
-            if embedded:
-                return embedded
         return self._get_preset(str(self._cfg("default_preset_id", "")))
 
-    async def _resolve_active_preset(
+    async def _resolve_active_persona_id(
         self,
         event: AstrMessageEvent | None = None,
-        preset_id: str | None = None,
-    ) -> dict[str, Any] | None:
-        if preset_id:
-            return self._get_preset(preset_id)
+    ) -> str:
         persona_id = ""
         resolved_by_persona_manager = False
         if event is not None:
@@ -574,6 +584,16 @@ class NovelAIPainterPlugin(Star):
                 logger.debug(f"[{PLUGIN_NAME}] 通过 PersonaManager 解析当前人设失败: {exc}")
         if not persona_id and not resolved_by_persona_manager:
             persona_id = self._resolve_persona_id(event)
+        return persona_id
+
+    async def _resolve_active_preset(
+        self,
+        event: AstrMessageEvent | None = None,
+        preset_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        if preset_id:
+            return self._get_preset(preset_id)
+        persona_id = await self._resolve_active_persona_id(event)
         return self._resolve_preset_for_persona(persona_id)
 
     def _resolve_preset(self, event: AstrMessageEvent | None = None, preset_id: str | None = None):
@@ -617,7 +637,10 @@ class NovelAIPainterPlugin(Star):
         return self._as_bool(self._cfg("quality_toggle", True))
 
     @staticmethod
-    def _requested_change_categories(event: AstrMessageEvent | None) -> set[str]:
+    def _requested_change_categories(
+        event: AstrMessageEvent | None,
+        candidate_prompt: str = "",
+    ) -> set[str]:
         try:
             raw_request = str(event.get_message_str() or "").lower().replace("_", " ") if event else ""
         except Exception:
@@ -631,11 +654,25 @@ class NovelAIPainterPlugin(Star):
             "body_features": r"(肤色|皮肤|身材|体型|胸部?|年龄|\bskin\b|\bbody shape\b|\bbreasts?\b|\bmuscular\b|\bpetite\b|\byoung\b|\badult\b|\bchild\b|\bteen(?:age|ager)?\b)",
             "style": r"(画风|风格|二次元|水彩|油画|写实|线稿|素描|赛璐璐|像素|\bstyle\b|\bwatercolor\b|\bphotorealistic\b|\brealistic\b|\bscreencap\b|\bsketch\b|\bcel shading\b|\banime\b|\bmanga\b|\bcartoon\b|\bcomic\b|\bpainting\b|\bdigital art\b|\billustration\b|\bpixel art\b|\b3d\b)",
         }
-        return {
+        categories = {
             category
             for category, pattern in patterns.items()
             if re.search(pattern, raw_request, re.I)
         }
+        explicit_change = re.search(
+            r"(换|改|变成|改成|改为|换成|换上|脱掉|摘掉|去掉|remove|replace|change|switch|"
+            r"turn into|instead of)",
+            raw_request,
+            re.I,
+        )
+        if explicit_change and candidate_prompt and not categories:
+            normalized_candidate = str(candidate_prompt).lower().replace("_", " ")
+            for category, pattern in NovelAIPainterPlugin._card_tag_patterns().items():
+                if pattern.search(normalized_candidate):
+                    categories.add(category)
+        if explicit_change and re.search(r"(造型|形象|look|appearance)", raw_request, re.I):
+            categories.update({"hair", "clothing", "body_features"})
+        return categories
 
     @staticmethod
     def _card_tag_patterns() -> dict[str, re.Pattern[str]]:
@@ -677,11 +714,12 @@ class NovelAIPainterPlugin(Star):
         positive_prompt: str,
         event: AstrMessageEvent | None,
         locked: bool,
+        candidate_prompt: str = "",
     ) -> str:
         """Apply request-local role-card overrides without mutating the card."""
         if not locked:
             return positive_prompt
-        requested_changes = self._requested_change_categories(event)
+        requested_changes = self._requested_change_categories(event, candidate_prompt)
         if not requested_changes:
             return positive_prompt
         patterns = self._card_tag_patterns()
@@ -702,9 +740,10 @@ class NovelAIPainterPlugin(Star):
         self,
         negative_prompt: str,
         event: AstrMessageEvent | None,
+        candidate_prompt: str = "",
     ) -> str:
         """Let an explicit request override role-card negatives for that category."""
-        requested_changes = self._requested_change_categories(event)
+        requested_changes = self._requested_change_categories(event, candidate_prompt)
         if not requested_changes:
             return negative_prompt
         patterns = self._card_tag_patterns()
@@ -736,8 +775,9 @@ class NovelAIPainterPlugin(Star):
             positive_prompt,
             event,
             lock_positive,
+            user_prompt,
         )
-        requested_changes = self._requested_change_categories(event)
+        requested_changes = self._requested_change_categories(event, user_prompt)
 
         if self._provider_name() == "novelai_official":
             model = self._active_model()
@@ -775,6 +815,7 @@ class NovelAIPainterPlugin(Star):
         preset_negative = self._adapt_negative_prompt(
             str(preset.get("negative_prompt", "") or "").strip(),
             event,
+            user_prompt,
         )
         return composed[:12000], str(preset.get("id", "")), preset_negative
 
@@ -792,7 +833,7 @@ class NovelAIPainterPlugin(Star):
         """
         if not preset:
             return prompt
-        requested_changes = self._requested_change_categories(event)
+        requested_changes = self._requested_change_categories(event, prompt)
         lock_positive = self._as_bool(preset.get("lock_positive", True), True)
         tag_patterns = self._card_tag_patterns()
         kept: list[str] = []
@@ -831,6 +872,30 @@ class NovelAIPainterPlugin(Star):
         raw = f"{origin}|{event.get_sender_id()}|{event.get_group_id() or ''}|{raw_message or prompt.strip()}"
         return "event-hash:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
+    def _claim_llm_tool_invocation(self, event: AstrMessageEvent) -> bool:
+        """Atomically gate duplicate LLM tool calls before any async preparation."""
+        claim_attr = "_novelai_painter_llm_tool_claim"
+        if getattr(event, claim_attr, False):
+            return False
+        key = self._event_key(event, "", "llm_tool")
+        claims = getattr(self, "_llm_tool_claims", None)
+        if claims is None:
+            self._llm_tool_claims = {}
+            claims = self._llm_tool_claims
+        now = time.time()
+        claim_ttl = max(300, int(self._cfg("dedupe_window_seconds", 30) or 30))
+        for old_key, created_at in list(claims.items()):
+            if now - created_at > claim_ttl:
+                claims.pop(old_key, None)
+        if key in claims:
+            return False
+        try:
+            setattr(event, claim_attr, True)
+        except Exception:
+            pass
+        claims[key] = now
+        return True
+
     def _can_use(self, event: AstrMessageEvent) -> tuple[bool, str]:
         if event.is_private_chat():
             policy = str(self._cfg("private_access", "all"))
@@ -861,6 +926,9 @@ class NovelAIPainterPlugin(Star):
         for job_id, delivered_at in list(getattr(self, "_delivered_jobs", {}).items()):
             if now - delivered_at > max(window, 300):
                 self._delivered_jobs.pop(job_id, None)
+        for key, claimed_at in list(getattr(self, "_llm_tool_claims", {}).items()):
+            if now - claimed_at > max(window, 300):
+                self._llm_tool_claims.pop(key, None)
         max_age = max(60, int(self._cfg("auto_clean_delay", 300) or 300) + 60)
         for path in self.temp_dir.glob("*"):
             try:
@@ -1345,6 +1413,177 @@ class NovelAIPainterPlugin(Star):
             return "img2img"
         return operation
 
+    def _command_help(self) -> str:
+        prefix = str(self._cfg("command_prefix", "nai") or "nai").strip().lstrip("/")
+        root = f"/{prefix}"
+        return (
+            "可执行命令：\n"
+            f"{root} draw <画面描述>\n"
+            f"{root} img2img <画面描述>\n"
+            f"{root} reference <character|style|both> <画面描述>\n"
+            f"{root} card current（查看当前角色卡）\n"
+            f"{root} card list（查看全部角色卡）\n"
+            f"{root} card use <角色卡 ID 或名称>（更换角色卡）\n"
+            f"{root} card clear（解除当前人设绑定或默认角色卡）\n"
+            f"{root} model current（查看当前 NAI 模型）\n"
+            f"{root} model list（查看可用 NAI 模型）\n"
+            f"{root} model use <模型 ID 或别名>（更换 NAI 模型）"
+        )
+
+    @staticmethod
+    def _truncate_command_value(value: Any, limit: int = 800) -> str:
+        text = str(value or "").strip() or "未填写"
+        return text if len(text) <= limit else text[:limit].rstrip() + "…"
+
+    def _find_role_card(self, selector: str) -> dict[str, Any]:
+        selector = str(selector or "").strip()
+        if not selector:
+            raise ValueError("请提供角色卡 ID 或完整名称。")
+        by_id = self._get_preset(selector, include_disabled=True)
+        if by_id:
+            return by_id
+        matches = [
+            preset
+            for preset in self.presets
+            if str(preset.get("name", "") or "").strip().casefold() == selector.casefold()
+        ]
+        if not matches:
+            raise ValueError("没有找到该角色卡，请先使用 card list 查看 ID。")
+        if len(matches) > 1:
+            raise ValueError("存在同名角色卡，请改用唯一的角色卡 ID。")
+        return matches[0]
+
+    def _role_card_details(self, preset: dict[str, Any], scope: str = "") -> str:
+        status = "已启用" if self._as_bool(preset.get("enabled", True), True) else "已禁用"
+        lines = [
+            f"当前角色卡：{preset.get('name') or preset.get('id')}（{preset.get('id')}，{status}）",
+        ]
+        if scope:
+            lines.append(f"生效来源：{scope}")
+        lines.extend([
+            f"正向 Tag：{self._truncate_command_value(preset.get('positive_prompt'))}",
+            f"负向 Tag：{self._truncate_command_value(preset.get('negative_prompt'))}",
+            f"参考图：{preset.get('reference_id') or '未绑定'}",
+        ])
+        return "\n".join(lines)
+
+    async def _handle_role_card_command(
+        self,
+        event: AstrMessageEvent,
+        arguments: str,
+    ) -> str:
+        action, separator, selector = str(arguments or "").strip().partition(" ")
+        action = action.lower()
+        if not action or action in {"current", "show", "当前", "查看"}:
+            persona_id = await self._resolve_active_persona_id(event)
+            raw_mapping = self._cfg("persona_preset_map", {})
+            mapping = raw_mapping if isinstance(raw_mapping, dict) else {}
+            mapped_preset = self._get_preset(str(mapping.get(persona_id, ""))) if persona_id else None
+            preset = mapped_preset or self._get_preset(str(self._cfg("default_preset_id", "")))
+            if not preset:
+                return "当前没有生效的角色卡，请使用 card list 和 card use 进行选择。"
+            if mapped_preset:
+                scope = f"AstrBot 人设 {persona_id}"
+            elif persona_id:
+                scope = f"默认角色卡（AstrBot 人设 {persona_id} 未单独绑定）"
+            else:
+                scope = "默认角色卡"
+            return self._role_card_details(preset, scope)
+        if action in {"list", "all", "列表", "全部"}:
+            if not self.presets:
+                return "暂无角色卡，请先在 WebUI 创建。"
+            lines = ["全部角色卡："]
+            for index, preset in enumerate(self.presets, 1):
+                status = "启用" if self._as_bool(preset.get("enabled", True), True) else "禁用"
+                lines.append(
+                    f"{index}. {preset.get('name') or preset.get('id')} · {preset.get('id')} · {status}"
+                )
+            return "\n".join(lines)
+        if action in {"use", "set", "切换", "更换"}:
+            if not separator or not selector.strip():
+                return "用法：card use <角色卡 ID 或完整名称>"
+            try:
+                preset = self._find_role_card(selector)
+            except ValueError as exc:
+                return str(exc)
+            if not self._as_bool(preset.get("enabled", True), True):
+                return "该角色卡已禁用，请先在 WebUI 启用后再切换。"
+            persona_id = await self._resolve_active_persona_id(event)
+            previous_config = dict(self.config)
+            if persona_id:
+                raw_mapping = self._cfg("persona_preset_map", {})
+                mapping = dict(raw_mapping) if isinstance(raw_mapping, dict) else {}
+                mapping[persona_id] = str(preset.get("id", ""))
+                self.config["persona_preset_map"] = mapping
+                scope = f"AstrBot 人设 {persona_id}"
+            else:
+                self.config["default_preset_id"] = str(preset.get("id", ""))
+                scope = "默认角色卡"
+            try:
+                self._save_config()
+            except Exception as exc:
+                self.config.clear()
+                self.config.update(previous_config)
+                logger.exception(f"[{PLUGIN_NAME}] 命令切换角色卡失败: {exc}")
+                return "角色卡切换失败，配置已回滚，请检查 AstrBot 日志。"
+            return f"已将 {scope} 切换为：{preset.get('name') or preset.get('id')}（{preset.get('id')}）。"
+        if action in {"clear", "off", "解除", "清除"}:
+            persona_id = await self._resolve_active_persona_id(event)
+            previous_config = dict(self.config)
+            if persona_id:
+                raw_mapping = self._cfg("persona_preset_map", {})
+                mapping = dict(raw_mapping) if isinstance(raw_mapping, dict) else {}
+                if persona_id not in mapping:
+                    return "当前 AstrBot 人设没有单独的角色卡绑定；默认角色卡未更改。"
+                mapping.pop(persona_id, None)
+                self.config["persona_preset_map"] = mapping
+                scope = f"AstrBot 人设 {persona_id} 的角色卡绑定"
+            else:
+                self.config["default_preset_id"] = ""
+                scope = "默认角色卡"
+            try:
+                self._save_config()
+            except Exception as exc:
+                self.config.clear()
+                self.config.update(previous_config)
+                logger.exception(f"[{PLUGIN_NAME}] 命令解除角色卡失败: {exc}")
+                return "角色卡解除失败，配置已回滚，请检查 AstrBot 日志。"
+            return f"已解除{scope}。"
+        return "角色卡命令用法：card current、card list、card use <ID 或名称>、card clear。"
+
+    def _handle_model_command(self, arguments: str) -> str:
+        action, separator, selector = str(arguments or "").strip().partition(" ")
+        action = action.lower()
+        active_model = self._active_model()
+        if not action or action in {"current", "show", "当前", "查看"}:
+            return f"当前 NAI 模型：{NAI_MODELS.get(active_model, '自定义模型')}（{active_model}）"
+        if action in {"list", "all", "列表", "全部"}:
+            lines = ["可用 NAI 模型："]
+            for model_id, label in NAI_MODELS.items():
+                marker = " ← 当前" if model_id == active_model else ""
+                lines.append(f"- {label}：{model_id}{marker}")
+            lines.append("常用别名：v5、v5-curated、v4.5、v4.5-curated、v4、v4-curated、v3、v3-furry")
+            return "\n".join(lines)
+        if action in {"use", "set", "切换", "更换"}:
+            if not separator or not selector.strip():
+                return "用法：model use <模型 ID 或别名>"
+            if self._provider_name() != "novelai_official":
+                return "更换 NAI 模型只适用于 NovelAI 官方后端；请先在 WebUI 切换后端。"
+            requested = selector.strip().lower()
+            model_id = NAI_MODEL_ALIASES.get(requested, requested)
+            if model_id not in NAI_MODELS:
+                return "不支持该 NAI 模型，请先使用 model list 查看可用模型和别名。"
+            previous_model = self.config.get("model", DEFAULT_MODEL)
+            self.config["model"] = model_id
+            try:
+                self._save_config()
+            except Exception as exc:
+                self.config["model"] = previous_model
+                logger.exception(f"[{PLUGIN_NAME}] 命令切换 NAI 模型失败: {exc}")
+                return "NAI 模型切换失败，配置已回滚，请检查 AstrBot 日志。"
+            return f"已切换 NAI 模型：{NAI_MODELS[model_id]}（{model_id}）。"
+        return "模型命令用法：model current、model list、model use <模型 ID 或别名>。"
+
     # --------------------------- AstrBot handlers ---------------------------
     @filter.llm_tool(name="novelai_generate_image")
     async def novelai_generate_image(
@@ -1366,6 +1605,14 @@ class NovelAIPainterPlugin(Star):
             return (
                 "FINAL_IMAGE_TOOL_RESULT: Natural-language image generation is disabled. "
                 "Do not call any tool again for this message. Reply to the user briefly."
+            )
+
+        if not self._claim_llm_tool_invocation(event):
+            return (
+                "FINAL_IMAGE_TOOL_RESULT: ENTRY_GATE_BLOCKED_DUPLICATE. An image generation call for this "
+                "exact user message was already accepted before backend preparation. Do not call any tool "
+                "again. The accepted call is responsible for sending the image; reply to the user once only "
+                "after that accepted call completes."
             )
 
         normalized_prompt = str(prompt or "").strip()
@@ -1417,17 +1664,21 @@ class NovelAIPainterPlugin(Star):
 
     @filter.regex(r"^/[A-Za-z][A-Za-z0-9_-]*(?:@[A-Za-z0-9_-]+)?(?:\s|$)")
     async def cmd_draw(self, event: AstrMessageEvent):
-        """NovelAI 命令入口：/nai draw <描述>、/nai img2img <描述>、/nai reference <character|style|both> <描述>。"""
-        if not self._mode_allows("command"):
-            yield event.plain_result("当前未启用固定命令生图入口。")
-            return
+        """NovelAI 生图、角色卡和模型固定命令入口。"""
         raw_message = event.get_message_str().strip()
         match = re.match(r"^/(?P<name>[A-Za-z][A-Za-z0-9_-]*)(?:@[A-Za-z0-9_-]+)?(?:\s+(?P<body>.*))?$", raw_message, re.S)
         if not match or match.group("name").lower() != str(self._cfg("command_prefix", "nai") or "nai").strip().lstrip("/").lower():
             return
+        if not self._mode_allows("command"):
+            yield event.plain_result("当前未启用固定命令入口。")
+            return
+        allowed, reason = self._can_use(event)
+        if not allowed:
+            yield event.plain_result(reason)
+            return
         text = (match.group("body") or "").strip()
         if not text or text.lower() in {"help", "?", "菜单"}:
-            yield event.plain_result("用法：/nai draw <画面描述>；/nai img2img <画面描述>；/nai reference <character|style|both> <画面描述>；/nai preset list")
+            yield event.plain_result(self._command_help())
             return
         command, separator, remainder = text.partition(" ")
         command = command.lower()
@@ -1447,12 +1698,23 @@ class NovelAIPainterPlugin(Star):
             if reference_type not in {"character", "style", "both"}:
                 yield event.plain_result("参考类型只能是 character、style 或 both。")
                 return
-        elif command == "preset":
-            if remainder.strip().lower() == "list":
-                names = [str(p.get("name", p.get("id", ""))) for p in self.presets]
-                yield event.plain_result("可用角色卡：" + ("、".join(names) if names else "暂无角色卡，请在 WebUI 创建。"))
-            else:
-                yield event.plain_result("角色卡管理请使用 AstrBot WebUI 页面。")
+        elif command in {"card", "role", "preset", "角色卡"}:
+            yield event.plain_result(await self._handle_role_card_command(event, remainder))
+            return
+        elif command in {"cards", "roles", "角色卡列表"}:
+            yield event.plain_result(await self._handle_role_card_command(event, "list"))
+            return
+        elif command in {"use-card", "切换角色卡", "更换角色卡"}:
+            yield event.plain_result(await self._handle_role_card_command(event, f"use {remainder}"))
+            return
+        elif command in {"model", "模型"}:
+            yield event.plain_result(self._handle_model_command(remainder))
+            return
+        elif command in {"models", "模型列表"}:
+            yield event.plain_result(self._handle_model_command("list"))
+            return
+        elif command in {"use-model", "切换模型", "更换模型"}:
+            yield event.plain_result(self._handle_model_command(f"use {remainder}"))
             return
         elif not self._as_bool(self._cfg("legacy_command_enabled", True)):
             yield event.plain_result("请使用 /nai draw、/nai img2img 或 /nai reference 命令。")
@@ -1484,6 +1746,7 @@ class NovelAIPainterPlugin(Star):
             ("references/manage", self.page_manage_reference, ["POST"]),
             ("references/<reference_id>", self.page_delete_reference, ["DELETE"]),
             ("jobs", self.page_jobs, ["GET"]),
+            ("jobs/manage", self.page_manage_jobs, ["POST"]),
         ]
         for suffix, handler, methods in routes:
             self.context.register_web_api(f"/{PLUGIN_NAME}/{suffix}", handler, methods, f"NovelAI Painter {suffix}")
@@ -1809,6 +2072,30 @@ class NovelAIPainterPlugin(Star):
 
     async def page_jobs(self):
         return json_response({"jobs": self._jobs[-50:]})
+
+    async def page_manage_jobs(self):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return self._page_error("任务记录操作格式错误")
+        action = str(payload.get("action", "") or "").strip().lower()
+        if action == "clear":
+            removed = len(self._jobs)
+            self._jobs.clear()
+            return json_response({"ok": True, "message": f"已清空 {removed} 条任务记录", "jobs": []})
+        if action == "delete":
+            job_id = str(payload.get("job_id", "") or "").strip()
+            if not job_id:
+                return self._page_error("缺少 Job ID")
+            remaining = [job for job in self._jobs if str(job.get("job_id", "")) != job_id]
+            if len(remaining) == len(self._jobs):
+                return self._page_error("任务记录不存在", status_code=404)
+            self._jobs = remaining
+            return json_response({
+                "ok": True,
+                "message": "任务记录已删除",
+                "jobs": self._jobs[-50:],
+            })
+        return self._page_error("不支持的任务记录操作")
 
     def _capabilities(self) -> dict[str, Any]:
         if self._provider_name() == "novelai_official":

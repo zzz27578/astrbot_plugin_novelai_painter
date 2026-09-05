@@ -356,6 +356,8 @@ async function renderJobs({ reportErrors = true } = {}) {
     const data = ensureOk(await withTimeout(bridge.apiGet("jobs"), 15000, "读取任务记录超时"));
     const jobs = Array.isArray(data.jobs) ? data.jobs : [];
     const box = $("#job-list");
+    const clearButton = $("#clear-jobs");
+    if (clearButton) clearButton.disabled = jobs.length === 0;
     if (!jobs.length) {
       box.innerHTML = '<div class="empty">暂无运行记录。</div>';
       return;
@@ -366,10 +368,68 @@ async function renderJobs({ reportErrors = true } = {}) {
           <div class="${job.ok ? "job-ok" : "job-fail"}">${job.ok ? "成功" : "失败"} · ${esc(job.operation || "generate")}</div>
           <small>Job ${esc(job.job_id)} · ${esc(job.provider)} · 尝试 ${esc(job.attempts || 0)} 次 · ${new Date((job.created_at || 0) * 1000).toLocaleString()}</small>
         </div>
-        <div><small>${job.preset_id ? `角色卡 ${esc(job.preset_id)} · ` : "未使用角色卡 · "}${esc(job.message || job.error_code || "")}</small></div>
+        <div class="job-meta"><small>${job.preset_id ? `角色卡 ${esc(job.preset_id)} · ` : "未使用角色卡 · "}${esc(job.message || job.error_code || "")}</small><div class="card-actions"><button class="small-btn danger" type="button" data-job-delete="${esc(job.job_id)}">删除记录</button></div></div>
       </article>`).join("");
+    $$('[data-job-delete]', box).forEach((button) => {
+      button.addEventListener("click", () => deleteJob(button.dataset.jobDelete, button));
+    });
   } catch (error) {
     if (reportErrors) toast(readableError(error), "error");
+  }
+}
+
+async function deleteJob(jobId, trigger = null) {
+  if (!jobId) return false;
+  const confirmed = await askConfirmation({
+    title: "删除这条任务记录？",
+    message: `将删除 Job ${jobId} 的本地运行记录，不会删除已经发送的图片。`,
+    confirmText: "删除记录",
+  });
+  if (!confirmed) return false;
+  if (trigger) trigger.disabled = true;
+  try {
+    const data = ensureOk(await withTimeout(
+      bridge.apiPost("jobs/manage", { action: "delete", job_id: jobId }),
+      15000,
+      "删除任务记录超时",
+    ));
+    await renderJobs();
+    toast(data.message || "任务记录已删除");
+    return true;
+  } catch (error) {
+    toast(readableError(error), "error", 7000);
+    return false;
+  } finally {
+    if (trigger?.isConnected) trigger.disabled = false;
+  }
+}
+
+async function clearJobs() {
+  const button = $("#clear-jobs");
+  const confirmed = await askConfirmation({
+    title: "清空全部任务记录？",
+    message: "只会清空本次插件运行期间的记录，不会删除已经发送的图片。",
+    confirmText: "清空记录",
+  });
+  if (!confirmed) return false;
+  button.disabled = true;
+  const previousText = button.textContent;
+  button.textContent = "清空中…";
+  try {
+    const data = ensureOk(await withTimeout(
+      bridge.apiPost("jobs/manage", { action: "clear" }),
+      15000,
+      "清空任务记录超时",
+    ));
+    await renderJobs();
+    toast(data.message || "任务记录已清空");
+    return true;
+  } catch (error) {
+    toast(readableError(error), "error", 7000);
+    return false;
+  } finally {
+    button.textContent = previousText;
+    if ($$(".job-card", $("#job-list")).length) button.disabled = false;
   }
 }
 
@@ -634,6 +694,7 @@ $("#delete-preset").addEventListener("click", () => {
   if (editingPreset) deletePreset(editingPreset.id, $("#delete-preset"));
 });
 $("#refresh-jobs").addEventListener("click", () => renderJobs());
+$("#clear-jobs").addEventListener("click", clearJobs);
 $("#confirm-cancel").addEventListener("click", () => closeConfirmation(false));
 $("#confirm-accept").addEventListener("click", () => closeConfirmation(true));
 $("#confirm-dialog").addEventListener("click", (event) => {
