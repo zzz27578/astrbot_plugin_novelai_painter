@@ -16,19 +16,23 @@ class FakeEvent:
     unified_msg_origin = "test:group:1"
     role = "admin"
     message_obj = SimpleNamespace(message_id="m-1")
-    def __init__(self): self.sent = []
+    def __init__(self, message="1girl, silver hair, blue eyes, night city"):
+        self.sent = []
+        self.message = message
     async def send(self, message): self.sent.append(message)
     def is_private_chat(self): return False
-    def is_admin(self): return True
+    def is_admin(self): return self.role == "admin"
     def get_sender_id(self): return "u-1"
     def get_group_id(self): return "g-1"
-    def get_message_str(self): return "1girl, silver hair, blue eyes, night city"
+    def get_platform_name(self): return "aiocqhttp"
+    def get_message_str(self): return self.message
+    def plain_result(self, message): return message
 
 
 class CoreTests(unittest.TestCase):
     def make_plugin(self):
         p = object.__new__(NovelAIPainterPlugin)
-        p.config = {"model":"nai-diffusion-5-full", "negative_prompt":DEFAULT_NEGATIVE, "quality_toggle":True, "width":832, "height":1216, "steps":28, "scale":5.0, "sampler":"k_euler_ancestral", "reference_strength":.6, "reference_fidelity":.6, "reference_information_extracted":1.0, "provider":"novelai_official", "invoke_mode":"both", "group_access":"admin_only", "admin_bypass":True, "private_access":"all", "dedupe_window_seconds":30, "queue_timeout":1, "retry_mode":"none", "retry_delay":1, "show_retry_notice":False, "auto_clean_delay":300}
+        p.config = {"model":"nai-diffusion-5-full", "negative_prompt":DEFAULT_NEGATIVE, "quality_toggle":True, "width":832, "height":1216, "steps":28, "scale":5.0, "sampler":"k_euler_ancestral", "reference_strength":.6, "reference_fidelity":.6, "reference_information_extracted":1.0, "provider":"novelai_official", "invoke_mode":"both", "group_access":"admin_only", "admin_bypass":True, "private_access":"all", "dedupe_window_seconds":30, "queue_timeout":1, "retry_mode":"none", "retry_delay":1, "show_retry_notice":False, "auto_clean_delay":300, "llm_auto_reference":True, "reference_enabled":True, "img2img_enabled":True, "persona_preset_map":{}}
         p.presets = [{"id":"p1", "name":"P1", "style_prompt":"watercolor", "character_prompt":"blue eyes", "negative_prompt":"extra arms", "reference_id":"r1", "reference_type":"style", "lock_style":True, "lock_character":True, "style_strength":1.35, "character_strength":1.25, "quality_override":"off"}]
         p._recent_jobs = {}
         p._delivered_jobs = {}
@@ -37,7 +41,6 @@ class CoreTests(unittest.TestCase):
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)
         p.temp_dir = Path(temp_dir.name)
-        p._get_preset = lambda pid: next((x for x in p.presets if x.get("id") == pid), None)
         p._resolve_persona_id = lambda event=None: ""
         return p
 
@@ -105,6 +108,156 @@ class CoreTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("管理员", reason)
 
+    def test_admin_policy_and_disabled_policy_are_not_controlled_by_allowlist_bypass(self):
+        p = self.make_plugin()
+        event = FakeEvent()
+        p.config["admin_bypass"] = False
+        p.config["group_access"] = "admin_only"
+        self.assertTrue(p._can_use(event)[0])
+        p.config["admin_bypass"] = True
+        p.config["group_access"] = "disabled"
+        self.assertFalse(p._can_use(event)[0])
+
+    def test_embedded_persona_binding_resolves_and_disabled_preset_does_not(self):
+        p = self.make_plugin()
+        p.presets[0]["persona_id"] = "persona-a"
+        p._resolve_persona_id = lambda event=None: "persona-a"
+        self.assertEqual(p._resolve_preset(FakeEvent())["id"], "p1")
+        p.presets[0]["enabled"] = False
+        self.assertIsNone(p._resolve_preset(FakeEvent()))
+
+    def test_editor_persona_binding_synchronizes_config_mapping(self):
+        p = self.make_plugin()
+        p.presets[0]["persona_id"] = "persona-a"
+        self.assertTrue(p._sync_preset_persona_binding(p.presets[0]))
+        self.assertEqual(p.config["persona_preset_map"], {"persona-a": "p1"})
+
+    def test_unchanged_embedded_binding_does_not_override_canonical_mapping(self):
+        p = self.make_plugin()
+        p.presets[0]["persona_id"] = "persona-a"
+        p.config["persona_preset_map"] = {"persona-a": "other"}
+        self.assertFalse(p._sync_preset_persona_binding(p.presets[0], "persona-a"))
+        self.assertEqual(p.config["persona_preset_map"], {"persona-a": "other"})
+        self.assertEqual(p._public_presets()[0]["persona_id"], "")
+
+    def test_preset_id_is_server_owned_and_immutable(self):
+        p = self.make_plugin()
+        created = p._normalize_preset_fields({"id": "client-id", "name": "New"})
+        self.assertNotEqual(created["id"], "client-id")
+        updated = p._normalize_preset_fields({"id": "replacement", "name": "Updated"}, p.presets[0])
+        self.assertEqual(updated["id"], "p1")
+
+    def test_old_embedded_persona_binding_is_migrated_without_overwriting_explicit_map(self):
+        p = self.make_plugin()
+        p.presets[0]["persona_id"] = "persona-a"
+        p.config["persona_preset_map"] = {"persona-a": "explicit", "persona-b": "other"}
+        p._save_config = Mock()
+        p._migrate_embedded_persona_bindings()
+        self.assertEqual(p.config["persona_preset_map"]["persona-a"], "explicit")
+        p._save_config.assert_not_called()
+
+        p.config["persona_preset_map"] = {"persona-b": "other"}
+        p._migrate_embedded_persona_bindings()
+        self.assertEqual(p.config["persona_preset_map"]["persona-a"], "p1")
+        p._save_config.assert_called_once()
+
+    def test_active_preset_uses_astrbot_4273_persona_manager(self):
+        async def run():
+            p = self.make_plugin()
+            p.config["persona_preset_map"] = {"persona-a": "p1"}
+            conversation_manager = SimpleNamespace(
+                get_curr_conversation_id=AsyncMock(return_value="conv-1"),
+                get_conversation=AsyncMock(return_value=SimpleNamespace(persona_id="conversation-persona")),
+            )
+            persona_manager = SimpleNamespace(
+                resolve_selected_persona=AsyncMock(return_value=("persona-a", {}, "persona-a", False)),
+            )
+            p.context = SimpleNamespace(
+                conversation_manager=conversation_manager,
+                persona_manager=persona_manager,
+                get_config=Mock(return_value={"provider_settings": {"default_personality": "default-persona"}}),
+            )
+            event = FakeEvent()
+            preset = await p._resolve_active_preset(event)
+            self.assertEqual(preset["id"], "p1")
+            persona_manager.resolve_selected_persona.assert_awaited_once_with(
+                umo=event.unified_msg_origin,
+                conversation_persona_id="conversation-persona",
+                platform_name="aiocqhttp",
+                provider_settings={"default_personality": "default-persona"},
+            )
+        asyncio.run(run())
+
+    def test_active_preset_passes_none_when_no_current_conversation(self):
+        async def run():
+            p = self.make_plugin()
+            p.config["persona_preset_map"] = {"persona-a": "p1"}
+            conversation_manager = SimpleNamespace(
+                get_curr_conversation_id=AsyncMock(return_value=None),
+                get_conversation=AsyncMock(return_value=None),
+            )
+            persona_manager = SimpleNamespace(
+                resolve_selected_persona=AsyncMock(return_value=("persona-a", {}, None, False)),
+            )
+            p.context = SimpleNamespace(
+                conversation_manager=conversation_manager,
+                persona_manager=persona_manager,
+                get_config=Mock(return_value={"provider_settings": {}}),
+            )
+            preset = await p._resolve_active_preset(FakeEvent())
+            self.assertEqual(preset["id"], "p1")
+            conversation_manager.get_conversation.assert_not_awaited()
+            self.assertIsNone(
+                persona_manager.resolve_selected_persona.await_args.kwargs["conversation_persona_id"]
+            )
+        asyncio.run(run())
+
+    def test_explicit_no_persona_does_not_fall_back_to_session_default_persona(self):
+        async def run():
+            p = self.make_plugin()
+            p.config["default_preset_id"] = "p1"
+            p.config["persona_preset_map"] = {"default-persona": "other"}
+            p._resolve_persona_id = Mock(return_value="default-persona")
+            p.context = SimpleNamespace(
+                conversation_manager=SimpleNamespace(
+                    get_curr_conversation_id=AsyncMock(return_value="conv-1"),
+                    get_conversation=AsyncMock(return_value=SimpleNamespace(persona_id="[%None]")),
+                ),
+                persona_manager=SimpleNamespace(
+                    resolve_selected_persona=AsyncMock(return_value=("[%None]", None, None, False)),
+                ),
+                get_config=Mock(return_value={"provider_settings": {"default_personality": "default-persona"}}),
+            )
+            preset = await p._resolve_active_preset(FakeEvent())
+            self.assertEqual(preset["id"], "p1")
+            p._resolve_persona_id.assert_not_called()
+        asyncio.run(run())
+
+    def test_locked_preset_filters_hallucinated_character_and_style_tags(self):
+        p = self.make_plugin()
+        event = FakeEvent("宝宝，画给我看看你现在的样子")
+        filtered = p._filter_llm_prompt_conflicts(
+            "full body, pink hair, wedding dress, anime screencap, looking at viewer",
+            event,
+            p.presets[0],
+        )
+        self.assertIn("full body", filtered)
+        self.assertIn("looking at viewer", filtered)
+        self.assertNotIn("pink hair", filtered)
+        self.assertNotIn("wedding dress", filtered)
+        self.assertNotIn("anime screencap", filtered)
+
+    def test_explicit_character_change_is_preserved(self):
+        p = self.make_plugin()
+        event = FakeEvent("把衣服换成婚纱")
+        filtered = p._filter_llm_prompt_conflicts(
+            "pink hair, wedding dress, standing",
+            event,
+            p.presets[0],
+        )
+        self.assertIn("wedding dress", filtered)
+        self.assertNotIn("pink hair", filtered)
+
     def test_duplicate_event_has_one_provider_call(self):
         async def run():
             p = self.make_plugin()
@@ -147,6 +300,33 @@ class CoreTests(unittest.TestCase):
             self.assertFalse(result.ok)
             self.assertEqual(result.attempts, 3)
             self.assertEqual(p._call_official.await_count, 3)
+        asyncio.run(run())
+
+    def test_retry_mode_obeys_hard_request_limit(self):
+        p = self.make_plugin()
+        p.config["retry_mode"] = "rate_limit_twice"
+        p.config["max_api_requests_per_job"] = 1
+        self.assertEqual(p._retry_limit(), 1)
+
+    def test_retry_wait_releases_global_request_lock(self):
+        async def run():
+            p = self.make_plugin()
+            p.config["retry_mode"] = "rate_limit_once"
+            p.config["max_api_requests_per_job"] = 2
+            p._call_official = AsyncMock(side_effect=[
+                ProviderError("429", "limited", retryable=True),
+                "image.png",
+            ])
+            p._load_reference = AsyncMock(return_value=(None, None))
+            lock_states = []
+
+            async def observe_sleep(_):
+                lock_states.append(p.lock.locked())
+
+            with patch("main.asyncio.sleep", new=observe_sleep):
+                result = await p._run_job(FakeEvent(), "a scene")
+            self.assertTrue(result.ok)
+            self.assertEqual(lock_states, [False])
         asyncio.run(run())
 
     def test_non_429_error_never_retries(self):
@@ -225,13 +405,66 @@ class CoreTests(unittest.TestCase):
             p._finish_event = AsyncMock(return_value="ok")
             event = FakeEvent()
             result = await p.novelai_generate_image(event)
-            self.assertEqual(result, "ok")
+            self.assertIsNone(result)
             p._run_job.assert_awaited_once_with(
                 event,
                 "1girl, silver hair, blue eyes, night city",
                 "generate",
+                preset_id=None,
+                reference_type=None,
             )
+            p._finish_event.assert_awaited_once()
 
+        asyncio.run(run())
+
+    def test_llm_automatically_uses_bound_reference(self):
+        p = self.make_plugin()
+        p.config["default_preset_id"] = "p1"
+        self.assertEqual(p._resolve_llm_operation("generate", p.presets[0]), "reference")
+        p.config["llm_auto_reference"] = False
+        self.assertEqual(p._resolve_llm_operation("generate", p.presets[0]), "generate")
+
+    def test_llm_request_reaches_provider_with_anchors_and_bound_reference(self):
+        async def run():
+            p = self.make_plugin()
+            p.config["default_preset_id"] = "p1"
+            p._load_reference = AsyncMock(return_value=(b"reference", {"id": "r1", "reference_type": "style"}))
+            p._call_official = AsyncMock(return_value="image.png")
+            p._finish_event = AsyncMock(return_value="done")
+            event = FakeEvent("宝宝，画给我看看你现在的样子")
+            result = await p.novelai_generate_image(
+                event,
+                "full body, pink hair, wedding dress, looking at viewer",
+            )
+            self.assertIsNone(result)
+            args = p._call_official.await_args.args
+            self.assertTrue(args[0].startswith("1.35::watercolor::"))
+            self.assertIn("1.25::blue eyes::", args[0])
+            self.assertNotIn("pink hair", args[0])
+            self.assertNotIn("wedding dress", args[0])
+            self.assertEqual(args[1], "reference")
+            self.assertIsNotNone(args[4])
+            self.assertEqual(args[4]["reference_type"], "style")
+            p._finish_event.assert_awaited_once()
+        asyncio.run(run())
+
+    def test_command_keeps_complete_prompt_and_does_not_mutate_reference_type(self):
+        async def run():
+            p = self.make_plugin()
+            p.config["default_preset_id"] = "p1"
+            p._run_job = AsyncMock(return_value=GenerationResult(True, "job-1", "novelai_official", send_image=False))
+            p._finish_event = AsyncMock()
+            event = FakeEvent("/nai draw 1girl, blonde hair, blue eyes")
+            async for _ in p.cmd_draw(event):
+                pass
+            self.assertEqual(p._run_job.await_args.args[1], "1girl, blonde hair, blue eyes")
+
+            original_type = p.presets[0]["reference_type"]
+            event = FakeEvent("/nai reference both standing in rain")
+            async for _ in p.cmd_draw(event):
+                pass
+            self.assertEqual(p._run_job.await_args.args[5], "both")
+            self.assertEqual(p.presets[0]["reference_type"], original_type)
         asyncio.run(run())
 
     def test_webui_uses_embedded_confirmation_and_wraps_long_text(self):
@@ -248,6 +481,10 @@ class CoreTests(unittest.TestCase):
         self.assertIn('value="rate_limit_once"', html)
         self.assertIn('id="preset-lock-style"', html)
         self.assertIn("preset-badges", script)
+        self.assertIn('id="preset-enabled"', html)
+        self.assertIn('data-config="llm_auto_reference"', html)
+        self.assertIn('list="persona-options"', html)
+        self.assertIn('enabled: $("#preset-enabled").checked', script)
 
 
 if __name__ == "__main__":

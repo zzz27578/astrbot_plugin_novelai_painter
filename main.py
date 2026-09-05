@@ -34,13 +34,27 @@ except ImportError:
 from astrbot.core.message.message_event_result import MessageChain
 
 PLUGIN_NAME = "astrbot_plugin_novelai_painter"
-VERSION = "2.1.3"
+VERSION = "2.2.0"
+MAX_IMAGE_BYTES = 32 * 1024 * 1024
+MAX_RESPONSE_BYTES = 48 * 1024 * 1024
 DEFAULT_MODEL = "nai-diffusion-5-full"
 DEFAULT_NEGATIVE = (
     "lowres, blurry, bad anatomy, bad hands, text, watermark, error, missing fingers, "
     "extra digit, fewer digits, cropped, worst quality, low quality, jpeg artifacts, "
     "signature, username"
 )
+CONFIG_KEYS = {
+    "config_version", "provider", "api_token", "api_key", "base_url", "openai_base_url",
+    "openai_image_endpoint", "openai_edit_endpoint", "openai_auth_header", "openai_auth_prefix",
+    "model", "custom_model", "command_prefix", "invoke_mode", "private_access", "group_access",
+    "allowed_users", "allowed_groups", "admin_bypass", "legacy_command_enabled", "width", "height",
+    "steps", "scale", "sampler", "negative_prompt", "quality_toggle", "images_per_request",
+    "max_api_requests_per_job", "dedupe_window_seconds", "queue_timeout", "retry_mode", "retry_delay",
+    "error_notify_mode", "show_queue_notice", "notify_429", "show_retry_notice", "auto_clean_delay",
+    "default_preset_id", "persona_preset_map", "llm_auto_reference", "img2img_enabled",
+    "reference_enabled", "img2img_strength", "img2img_noise", "img2img_color_correct",
+    "reference_strength", "reference_fidelity", "reference_information_extracted",
+}
 
 
 @dataclass
@@ -75,7 +89,9 @@ class ProviderError(RuntimeError):
 class NovelAIPainterPlugin(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
-        self.config = config or {}
+        # Keep AstrBot's dict-like config object even when it is currently empty;
+        # replacing it with a plain dict would make subsequent saves ineffective.
+        self.config = config if config is not None else {}
         self.data_dir = Path(StarTools.get_data_dir(PLUGIN_NAME))
         self.temp_dir = self.data_dir / "temp"
         self.reference_dir = self.data_dir / "references"
@@ -84,16 +100,18 @@ class NovelAIPainterPlugin(Star):
         self.reference_dir.mkdir(parents=True, exist_ok=True)
         self.lock = asyncio.Lock()
         self._recent_jobs: dict[str, tuple[float, GenerationResult]] = {}
+        self._inflight_jobs: dict[str, str] = {}
         self._delivered_jobs: dict[str, float] = {}
         self._jobs: list[dict[str, Any]] = []
         self.presets = self._load_presets()
         self._ensure_defaults()
+        self._migrate_embedded_persona_bindings()
         self._register_web_api()
 
     # --------------------------- configuration ---------------------------
     def _ensure_defaults(self) -> None:
         defaults = {
-            "config_version": 3,
+            "config_version": 4,
             "provider": "novelai_official",
             "api_token": "",
             "api_key": "",
@@ -133,6 +151,7 @@ class NovelAIPainterPlugin(Star):
             "auto_clean_delay": 300,
             "default_preset_id": "",
             "persona_preset_map": {},
+            "llm_auto_reference": True,
             "img2img_enabled": True,
             "reference_enabled": True,
             "img2img_strength": 0.7,
@@ -151,8 +170,8 @@ class NovelAIPainterPlugin(Star):
             config_version = int(self.config.get("config_version", 0) or 0)
         except (TypeError, ValueError):
             config_version = 0
-        if config_version < 3:
-            self.config["config_version"] = 3
+        if config_version < 4:
+            self.config["config_version"] = 4
             self.config["images_per_request"] = 1
             self.config["max_api_requests_per_job"] = 3
             changed = True
@@ -242,10 +261,142 @@ class NovelAIPainterPlugin(Star):
         if callable(saver):
             saver()
 
+    def _migrate_embedded_persona_bindings(self) -> None:
+        """Make the preset editor's legacy persona_id field operational.
+
+        persona_preset_map remains the canonical many-persona mapping. Older
+        presets only stored persona_id, so copy non-conflicting bindings into
+        the map during startup instead of silently ignoring them.
+        """
+        raw_mapping = self._cfg("persona_preset_map", {})
+        mapping = dict(raw_mapping) if isinstance(raw_mapping, dict) else {}
+        changed = not isinstance(raw_mapping, dict)
+        for preset in self.presets:
+            persona_id = str(preset.get("persona_id", "") or "").strip()
+            preset_id = str(preset.get("id", "") or "").strip()
+            if persona_id and preset_id and persona_id not in mapping:
+                mapping[persona_id] = preset_id
+                changed = True
+        if changed:
+            self.config["persona_preset_map"] = mapping
+            try:
+                self._save_config()
+            except Exception as exc:
+                logger.warning(f"[{PLUGIN_NAME}] 迁移人设预设映射失败: {exc}")
+
+    def _sync_preset_persona_binding(self, preset: dict[str, Any], previous_persona_id: str = "") -> bool:
+        """Synchronize the preset editor binding with persona_preset_map."""
+        preset_id = str(preset.get("id", "") or "").strip()
+        persona_id = str(preset.get("persona_id", "") or "").strip()
+        previous_persona_id = str(previous_persona_id or "").strip()
+        raw_mapping = self._cfg("persona_preset_map", {})
+        mapping = dict(raw_mapping) if isinstance(raw_mapping, dict) else {}
+        changed = not isinstance(raw_mapping, dict)
+
+        if persona_id != previous_persona_id:
+            if previous_persona_id and mapping.get(previous_persona_id) == preset_id:
+                mapping.pop(previous_persona_id, None)
+                changed = True
+            if persona_id and mapping.get(persona_id) != preset_id:
+                mapping[persona_id] = preset_id
+                changed = True
+        if changed:
+            self.config["persona_preset_map"] = mapping
+        return changed
+
+    def _normalize_preset_fields(
+        self,
+        payload: dict[str, Any],
+        current: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        merged = dict(current or {})
+        merged.update(payload)
+        name = str(merged.get("name", "") or "").strip()
+        if not name:
+            raise ValueError("预设名称不能为空")
+        reference_type = str(merged.get("reference_type", "character") or "character").strip().lower()
+        if reference_type == "character&style":
+            reference_type = "both"
+        if reference_type not in {"character", "style", "both"}:
+            raise ValueError("参考类型只能是 character、style 或 both")
+        reference_id = str(merged.get("reference_id", "") or "").strip()
+        if reference_id and (Path(reference_id).name != reference_id or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", reference_id)):
+            raise ValueError("参考图 ID 格式不正确")
+        preset_id = str((current or {}).get("id", "") or "").strip()
+        if not preset_id:
+            preset_id = uuid.uuid4().hex[:10]
+        return {
+            # Preset IDs are server-owned and immutable. Accepting an ID from
+            # a create/update payload can create duplicates or orphan mappings.
+            "id": preset_id,
+            "name": name[:80],
+            "description": str(merged.get("description", "") or "").strip()[:300],
+            "style_prompt": str(merged.get("style_prompt", "") or "").strip()[:4000],
+            "character_prompt": str(merged.get("character_prompt", "") or "").strip()[:4000],
+            "negative_prompt": str(merged.get("negative_prompt", "") or "").strip()[:4000],
+            "reference_id": reference_id,
+            "reference_type": reference_type,
+            "lock_character": self._as_bool(merged.get("lock_character", True), True),
+            "lock_style": self._as_bool(merged.get("lock_style", True), True),
+            "style_strength": self._preset_strength(merged.get("style_strength", 1.35), 1.35),
+            "character_strength": self._preset_strength(merged.get("character_strength", 1.25), 1.25),
+            "quality_override": str(merged.get("quality_override", "off"))
+            if str(merged.get("quality_override", "off")) in {"inherit", "on", "off"}
+            else "off",
+            "persona_id": str(merged.get("persona_id", "") or "").strip()[:200],
+            "enabled": self._as_bool(merged.get("enabled", True), True),
+        }
+
+    def _create_preset_record(self, payload: dict[str, Any]) -> dict[str, Any]:
+        preset = self._normalize_preset_fields(payload)
+        raw_mapping = self._cfg("persona_preset_map", {})
+        previous_mapping = dict(raw_mapping) if isinstance(raw_mapping, dict) else {}
+        self.presets.append(preset)
+        try:
+            mapping_changed = self._sync_preset_persona_binding(preset)
+            self._save_presets()
+            if mapping_changed:
+                self._save_config()
+        except Exception:
+            self.presets = [item for item in self.presets if item is not preset]
+            self.config["persona_preset_map"] = previous_mapping
+            try:
+                self._save_presets()
+                self._save_config()
+            except Exception:
+                pass
+            raise
+        return preset
+
+    def _update_preset_record(self, preset: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+        normalized = self._normalize_preset_fields(payload, preset)
+        previous = dict(preset)
+        raw_mapping = self._cfg("persona_preset_map", {})
+        previous_mapping = dict(raw_mapping) if isinstance(raw_mapping, dict) else {}
+        previous_persona_id = str(previous.get("persona_id", "") or "")
+        try:
+            preset.clear()
+            preset.update(normalized)
+            mapping_changed = self._sync_preset_persona_binding(preset, previous_persona_id)
+            self._save_presets()
+            if mapping_changed:
+                self._save_config()
+        except Exception:
+            preset.clear()
+            preset.update(previous)
+            self.config["persona_preset_map"] = previous_mapping
+            try:
+                self._save_presets()
+                self._save_config()
+            except Exception:
+                pass
+            raise
+        return preset
+
     def _delete_preset_record(self, preset_id: str) -> bool:
         """Delete a preset and remove every configuration reference to it."""
         preset_id = str(preset_id or "").strip()
-        if not preset_id or not self._get_preset(preset_id):
+        if not preset_id or not self._get_preset(preset_id, include_disabled=True):
             return False
 
         self.presets = [p for p in self.presets if str(p.get("id", "")) != preset_id]
@@ -271,10 +422,13 @@ class NovelAIPainterPlugin(Star):
             self._save_config()
         return True
 
-    def _get_preset(self, preset_id: str | None) -> dict[str, Any] | None:
+    def _get_preset(self, preset_id: str | None, *, include_disabled: bool = False) -> dict[str, Any] | None:
         if not preset_id:
             return None
-        return next((p for p in self.presets if p.get("id") == preset_id), None)
+        preset = next((p for p in self.presets if p.get("id") == preset_id), None)
+        if preset and not include_disabled and not self._as_bool(preset.get("enabled", True), True):
+            return None
+        return preset
 
     def _resolve_persona_id(self, event: AstrMessageEvent | None = None) -> str:
         candidates: list[Any] = []
@@ -282,6 +436,10 @@ class NovelAIPainterPlugin(Star):
             if event is not None:
                 session_cfg = self.context.get_config(umo=event.unified_msg_origin)
                 candidates.extend([session_cfg.get("persona_id"), session_cfg.get("persona")])
+                provider_settings = session_cfg.get("provider_settings", {})
+                if isinstance(provider_settings, dict):
+                    candidates.append(provider_settings.get("default_personality"))
+                candidates.append(session_cfg.get("default_personality"))
         except Exception:
             pass
         candidates.extend([self._cfg("persona_id", ""), self._cfg("persona", "")])
@@ -292,16 +450,75 @@ class NovelAIPainterPlugin(Star):
                 return str(candidate)
         return ""
 
-    def _resolve_preset(self, event: AstrMessageEvent | None = None, preset_id: str | None = None):
-        if preset_id and self._get_preset(preset_id):
-            return self._get_preset(preset_id)
-        persona_id = self._resolve_persona_id(event)
+    def _resolve_preset_for_persona(self, persona_id: str) -> dict[str, Any] | None:
         mapping = self._cfg("persona_preset_map", {})
         if isinstance(mapping, dict) and persona_id:
             mapped = self._get_preset(str(mapping.get(persona_id, "")))
             if mapped:
                 return mapped
+        if persona_id:
+            embedded = next(
+                (
+                    preset
+                    for preset in self.presets
+                    if str(preset.get("persona_id", "") or "").strip() == persona_id
+                    and self._as_bool(preset.get("enabled", True), True)
+                ),
+                None,
+            )
+            if embedded:
+                return embedded
         return self._get_preset(str(self._cfg("default_preset_id", "")))
+
+    async def _resolve_active_preset(
+        self,
+        event: AstrMessageEvent | None = None,
+        preset_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        if preset_id:
+            return self._get_preset(preset_id)
+        persona_id = ""
+        resolved_by_persona_manager = False
+        if event is not None:
+            origin = str(getattr(event, "unified_msg_origin", "") or "")
+            try:
+                conversation_persona_id = None
+                conversation_manager = self.context.conversation_manager
+                conversation_id = await conversation_manager.get_curr_conversation_id(origin)
+                if conversation_id:
+                    conversation = await conversation_manager.get_conversation(origin, conversation_id)
+                    if conversation:
+                        conversation_persona_id = getattr(conversation, "persona_id", None)
+
+                session_config = self.context.get_config(umo=origin) or {}
+                provider_settings = session_config.get("provider_settings", {})
+                if not isinstance(provider_settings, dict):
+                    provider_settings = {}
+                platform_name = event.get_platform_name()
+                resolved = await self.context.persona_manager.resolve_selected_persona(
+                    umo=event.unified_msg_origin,
+                    conversation_persona_id=conversation_persona_id,
+                    platform_name=platform_name,
+                    provider_settings=provider_settings,
+                )
+                if isinstance(resolved, tuple) and resolved:
+                    resolved_by_persona_manager = True
+                    selected_persona_id = resolved[0]
+                    if selected_persona_id and selected_persona_id != "[%None]":
+                        persona_id = str(selected_persona_id)
+            except Exception as exc:
+                # Keep a conservative fallback for partially initialized contexts,
+                # while AstrBot >= 4.27.3 normally uses PersonaManager above.
+                logger.debug(f"[{PLUGIN_NAME}] 通过 PersonaManager 解析当前人设失败: {exc}")
+        if not persona_id and not resolved_by_persona_manager:
+            persona_id = self._resolve_persona_id(event)
+        return self._resolve_preset_for_persona(persona_id)
+
+    def _resolve_preset(self, event: AstrMessageEvent | None = None, preset_id: str | None = None):
+        if preset_id and self._get_preset(preset_id):
+            return self._get_preset(preset_id)
+        persona_id = self._resolve_persona_id(event)
+        return self._resolve_preset_for_persona(persona_id)
 
     @staticmethod
     def _preset_strength(value: Any, default: float) -> float:
@@ -384,6 +601,81 @@ class NovelAIPainterPlugin(Star):
         preset_negative = str(preset.get("negative_prompt", "") or "").strip()
         return composed[:12000], str(preset.get("id", "")), preset_negative
 
+    def _filter_llm_prompt_conflicts(
+        self,
+        prompt: str,
+        event: AstrMessageEvent,
+        preset: dict[str, Any] | None,
+    ) -> str:
+        """Drop appearance/style tags hallucinated by the LLM for locked presets.
+
+        Explicit user requests to change the corresponding category remain
+        allowed. This is intentionally applied only to LLM-generated tags;
+        fixed command prompts are treated as direct user input.
+        """
+        if not preset:
+            return prompt
+        try:
+            raw_request = str(event.get_message_str() or "").lower()
+        except Exception:
+            raw_request = ""
+        requested_character_changes = {
+            category
+            for category, pattern in {
+                "hair": r"(头发|发型|发色|马尾|辫子?|刘海|呆毛|[粉金银白黑红蓝绿紫棕]毛|\bhair\b|\bponytails?\b|\btwintails?\b|\bbraids?\b|\bbangs?\b)",
+                "eyes": r"(眼睛|眼色|瞳色?|异色瞳|\beyes?\b|\biris\b|\bheterochromia\b)",
+                "ears_species": r"(耳朵|精灵耳|兽耳|种族|\bears?\b|\belf\b|\bkemonomimi\b)",
+                "clothing": r"(衣服|服装|换装|穿着|婚纱|礼服|裙|裤|鞋|帽|配饰|饰品|\boutfit\b|\bclothes?\b|\bclothing\b|\bwear\b|\bdress\b|\bgown\b|\bskirt\b|\buniform\b|\baccessor(?:y|ies)\b)",
+            }.items()
+            if re.search(pattern, raw_request, re.I)
+        }
+        style_change = bool(re.search(
+            r"(画风|风格|水彩|油画|写实|线稿|素描|\bart style\b|\bwatercolor\b|\bphotorealistic\b|\bscreencap\b|\bsketch\b)",
+            raw_request,
+        ))
+        lock_character = self._as_bool(preset.get("lock_character", True), True)
+        lock_style = self._as_bool(preset.get("lock_style", True), True)
+        character_tags = {
+            "hair": re.compile(
+                r"\b(hair|ponytails?|twintails?|braids?|bangs?|ahoge|blonde|brunette)\b",
+                re.I,
+            ),
+            "eyes": re.compile(r"\b(eyes?|iris|heterochromia)\b", re.I),
+            "ears_species": re.compile(r"\b(ears?|elf|kemonomimi)\b", re.I),
+            "clothing": re.compile(
+                r"\b(dress|gown|shirt|skirt|pants|stockings?|bodysuit|outfit|clothes?|clothing|"
+                r"uniform|jacket|coat|shoes?|boots?|gloves?|hat|ribbon|necklace|earrings?|"
+                r"accessor(?:y|ies))\b",
+                re.I,
+            ),
+        }
+        style_tag = re.compile(
+            r"\b(artist|art style|screencap|watercolor|oil painting|photorealistic|realistic|3d|"
+            r"cel shading|lineart|sketch)\b",
+            re.I,
+        )
+        kept: list[str] = []
+        removed = 0
+        for part in re.split(r"[,\n]+", str(prompt or "")):
+            tag = part.strip()
+            if not tag:
+                continue
+            if lock_character:
+                blocked_character_tag = any(
+                    pattern.search(tag) and category not in requested_character_changes
+                    for category, pattern in character_tags.items()
+                )
+                if blocked_character_tag:
+                    removed += 1
+                    continue
+            if lock_style and not style_change and style_tag.search(tag):
+                removed += 1
+                continue
+            kept.append(tag)
+        if removed:
+            logger.info(f"[{PLUGIN_NAME}] 已移除 {removed} 个与锁定人物/画风冲突的 LLM 标签")
+        return ", ".join(kept) if kept else "portrait, looking at viewer"
+
     # --------------------------- permissions and dedupe ---------------------------
     def _event_key(self, event: AstrMessageEvent, prompt: str, operation: str) -> str:
         """Return one generation key per incoming message, regardless of tool rewrites."""
@@ -408,15 +700,16 @@ class NovelAIPainterPlugin(Star):
             policy = str(self._cfg("private_access", "all"))
         else:
             policy = str(self._cfg("group_access", "admin_only"))
-        if self._as_bool(self._cfg("admin_bypass", True)) and event.is_admin():
-            return True, ""
+        is_admin = event.is_admin()
         sender = str(event.get_sender_id())
         group = str(event.get_group_id() or "")
         if policy == "disabled":
             return False, "当前会话未开启生图权限。"
         if policy == "admin_only":
-            return False, "当前会话仅允许管理员使用生图功能。"
+            return (True, "") if is_admin else (False, "当前会话仅允许管理员使用生图功能。")
         if policy == "allowlist":
+            if self._as_bool(self._cfg("admin_bypass", True)) and is_admin:
+                return True, ""
             allowed_users = set(self._as_list(self._cfg("allowed_users", [])))
             allowed_groups = set(self._as_list(self._cfg("allowed_groups", [])))
             if sender not in allowed_users and (not group or group not in allowed_groups):
@@ -450,7 +743,14 @@ class NovelAIPainterPlugin(Star):
                 names = [name for name in archive.namelist() if not name.endswith("/") and name.lower().endswith((".png", ".webp", ".jpg", ".jpeg"))]
                 if len(names) > 1:
                     logger.warning(f"[{PLUGIN_NAME}] 服务端返回 {len(names)} 张图片，仅保留并发送第一张")
-                return archive.read(names[0]) if names else None
+                if not names:
+                    return None
+                info = archive.getinfo(names[0])
+                if info.file_size > MAX_IMAGE_BYTES:
+                    raise ProviderError("response_too_large", "图片服务返回的图片超过 32MB 安全上限")
+                return archive.read(info)
+        except ProviderError:
+            raise
         except Exception:
             return None
 
@@ -460,8 +760,35 @@ class NovelAIPainterPlugin(Star):
             value = value.split(",", 1)[1]
         return base64.b64decode(value)
 
+    @staticmethod
+    async def _read_limited_response(response: aiohttp.ClientResponse, limit: int = MAX_RESPONSE_BYTES) -> bytes:
+        try:
+            content_length = int(response.headers.get("Content-Length", "") or 0)
+        except (TypeError, ValueError):
+            content_length = 0
+        if content_length > limit:
+            raise ProviderError("response_too_large", "图片服务响应超过安全上限")
+        data = bytearray()
+        async for chunk in response.content.iter_chunked(64 * 1024):
+            data.extend(chunk)
+            if len(data) > limit:
+                raise ProviderError("response_too_large", "图片服务响应超过安全上限")
+        return bytes(data)
+
+    @staticmethod
+    def _image_extension(image_bytes: bytes) -> str:
+        if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+            return ".png"
+        if image_bytes.startswith(b"\xff\xd8"):
+            return ".jpg"
+        if image_bytes[:4] == b"RIFF" and image_bytes[8:12] == b"WEBP":
+            return ".webp"
+        raise ProviderError("invalid_image", "图片服务返回了不受支持的图片格式")
+
     def _save_image(self, image_bytes: bytes, job_id: str) -> str:
-        path = self.temp_dir / f"{job_id}.png"
+        if len(image_bytes) > MAX_IMAGE_BYTES:
+            raise ProviderError("response_too_large", "图片服务返回的图片超过 32MB 安全上限")
+        path = self.temp_dir / f"{job_id}{self._image_extension(image_bytes)}"
         path.write_bytes(image_bytes)
         return str(path)
 
@@ -469,6 +796,11 @@ class NovelAIPainterPlugin(Star):
         content_type = response.headers.get("Content-Type", "").lower()
         image_bytes = self._decode_zip(body)
         if image_bytes is None and body.startswith(b"\x89PNG"):
+            image_bytes = body
+        if image_bytes is None and (
+            body.startswith(b"\xff\xd8")
+            or (body[:4] == b"RIFF" and body[8:12] == b"WEBP")
+        ):
             image_bytes = body
         if image_bytes is None and ("json" in content_type or body[:1] in {b"{", b"["}):
             try:
@@ -482,7 +814,7 @@ class NovelAIPainterPlugin(Star):
                         async with session.get(first["url"]) as img_resp:
                             if img_resp.status >= 400:
                                 raise ProviderError("image_download", "图片地址下载失败")
-                            image_bytes = await img_resp.read()
+                            image_bytes = await self._read_limited_response(img_resp, MAX_IMAGE_BYTES)
             except ProviderError:
                 raise
             except Exception as exc:
@@ -562,13 +894,13 @@ class NovelAIPainterPlugin(Star):
                     form.add_field("size", f"{int(self._cfg('width', 832))}x{int(self._cfg('height', 1216))}")
                     form.add_field("image", image_bytes, filename="input.png", content_type="image/png")
                     async with session.post(url, headers=headers, data=form) as response:
-                        body = await response.read()
+                        body = await self._read_limited_response(response)
                         if response.status >= 400:
                             raise self._http_error(response.status, body, response.headers)
                         return await self._parse_image_response(response, body, job_id)
                 payload = {"model": self._active_model(), "prompt": prompt, "n": 1, "size": f"{int(self._cfg('width', 832))}x{int(self._cfg('height', 1216))}", "response_format": "b64_json"}
                 async with session.post(url, headers={**headers, "Content-Type": "application/json"}, json=payload) as response:
-                    body = await response.read()
+                    body = await self._read_limited_response(response)
                     if response.status >= 400:
                         raise self._http_error(response.status, body, response.headers)
                     return await self._parse_image_response(response, body, job_id)
@@ -593,7 +925,12 @@ class NovelAIPainterPlugin(Star):
 
     def _retry_limit(self) -> int:
         mode = str(self._cfg("retry_mode", "none") or "none")
-        return {"none": 1, "rate_limit_once": 2, "rate_limit_twice": 3}.get(mode, 1)
+        configured = {"none": 1, "rate_limit_once": 2, "rate_limit_twice": 3}.get(mode, 1)
+        try:
+            hard_limit = max(1, min(3, int(self._cfg("max_api_requests_per_job", 3) or 3)))
+        except (TypeError, ValueError):
+            hard_limit = 1
+        return min(configured, hard_limit)
 
     def _should_retry(self, error: ProviderError, attempts: int) -> bool:
         return error.code == "429" and error.retryable and attempts < self._retry_limit()
@@ -603,7 +940,7 @@ class NovelAIPainterPlugin(Star):
         async with aiohttp.ClientSession(timeout=timeout) as session:
             try:
                 async with session.post(url, headers=headers, json=payload) as response:
-                    body = await response.read()
+                    body = await self._read_limited_response(response)
                     if response.status not in {200, 201}:
                         raise self._http_error(response.status, body, response.headers)
                     return await self._parse_image_response(response, body, job_id)
@@ -619,8 +956,9 @@ class NovelAIPainterPlugin(Star):
             return None, None
         try:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            image_path = self.reference_dir / str(meta.get("filename", ""))
-            if not image_path.exists() or image_path.parent != self.reference_dir:
+            reference_root = self.reference_dir.resolve()
+            image_path = (self.reference_dir / str(meta.get("filename", ""))).resolve()
+            if not image_path.exists() or image_path.parent != reference_root:
                 return None, None
             data = image_path.read_bytes()
             return data, {**meta, "image_b64": base64.b64encode(data).decode("ascii")}
@@ -631,7 +969,15 @@ class NovelAIPainterPlugin(Star):
     def _cached_result(result: GenerationResult) -> GenerationResult:
         return GenerationResult(result.ok, result.job_id, result.provider, result.path, result.error_code, result.message, result.attempts, False)
 
-    async def _run_job(self, event: AstrMessageEvent, prompt: str, operation: str = "generate", preset_id: str | None = None, reference_id: str | None = None) -> GenerationResult:
+    async def _run_job(
+        self,
+        event: AstrMessageEvent,
+        prompt: str,
+        operation: str = "generate",
+        preset_id: str | None = None,
+        reference_id: str | None = None,
+        reference_type: str | None = None,
+    ) -> GenerationResult:
         allowed, reason = self._can_use(event)
         job_id = uuid.uuid4().hex[:12]
         provider = self._provider_name()
@@ -662,62 +1008,82 @@ class NovelAIPainterPlugin(Star):
             if provider != "novelai_official":
                 return GenerationResult(False, job_id, provider, error_code="unsupported", message="当前兼容后端不支持 NovelAI Precise Reference。")
         self._cleanup_expired()
-        composed_prompt, active_preset_id, preset_negative = self._compose_prompt(prompt, event, preset_id)
+        resolved_preset = await self._resolve_active_preset(event, preset_id)
+        resolved_preset_id = str(resolved_preset.get("id", "")) if resolved_preset else ""
+        composed_prompt, active_preset_id, preset_negative = self._compose_prompt(
+            prompt,
+            event,
+            resolved_preset_id or None,
+        )
         key = self._event_key(event, composed_prompt, operation)
         now = time.time()
         window = max(1, int(self._cfg("dedupe_window_seconds", 30) or 30))
         cached = self._recent_jobs.get(key)
         if cached and now - cached[0] <= window:
             return self._cached_result(cached[1])
+        inflight_jobs = getattr(self, "_inflight_jobs", None)
+        if inflight_jobs is None:
+            self._inflight_jobs = {}
+            inflight_jobs = self._inflight_jobs
+        if existing_job_id := inflight_jobs.get(key):
+            return GenerationResult(
+                True,
+                existing_job_id,
+                provider,
+                message="同一条用户消息的生成任务正在处理中，重复请求已被拦截。",
+                attempts=0,
+                send_image=False,
+            )
+        inflight_jobs[key] = job_id
         try:
-            timeout = max(1, int(self._cfg("queue_timeout", 120) or 120))
-            if self.lock.locked() and self._as_bool(self._cfg("show_queue_notice", True)):
-                await self._notify(event, "当前生图通道繁忙，任务已排队。", "queue")
-            await asyncio.wait_for(self.lock.acquire(), timeout=timeout)
-        except asyncio.TimeoutError:
-            result = GenerationResult(False, job_id, provider, error_code="queue_timeout", message="生图排队超时，任务已取消。")
-            self._recent_jobs[key] = (time.time(), result)
-            return result
-        try:
-            cached = self._recent_jobs.get(key)
-            if cached and time.time() - cached[0] <= window:
-                return self._cached_result(cached[1])
             selected_preset = self._get_preset(active_preset_id)
             if not reference_id and selected_preset and operation in {"img2img", "reference"}:
                 reference_id = str(selected_preset.get("reference_id", "")) or None
-            if operation == "reference" and selected_preset:
-                reference_type = selected_preset.get("reference_type", "character")
-            else:
-                reference_type = "character"
+            effective_reference_type = reference_type
+            if not effective_reference_type and operation == "reference" and selected_preset:
+                effective_reference_type = str(selected_preset.get("reference_type", "character") or "character")
+            if effective_reference_type not in {"character", "style", "both", "character&style"}:
+                effective_reference_type = "character"
             image_bytes, reference = await self._load_reference(reference_id)
             if operation in {"img2img", "reference"} and not image_bytes:
                 result = GenerationResult(False, job_id, provider, error_code="missing_reference", message="请先在 WebUI 上传参考图并绑定到默认预设。", attempts=0)
                 self._recent_jobs[key] = (time.time(), result)
                 return result
             if reference:
-                reference["reference_type"] = reference_type
+                reference["reference_type"] = effective_reference_type or "character"
             image_b64 = base64.b64encode(image_bytes).decode("ascii") if image_bytes and provider == "novelai_official" else None
             attempts = 0
             while True:
-                attempts += 1
                 try:
-                    if provider == "novelai_official":
-                        path = await self._call_official(
-                            composed_prompt,
-                            operation,
-                            job_id,
-                            image_b64 if operation == "img2img" else None,
-                            reference if operation == "reference" else None,
-                            preset_negative,
-                            selected_preset,
-                        )
-                    else:
-                        path = await self._call_openai(
-                            composed_prompt,
-                            operation,
-                            job_id,
-                            image_bytes if operation == "img2img" else None,
-                        )
+                    timeout = max(1, int(self._cfg("queue_timeout", 120) or 120))
+                    if self.lock.locked() and self._as_bool(self._cfg("show_queue_notice", True)):
+                        await self._notify(event, "当前生图通道繁忙，任务已排队。", "queue")
+                    await asyncio.wait_for(self.lock.acquire(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    result = GenerationResult(False, job_id, provider, error_code="queue_timeout", message="生图排队超时，任务已取消。", attempts=attempts)
+                    break
+                try:
+                    attempts += 1
+                    try:
+                        if provider == "novelai_official":
+                            path = await self._call_official(
+                                composed_prompt,
+                                operation,
+                                job_id,
+                                image_b64 if operation == "img2img" else None,
+                                reference if operation == "reference" else None,
+                                preset_negative,
+                                selected_preset,
+                            )
+                        else:
+                            path = await self._call_openai(
+                                composed_prompt,
+                                operation,
+                                job_id,
+                                image_bytes if operation == "img2img" else None,
+                            )
+                    finally:
+                        self.lock.release()
                     result = GenerationResult(True, job_id, provider, path=path, message="图片已生成并发送到当前会话。", attempts=attempts)
                     break
                 except ProviderError as exc:
@@ -729,14 +1095,18 @@ class NovelAIPainterPlugin(Star):
                     delay = max(configured_delay, float(exc.retry_after or 0))
                     if self._as_bool(self._cfg("show_retry_notice", False)):
                         await self._notify(event, f"图片服务限流，{delay:g} 秒后进行第 {attempts + 1} 次尝试。", "retry")
+                    # Do not monopolize the global provider slot while waiting
+                    # for a Retry-After window.
                     await asyncio.sleep(delay)
             self._recent_jobs[key] = (time.time(), result)
-            self._jobs.append({**asdict(result), "operation": operation, "preset_id": active_preset_id, "created_at": int(time.time())})
+            job_record = asdict(result)
+            job_record["has_image"] = bool(job_record.pop("path", None))
+            self._jobs.append({**job_record, "operation": operation, "preset_id": active_preset_id, "created_at": int(time.time())})
             self._jobs = self._jobs[-50:]
             return result
         finally:
-            if self.lock.locked():
-                self.lock.release()
+            if inflight_jobs.get(key) == job_id:
+                inflight_jobs.pop(key, None)
 
     async def _notify(self, event: AstrMessageEvent, message: str, kind: str = "error") -> None:
         if kind == "error":
@@ -787,16 +1157,49 @@ class NovelAIPainterPlugin(Star):
             await self._notify(event, "图片已生成，但发送到当前会话失败。", "error")
             return "图片已生成，但发送失败。"
 
+    def _resolve_llm_operation(
+        self,
+        requested: str,
+        preset: dict[str, Any] | None = None,
+    ) -> str:
+        operation = str(requested or "generate").strip().lower()
+        aliases = {
+            "generate": "generate",
+            "draw": "generate",
+            "text2img": "generate",
+            "img2img": "img2img",
+            "reference": "reference",
+        }
+        operation = aliases.get(operation, "generate")
+        if operation != "generate" or not self._as_bool(self._cfg("llm_auto_reference", True), True):
+            return operation
+        if not preset or not str(preset.get("reference_id", "") or "").strip():
+            return operation
+        if self._provider_name() == "novelai_official" and self._as_bool(self._cfg("reference_enabled", True), True):
+            return "reference"
+        if self._provider_name() == "openai_compatible" and self._as_bool(self._cfg("img2img_enabled", True), True):
+            return "img2img"
+        return operation
+
     # --------------------------- AstrBot handlers ---------------------------
     @filter.llm_tool(name="novelai_generate_image")
-    async def novelai_generate_image(self, event: AstrMessageEvent, prompt: str = ""):
-        """仅在用户明确要求生成、绘制或修改图片时调用；每条用户消息最多生成并发送一张图片。插件会自动在用户要求之前应用当前 AstrBot 人设映射或默认人物/画风预设。不要仅因为内容适合配图就主动调用，也不要在回复中泄露内部错误、密钥、文件路径或完整提示词。
+    async def novelai_generate_image(
+        self,
+        event: AstrMessageEvent,
+        prompt: str = "",
+        operation: str = "generate",
+        reference_type: str = "",
+    ):
+        """仅在用户明确要求生成、绘制或修改图片时调用；每条用户消息最多生成并发送一张图片。插件会强制应用当前 AstrBot 人设映射或默认人物/画风预设，并可自动使用预设绑定的参考图。工具会直接向用户发送最终结果，完成后不要再次调用任何工具。
 
         Args:
             prompt(string): 必须传入用户本次要求的动作、姿势、表情、构图或场景变化。优先整理为具体的英文 NovelAI / Danbooru 风格标签；不要自行重写、替换或重复人物与画风设定，插件会从已选预设中自动加入并强化这些锚定词。不得省略该参数。
+            operation(string): 生成方式，只能是 generate、img2img 或 reference。普通生图使用 generate；用户明确要求基于绑定图片修改时使用 img2img；NovelAI 精确参考使用 reference。省略时若开启自动参考且当前预设绑定了参考图，插件会自动选择合适方式。
+            reference_type(string): reference 模式的参考类型，只能是 character、style 或 both；省略时继承当前预设保存的参考类型，无预设时使用 character。
         """
         if not self._mode_allows("llm_tool"):
-            return "当前未启用自然语言生图入口。"
+            await self._notify(event, "当前未启用自然语言生图入口。", "error")
+            return None
 
         normalized_prompt = str(prompt or "").strip()
         if not normalized_prompt:
@@ -805,10 +1208,34 @@ class NovelAIPainterPlugin(Star):
             except Exception:
                 normalized_prompt = ""
         if not normalized_prompt:
-            return "生图工具缺少画面描述，请根据用户请求重新调用并传入 prompt 参数。"
+            await self._notify(event, "生图工具缺少画面描述，本次任务已停止。", "error")
+            return None
 
-        result = await self._run_job(event, normalized_prompt, "generate")
-        return await self._finish_event(event, result)
+        active_preset = await self._resolve_active_preset(event)
+        normalized_prompt = self._filter_llm_prompt_conflicts(
+            normalized_prompt,
+            event,
+            active_preset,
+        )
+        resolved_operation = self._resolve_llm_operation(operation, active_preset)
+        requested_reference_type = str(reference_type or "").strip().lower()
+        normalized_reference_type = (
+            requested_reference_type
+            if requested_reference_type in {"character", "style", "both"}
+            else None
+        )
+        result = await self._run_job(
+            event,
+            normalized_prompt,
+            resolved_operation,
+            preset_id=str(active_preset.get("id", "")) if active_preset else None,
+            reference_type=normalized_reference_type,
+        )
+        await self._finish_event(event, result)
+        # AstrBot treats None as a direct-result terminal signal. Returning a
+        # status string here keeps the LLM tool loop alive and caused repeated
+        # generation attempts followed by unrelated shell/file tool calls.
+        return None
 
     @filter.regex(r"^/[A-Za-z][A-Za-z0-9_-]*(?:@[A-Za-z0-9_-]+)?(?:\s|$)")
     async def cmd_draw(self, event: AstrMessageEvent):
@@ -824,21 +1251,26 @@ class NovelAIPainterPlugin(Star):
         if not text or text.lower() in {"help", "?", "菜单"}:
             yield event.plain_result("用法：/nai draw <画面描述>；/nai img2img <画面描述>；/nai reference <character|style|both> <画面描述>；/nai preset list")
             return
-        parts = text.split(maxsplit=2)
+        command, separator, remainder = text.partition(" ")
+        command = command.lower()
         operation = "generate"
         reference_type = None
         body = text
-        if parts[0].lower() in {"draw", "generate", "生图"}:
-            body = parts[1] if len(parts) == 2 else parts[2]
-        elif parts[0].lower() in {"img2img", "i2i", "图生图"}:
+        if command in {"draw", "generate", "生图"}:
+            body = remainder.strip() if separator else ""
+        elif command in {"img2img", "i2i", "图生图"}:
             operation = "img2img"
-            body = parts[1] if len(parts) == 2 else parts[2]
-        elif parts[0].lower() in {"reference", "ref", "参考图"}:
+            body = remainder.strip() if separator else ""
+        elif command in {"reference", "ref", "参考图"}:
             operation = "reference"
-            reference_type = parts[1].lower() if len(parts) > 1 else "character"
-            body = parts[2] if len(parts) > 2 else ""
-        elif parts[0].lower() == "preset":
-            if len(parts) > 1 and parts[1].lower() == "list":
+            reference_type, separator, body = remainder.strip().partition(" ")
+            reference_type = reference_type.lower() or "character"
+            body = body.strip() if separator else ""
+            if reference_type not in {"character", "style", "both"}:
+                yield event.plain_result("参考类型只能是 character、style 或 both。")
+                return
+        elif command == "preset":
+            if remainder.strip().lower() == "list":
                 names = [str(p.get("name", p.get("id", ""))) for p in self.presets]
                 yield event.plain_result("可用预设：" + ("、".join(names) if names else "暂无预设，请在 WebUI 创建。"))
             else:
@@ -852,12 +1284,7 @@ class NovelAIPainterPlugin(Star):
             return
         preset_id = None
         reference_id = None
-        if operation == "reference":
-            selected = self._resolve_preset(event)
-            if selected:
-                reference_id = str(selected.get("reference_id", "")) or None
-                selected["reference_type"] = reference_type or "character"
-        result = await self._run_job(event, body, operation, preset_id, reference_id)
+        result = await self._run_job(event, body, operation, preset_id, reference_id, reference_type)
         await self._finish_event(event, result)
 
     # --------------------------- WebUI page APIs ---------------------------
@@ -895,6 +1322,33 @@ class NovelAIPainterPlugin(Star):
                 data[key] = "********"
         return data
 
+    def _public_presets(self) -> list[dict[str, Any]]:
+        """Expose each preset's current canonical mapping in the editor.
+
+        A preset stores at most one editor shortcut while persona_preset_map can
+        map many personas. Never show a stale embedded shortcut that now maps
+        to another preset, otherwise an unrelated edit could appear to undo a
+        mapping selected in the dedicated WebUI mapping controls.
+        """
+        mapping = self._cfg("persona_preset_map", {})
+        mapping = mapping if isinstance(mapping, dict) else {}
+        public: list[dict[str, Any]] = []
+        for preset in self.presets:
+            item = dict(preset)
+            preset_id = str(item.get("id", "") or "")
+            embedded = str(item.get("persona_id", "") or "")
+            if not embedded or str(mapping.get(embedded, "")) != preset_id:
+                item["persona_id"] = next(
+                    (
+                        str(persona_id)
+                        for persona_id, mapped_id in mapping.items()
+                        if str(mapped_id) == preset_id
+                    ),
+                    "",
+                )
+            public.append(item)
+        return public
+
     async def page_settings(self):
         personas = []
         try:
@@ -902,13 +1356,17 @@ class NovelAIPainterPlugin(Star):
             personas = [{"id": str(p.persona_id), "name": str(p.persona_id)} for p in items]
         except Exception:
             pass
-        return json_response({"config": self._public_config(), "presets": self.presets, "references": self._reference_list(), "personas": personas, "capabilities": self._capabilities()})
+        return json_response({"config": self._public_config(), "presets": self._public_presets(), "references": self._reference_list(), "personas": personas, "capabilities": self._capabilities()})
 
     async def page_save_config(self):
         payload = await request.json(default={})
         if not isinstance(payload, dict):
             return self._page_error("配置格式错误")
-        fields = {key: value for key, value in payload.items() if key not in {"api_token", "api_key"}}
+        fields = {
+            key: value
+            for key, value in payload.items()
+            if key in CONFIG_KEYS and key not in {"api_token", "api_key", "config_version"}
+        }
         for key in ("api_token", "api_key"):
             if str(payload.get(key, "")).strip() and payload.get(key) != "********":
                 fields[key] = str(payload[key]).strip()
@@ -933,6 +1391,13 @@ class NovelAIPainterPlugin(Star):
         for key in ("allowed_users", "allowed_groups"):
             if key in fields:
                 fields[key] = self._as_list(fields[key])
+        for key in (
+            "admin_bypass", "legacy_command_enabled", "quality_toggle", "show_queue_notice",
+            "notify_429", "show_retry_notice", "llm_auto_reference", "img2img_enabled",
+            "reference_enabled", "img2img_color_correct",
+        ):
+            if key in fields:
+                fields[key] = self._as_bool(fields[key])
         if "command_prefix" in fields:
             prefix = str(fields["command_prefix"] or "nai").strip().lstrip("/")
             if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,30}", prefix):
@@ -942,6 +1407,18 @@ class NovelAIPainterPlugin(Star):
             return self._page_error("兼容后端鉴权请求头不受支持")
         if "persona_preset_map" in fields and not isinstance(fields["persona_preset_map"], dict):
             return self._page_error("persona_preset_map 必须是对象")
+        if "persona_preset_map" in fields:
+            fields["persona_preset_map"] = {
+                str(persona_id).strip(): str(mapped_id).strip()
+                for persona_id, mapped_id in fields["persona_preset_map"].items()
+                if str(persona_id).strip()
+                and self._get_preset(str(mapped_id).strip(), include_disabled=True)
+            }
+        if "default_preset_id" in fields:
+            default_id = str(fields["default_preset_id"] or "").strip()
+            if default_id and not self._get_preset(default_id, include_disabled=True):
+                return self._page_error("默认预设不存在")
+            fields["default_preset_id"] = default_id
         allowed_enums = {
             "provider": {"novelai_official", "openai_compatible"},
             "invoke_mode": {"disabled", "command_only", "llm_tool_only", "both"},
@@ -955,7 +1432,7 @@ class NovelAIPainterPlugin(Star):
                 return self._page_error(f"{key} 的值不受支持")
         previous_config = dict(self.config)
         self.config.update(fields)
-        self.config["config_version"] = 3
+        self.config["config_version"] = 4
         try:
             self._save_config()
         except Exception as exc:
@@ -988,7 +1465,7 @@ class NovelAIPainterPlugin(Star):
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
                 async with session.get(url, headers=headers) as response:
                     if response.status >= 400:
-                        raise self._http_error(response.status, await response.read())
+                        raise self._http_error(response.status, await self._read_limited_response(response, 1024 * 1024))
             return json_response({"ok": True, "message": "连接测试成功"})
         except ProviderError as exc:
             return json_response({"ok": False, "message": exc.message})
@@ -996,32 +1473,20 @@ class NovelAIPainterPlugin(Star):
             return json_response({"ok": False, "message": "连接测试失败，请检查地址、密钥和网络"})
 
     async def page_presets(self):
-        return json_response({"presets": self.presets})
+        return json_response({"presets": self._public_presets()})
 
     async def page_create_preset(self):
         payload = await request.json(default={})
-        if not isinstance(payload, dict) or not str(payload.get("name", "")).strip():
-            return self._page_error("预设名称不能为空")
-        preset = {
-            "id": uuid.uuid4().hex[:10],
-            "name": str(payload.get("name")).strip()[:80],
-            "description": str(payload.get("description", "")).strip()[:300],
-            "style_prompt": str(payload.get("style_prompt", "")).strip()[:4000],
-            "character_prompt": str(payload.get("character_prompt", "")).strip()[:4000],
-            "negative_prompt": str(payload.get("negative_prompt", "")).strip()[:4000],
-            "reference_id": str(payload.get("reference_id", "")).strip(),
-            "reference_type": str(payload.get("reference_type", "character")),
-            "lock_character": self._as_bool(payload.get("lock_character", True), True),
-            "lock_style": self._as_bool(payload.get("lock_style", True), True),
-            "style_strength": self._preset_strength(payload.get("style_strength", 1.35), 1.35),
-            "character_strength": self._preset_strength(payload.get("character_strength", 1.25), 1.25),
-            "quality_override": str(payload.get("quality_override", "off")) if str(payload.get("quality_override", "off")) in {"inherit", "on", "off"} else "off",
-            "persona_id": str(payload.get("persona_id", "")).strip(),
-            "enabled": self._as_bool(payload.get("enabled", True), True),
-        }
-        self.presets.append(preset)
-        self._save_presets()
-        return json_response({"saved": True, "message": "预设已创建", "preset": preset})
+        if not isinstance(payload, dict):
+            return self._page_error("预设格式错误")
+        try:
+            preset = self._create_preset_record(payload)
+        except ValueError as exc:
+            return self._page_error(str(exc))
+        except Exception as exc:
+            logger.exception(f"[{PLUGIN_NAME}] 创建预设失败: {exc}")
+            return self._page_error("创建预设失败，请检查插件数据目录权限和 AstrBot 日志")
+        return json_response({"saved": True, "message": "预设已创建并同步人设映射", "preset": preset, "config": self._public_config()})
 
 
     async def page_manage_preset(self):
@@ -1047,61 +1512,44 @@ class NovelAIPainterPlugin(Star):
                 "config": self._public_config(),
             })
         if action == "update":
-            preset = self._get_preset(preset_id)
+            preset = self._get_preset(preset_id, include_disabled=True)
             if not preset:
                 return self._page_error("预设不存在", status_code=404)
-            for key in ("name", "description", "style_prompt", "character_prompt", "negative_prompt", "reference_id", "reference_type", "lock_character", "lock_style", "style_strength", "character_strength", "quality_override", "persona_id", "enabled"):
-                if key in payload:
-                    preset[key] = payload[key]
-            preset["lock_character"] = self._as_bool(preset.get("lock_character", True), True)
-            preset["lock_style"] = self._as_bool(preset.get("lock_style", True), True)
-            preset["style_strength"] = self._preset_strength(preset.get("style_strength", 1.35), 1.35)
-            preset["character_strength"] = self._preset_strength(preset.get("character_strength", 1.25), 1.25)
-            if str(preset.get("quality_override", "inherit")) not in {"inherit", "on", "off"}:
-                preset["quality_override"] = "inherit"
-            self._save_presets()
-            return json_response({"saved": True, "message": "预设已更新", "preset": preset})
-        if not str(payload.get("name", "")).strip():
-            return self._page_error("预设名称不能为空")
-        preset = {
-            "id": uuid.uuid4().hex[:10],
-            "name": str(payload.get("name")).strip()[:80],
-            "description": str(payload.get("description", "")).strip()[:300],
-            "style_prompt": str(payload.get("style_prompt", "")).strip()[:4000],
-            "character_prompt": str(payload.get("character_prompt", "")).strip()[:4000],
-            "negative_prompt": str(payload.get("negative_prompt", "")).strip()[:4000],
-            "reference_id": str(payload.get("reference_id", "")).strip(),
-            "reference_type": str(payload.get("reference_type", "character")),
-            "lock_character": self._as_bool(payload.get("lock_character", True), True),
-            "lock_style": self._as_bool(payload.get("lock_style", True), True),
-            "style_strength": self._preset_strength(payload.get("style_strength", 1.35), 1.35),
-            "character_strength": self._preset_strength(payload.get("character_strength", 1.25), 1.25),
-            "quality_override": str(payload.get("quality_override", "off")) if str(payload.get("quality_override", "off")) in {"inherit", "on", "off"} else "off",
-            "persona_id": str(payload.get("persona_id", "")).strip(),
-            "enabled": self._as_bool(payload.get("enabled", True), True),
-        }
-        self.presets.append(preset)
-        self._save_presets()
-        return json_response({"saved": True, "message": "预设已创建", "preset": preset})
+            try:
+                self._update_preset_record(preset, payload)
+            except ValueError as exc:
+                return self._page_error(str(exc))
+            except Exception as exc:
+                logger.exception(f"[{PLUGIN_NAME}] 更新预设失败: {exc}")
+                return self._page_error("更新预设失败，请检查插件数据目录权限和 AstrBot 日志")
+            return json_response({"saved": True, "message": "预设已更新并同步人设映射", "preset": preset, "config": self._public_config()})
+        return self._create_preset_response(payload)
+
+    def _create_preset_response(self, payload: dict[str, Any]):
+        try:
+            preset = self._create_preset_record(payload)
+        except ValueError as exc:
+            return self._page_error(str(exc))
+        except Exception as exc:
+            logger.exception(f"[{PLUGIN_NAME}] 创建预设失败: {exc}")
+            return self._page_error("创建预设失败，请检查插件数据目录权限和 AstrBot 日志")
+        return json_response({"saved": True, "message": "预设已创建并同步人设映射", "preset": preset, "config": self._public_config()})
 
     async def page_update_preset(self, preset_id: str):
-        preset = self._get_preset(preset_id)
+        preset = self._get_preset(preset_id, include_disabled=True)
         if not preset:
             return self._page_error("预设不存在", status_code=404)
         payload = await request.json(default={})
         if not isinstance(payload, dict):
             return self._page_error("预设格式错误")
-        for key in ("name", "description", "style_prompt", "character_prompt", "negative_prompt", "reference_id", "reference_type", "lock_character", "lock_style", "style_strength", "character_strength", "quality_override", "persona_id", "enabled"):
-            if key in payload:
-                preset[key] = payload[key]
-        preset["lock_character"] = self._as_bool(preset.get("lock_character", True), True)
-        preset["lock_style"] = self._as_bool(preset.get("lock_style", True), True)
-        preset["style_strength"] = self._preset_strength(preset.get("style_strength", 1.35), 1.35)
-        preset["character_strength"] = self._preset_strength(preset.get("character_strength", 1.25), 1.25)
-        if str(preset.get("quality_override", "inherit")) not in {"inherit", "on", "off"}:
-            preset["quality_override"] = "inherit"
-        self._save_presets()
-        return json_response({"saved": True, "message": "预设已更新", "preset": preset})
+        try:
+            self._update_preset_record(preset, payload)
+        except ValueError as exc:
+            return self._page_error(str(exc))
+        except Exception as exc:
+            logger.exception(f"[{PLUGIN_NAME}] 更新预设失败: {exc}")
+            return self._page_error("更新预设失败，请检查插件数据目录权限和 AstrBot 日志")
+        return json_response({"saved": True, "message": "预设已更新并同步人设映射", "preset": preset, "config": self._public_config()})
 
     async def page_delete_preset(self, preset_id: str):
         try:

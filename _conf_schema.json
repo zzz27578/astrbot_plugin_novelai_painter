@@ -1,7 +1,7 @@
 {
   "config_version": {
     "type": "int",
-    "default": 3,
+    "default": 4,
     "invisible": true
   },
   "provider": {
@@ -335,6 +335,12 @@
     "type": "dict",
     "default": {},
     "invisible": true
+  },
+  "llm_auto_reference": {
+    "description": "LLM 自动应用预设绑定参考图",
+    "type": "bool",
+    "default": true,
+    "hint": "启用后，LLM 生图会自动使用当前人设预设绑定的参考图；NovelAI 官方使用 Precise Reference，兼容后端使用图生图。"
   },
   "img2img_enabled": {
     "description": "启用图生图",

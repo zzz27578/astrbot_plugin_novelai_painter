@@ -4,7 +4,7 @@
 
 ## 主要能力
 
-- NovelAI 官方后端：文生图、图生图、V5 / V4.5 / V4 / V3 官方模型下拉选择、Precise Reference / Character Reference / Style Reference。
+- NovelAI 官方后端：文生图、图生图、V5 / V4.5 / V4 / V3 官方模型下拉选择、Precise Reference / Character Reference / Style Reference；LLM 生图可自动使用当前预设绑定的参考图。
 - OpenAI / NewAPI 兼容后端：/v1/images/generations 与 /v1/images/edits。
 - 入口四选一：全部禁用、仅固定命令、仅 LLM 工具、两者都启用；固定命令名可在 WebUI 修改，默认是 /nai。
 - 私聊 / 群聊权限：所有人、仅管理员、白名单、禁用；管理员绕过白名单可单独控制。
@@ -19,7 +19,7 @@
 
     git clone https://github.com/zzz27578/astrbot_plugin_novelai_painter.git
 
-安装后进入 AstrBot WebUI 的插件详情页，打开 NovelAI Painter 设置页面完成配置。自 2.1.1 起要求 AstrBot >= 4.17.0，以确保插件 Pages Web API 和 Bridge 可用。
+安装后进入 AstrBot WebUI 的插件详情页，打开 NovelAI Painter 设置页面完成配置。2.2.0 要求 AstrBot >= 4.27.3，并使用该版本起提供的统一人设解析接口，确保会话强制人设、Conversation 人设和默认人设与 AstrBot 主 Agent 的选择结果一致。
 
 ## 命令
 
@@ -36,6 +36,8 @@
 
 LLM 工具名称为 novelai_generate_image。只有在入口模式启用、用户通过权限检查，并且用户明确要求生成/绘制/修改图片时才会执行。
 
+LLM 工具直接发送图片或最终错误后会按 AstrBot 协议结束 Agent 循环，不再依赖模型理解某句状态文本。若当前生效预设绑定了参考图且“LLM 自动应用绑定参考图”已开启，官方后端自动使用 Precise Reference，OpenAI 兼容后端自动使用图生图端点。
+
 ## WebUI 配置
 
 页面中的设置分为：
@@ -47,6 +49,21 @@ LLM 工具名称为 novelai_generate_image。只有在入口模式启用、用�
 5. 任务记录：查看本次运行期间的最近任务状态，不保存完整提示词和密钥。
 
 点击顶部或底部“保存配置”后会立即写入插件配置，并通过页面提示保存结果。保存失败也会返回可读的中文错误，不依赖 Dashboard 的原始错误响应。
+
+预设编辑器内的“绑定人设 ID”和下方的人设映射表使用同一份 `persona_preset_map`。保存预设后绑定立即生效；旧版只写入预设 `persona_id` 的数据会在启动时自动迁移。禁用的预设会保留配置，但不会参与默认预设、人设映射或提示词合成。
+
+## 2.2.0 修复
+
+- 修复 LLM 工具发送图片后仍返回字符串、导致 Agent 继续调用生图和沙箱工具的问题。完成路径现在返回 `None`，由 AstrBot 直接终止工具循环。
+- 打通 WebUI 预设 `persona_id` 与 `persona_preset_map`：创建、编辑、改绑、解绑和旧数据迁移均同步生效。
+- LLM 调用始终解析当前人设映射或默认预设；锁定人物/画风时，会移除 LLM 自行补写且用户未明确要求的发色、服装和画风冲突标签。
+- 新增“LLM 自动应用绑定参考图”开关；NovelAI 官方自动使用 Precise Reference，兼容后端自动使用图生图。
+- 修复 `/nai draw` 和 `/nai img2img` 丢失提示词第一个单词，以及 reference 命令修改共享预设造成串类型的问题。
+- 修复 `admin_only` 与“管理员绕过白名单”的权限语义；禁用会话不再被管理员绕过。
+- 预设启用状态真正参与解析，并在 WebUI 明确显示；补齐服务端预设字段校验和失败回滚。
+- API 重试遵守硬上限；429 等待期间释放全局通道；增加响应、图片和 ZIP 解压大小限制，并隐藏任务记录中的本地文件路径。
+
+完整验证与兼容说明见 [UPDATE_REPORT_2.2.0.md](UPDATE_REPORT_2.2.0.md)。
 
 ## 2.1.3 修复
 

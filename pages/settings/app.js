@@ -204,7 +204,16 @@ function renderStatus() {
 function fillConfig() {
   Object.entries(state.config).forEach(([key, value]) => setConfigField(key, value));
   renderStatus();
+  renderPersonaOptions();
   renderPersonaMappings();
+}
+
+function renderPersonaOptions() {
+  const list = $("#persona-options");
+  if (!list) return;
+  list.innerHTML = state.personas
+    .map((persona) => `<option value="${esc(persona.id)}">${esc(persona.name || persona.id)}</option>`)
+    .join("");
 }
 
 function renderActivePresets() {
@@ -214,14 +223,20 @@ function renderActivePresets() {
   const mapped = Object.entries(state.config.persona_preset_map || {})
     .map(([persona, id]) => {
       const preset = state.presets.find((item) => item.id === id);
-      return preset ? `${persona} → ${preset.name || preset.id}` : null;
+      return preset ? {
+        label: `${persona} → ${preset.name || preset.id}${preset.enabled === false ? "（已禁用）" : ""}`,
+        active: preset.enabled !== false,
+      } : null;
     })
     .filter(Boolean);
   const items = [];
-  if (selected) items.push(`默认：${selected.name || selected.id}`);
+  if (selected) items.push({
+    label: `默认：${selected.name || selected.id}${selected.enabled === false ? "（已禁用）" : ""}`,
+    active: selected.enabled !== false,
+  });
   items.push(...mapped);
   box.innerHTML = items.length
-    ? items.map((item) => `<article class="preset-card"><div class="preset-meta"><strong>${esc(item)}</strong><p>当前生图会自动应用</p></div></article>`).join("")
+    ? items.map((item) => `<article class="preset-card"><div class="preset-meta"><strong>${esc(item.label)}</strong><p>${item.active ? "当前生图会自动应用" : "映射已保留；重新启用预设后才会应用"}</p></div></article>`).join("")
     : '<div class="empty">当前没有应用预设。</div>';
 }
 
@@ -229,7 +244,7 @@ function renderPresets() {
   const select = $("#default-preset");
   if (select) {
     select.innerHTML = '<option value="">不使用默认预设</option>' + state.presets
-      .map((preset) => `<option value="${esc(preset.id)}">${esc(preset.name || preset.id)}</option>`)
+      .map((preset) => `<option value="${esc(preset.id)}">${esc(preset.name || preset.id)}${preset.enabled === false ? "（已禁用）" : ""}</option>`)
       .join("");
     select.value = state.config.default_preset_id || "";
   }
@@ -246,6 +261,7 @@ function renderPresets() {
     const characterLocked = preset.lock_character !== false && Boolean(preset.character_prompt);
     const qualityMode = preset.quality_override || (styleLocked ? "off" : "inherit");
     const badges = [
+      preset.enabled === false ? "已禁用" : "已启用",
       styleLocked ? `画风 ${Number(preset.style_strength || 1.35).toFixed(2)}×` : "画风未锁定",
       characterLocked ? `人物 ${Number(preset.character_strength || 1.25).toFixed(2)}×` : "人物未锁定",
       qualityMode === "off" ? "质量标签关闭" : qualityMode === "on" ? "质量标签开启" : "质量标签跟随全局",
@@ -287,7 +303,7 @@ function renderPersonaMappings() {
       <span>${esc(persona.name || persona.id)} <small>(${esc(persona.id)})</small></span>
       <select data-persona="${esc(persona.id)}">
         <option value="">不自动应用</option>
-        ${state.presets.map((preset) => `<option value="${esc(preset.id)}">${esc(preset.name || preset.id)}</option>`).join("")}
+        ${state.presets.map((preset) => `<option value="${esc(preset.id)}">${esc(preset.name || preset.id)}${preset.enabled === false ? "（已禁用）" : ""}</option>`).join("")}
       </select>
     </label>`).join("");
 
@@ -370,6 +386,7 @@ function openPreset(id = "") {
   $("#preset-persona").value = preset.persona_id || "";
   renderReferenceOptions(preset.reference_id || "");
   $("#preset-reference-type").value = preset.reference_type || "character";
+  $("#preset-enabled").checked = preset.enabled !== false;
   $("#preset-lock-style").checked = preset.lock_style !== false;
   $("#preset-lock-character").checked = preset.lock_character !== false;
   $("#preset-style-strength").value = preset.style_strength || 1.35;
@@ -414,7 +431,7 @@ async function savePreset() {
     style_prompt: $("#preset-style").value.trim(),
     character_prompt: $("#preset-character").value.trim(),
     negative_prompt: $("#preset-negative").value.trim(),
-    enabled: true,
+    enabled: $("#preset-enabled").checked,
   };
   if (!payload.name) {
     toast("预设名称不能为空", "error");
@@ -526,9 +543,7 @@ async function saveConfig() {
       15000,
       "保存配置超时",
     ));
-    state.config = data.config || getConfig();
-    fillConfig();
-    renderPresets();
+    await reloadState();
     $("#dirty").textContent = "已保存";
     toast(data.message || "配置已保存");
   } catch (error) {
