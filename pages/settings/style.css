@@ -74,6 +74,17 @@ button:disabled {
   transform: none !important;
 }
 
+input:disabled,
+select:disabled,
+textarea:disabled {
+  cursor: not-allowed;
+}
+
+.setting-disabled {
+  opacity: 0.62;
+  transition: opacity 0.2s ease;
+}
+
 h1,
 h2,
 h3,
@@ -592,6 +603,27 @@ body.custom-model .custom-model-only {
   white-space: normal;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
+}
+
+.preset-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+  min-width: 0;
+}
+
+.preset-badges span {
+  max-width: 100%;
+  padding: 3px 8px;
+  border: 1px solid color-mix(in srgb, var(--primary) 22%, var(--line));
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--primary) 7%, var(--surface));
+  color: var(--primary-2);
+  font-size: 11px;
+  font-weight: 750;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
 }
 
 .card-actions {

@@ -1,7 +1,7 @@
 {
   "config_version": {
     "type": "int",
-    "default": 2,
+    "default": 3,
     "invisible": true
   },
   "provider": {
@@ -247,11 +247,11 @@
     "invisible": true
   },
   "max_api_requests_per_job": {
-    "description": "一次任务 API 请求数（强制上限为 1）",
+    "description": "一次任务 API 尝试次数硬上限（仅 429 策略可超过 1）",
     "type": "int",
-    "default": 1,
+    "default": 3,
     "min": 1,
-    "max": 1,
+    "max": 3,
     "invisible": true
   },
   "dedupe_window_seconds": {
@@ -269,21 +269,28 @@
     "max": 600
   },
   "retry_mode": {
-    "description": "重试策略",
+    "description": "429 限流重试策略",
     "type": "string",
     "default": "none",
     "options": [
-      "none"
+      "none",
+      "rate_limit_once",
+      "rate_limit_twice"
     ],
     "labels": {
-      "none": "关闭自动重试（防止重复生图）"
-    }
+      "none": "不自动重试（最严格）",
+      "rate_limit_once": "仅 429 自动重试 1 次",
+      "rate_limit_twice": "仅 429 自动重试 2 次"
+    },
+    "hint": "只在服务明确返回 429 时重试；网络超时、连接中断和其他错误不会重试，以避免重复扣费或重复生图。"
   },
   "retry_delay": {
-    "description": "兼容字段：重试等待（秒）",
+    "description": "429 重试基础等待（秒）",
     "type": "float",
     "default": 5,
-    "invisible": true
+    "min": 1,
+    "max": 300,
+    "hint": "若服务返回 Retry-After，则使用两者中较长的等待时间。"
   },
   "error_notify_mode": {
     "description": "错误提示",
@@ -306,10 +313,10 @@
     "default": true
   },
   "show_retry_notice": {
-    "description": "兼容字段：发送重试提示",
+    "description": "发送 429 重试提示",
     "type": "bool",
     "default": false,
-    "invisible": true
+    "hint": "开启后会在真正执行下一次 429 重试前向会话发送提示。"
   },
   "auto_clean_delay": {
     "description": "临时图片清理延迟（秒）",

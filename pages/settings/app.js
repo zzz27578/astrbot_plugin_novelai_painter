@@ -165,9 +165,17 @@ function renderStatus() {
     both: "命令 + LLM 工具",
   };
   $("#mode-status").textContent = modes[state.config.invoke_mode] || "未设置";
-  $("#guard-status").textContent = `单请求 · ${state.config.dedupe_window_seconds || 30} 秒去重`;
+  const retryMode = state.config.retry_mode || "none";
+  const retryAttempts = { none: 1, rate_limit_once: 2, rate_limit_twice: 3 }[retryMode] || 1;
+  $("#guard-status").textContent = `单事件去重 · ${state.config.dedupe_window_seconds || 30} 秒`;
+  $("#limit-status").textContent = `最多 1 张 · ${retryAttempts} 次 API 尝试`;
   document.body.classList.toggle("compatible", !official);
   document.body.classList.toggle("custom-model", state.config.model === "custom");
+  $$('[data-retry-setting]').forEach((container) => {
+    const control = $("input, select", container);
+    if (control) control.disabled = retryMode === "none";
+    container.classList.toggle("setting-disabled", retryMode === "none");
+  });
 
   const keyLabel = $("#api-key-label");
   const authHelp = $("#auth-help");
@@ -233,17 +241,28 @@ function renderPresets() {
     return;
   }
 
-  box.innerHTML = state.presets.map((preset) => `
+  box.innerHTML = state.presets.map((preset) => {
+    const styleLocked = preset.lock_style !== false && Boolean(preset.style_prompt);
+    const characterLocked = preset.lock_character !== false && Boolean(preset.character_prompt);
+    const qualityMode = preset.quality_override || (styleLocked ? "off" : "inherit");
+    const badges = [
+      styleLocked ? `画风 ${Number(preset.style_strength || 1.35).toFixed(2)}×` : "画风未锁定",
+      characterLocked ? `人物 ${Number(preset.character_strength || 1.25).toFixed(2)}×` : "人物未锁定",
+      qualityMode === "off" ? "质量标签关闭" : qualityMode === "on" ? "质量标签开启" : "质量标签跟随全局",
+    ];
+    return `
     <article class="preset-card">
       <div class="preset-meta">
         <strong>${esc(preset.name || preset.id)}</strong>
         <p>${esc(preset.description || preset.character_prompt || preset.style_prompt || "未填写说明")}</p>
+        <div class="preset-badges">${badges.map((badge) => `<span>${esc(badge)}</span>`).join("")}</div>
       </div>
       <div class="card-actions">
         <button class="small-btn" type="button" data-edit="${esc(preset.id)}">编辑</button>
         <button class="small-btn danger" type="button" data-delete="${esc(preset.id)}">删除</button>
       </div>
-    </article>`).join("");
+    </article>`;
+  }).join("");
 
   $$('[data-edit]', box).forEach((button) => {
     button.addEventListener("click", () => openPreset(button.dataset.edit));
@@ -331,9 +350,9 @@ async function renderJobs({ reportErrors = true } = {}) {
       <article class="job-card">
         <div>
           <div class="${job.ok ? "job-ok" : "job-fail"}">${job.ok ? "成功" : "失败"} · ${esc(job.operation || "generate")}</div>
-          <small>Job ${esc(job.job_id)} · ${esc(job.provider)} · ${new Date((job.created_at || 0) * 1000).toLocaleString()}</small>
+          <small>Job ${esc(job.job_id)} · ${esc(job.provider)} · 尝试 ${esc(job.attempts || 0)} 次 · ${new Date((job.created_at || 0) * 1000).toLocaleString()}</small>
         </div>
-        <div><small>${esc(job.message || job.error_code || "")}</small></div>
+        <div><small>${job.preset_id ? `预设 ${esc(job.preset_id)} · ` : "未使用预设 · "}${esc(job.message || job.error_code || "")}</small></div>
       </article>`).join("");
   } catch (error) {
     if (reportErrors) toast(readableError(error), "error");
@@ -351,7 +370,11 @@ function openPreset(id = "") {
   $("#preset-persona").value = preset.persona_id || "";
   renderReferenceOptions(preset.reference_id || "");
   $("#preset-reference-type").value = preset.reference_type || "character";
+  $("#preset-lock-style").checked = preset.lock_style !== false;
   $("#preset-lock-character").checked = preset.lock_character !== false;
+  $("#preset-style-strength").value = preset.style_strength || 1.35;
+  $("#preset-character-strength").value = preset.character_strength || 1.25;
+  $("#preset-quality-override").value = preset.quality_override || "off";
   $("#preset-description").value = preset.description || "";
   $("#preset-style").value = preset.style_prompt || "";
   $("#preset-character").value = preset.character_prompt || "";
@@ -382,7 +405,11 @@ async function savePreset() {
     persona_id: $("#preset-persona").value.trim(),
     reference_id: $("#preset-reference").value.trim(),
     reference_type: $("#preset-reference-type").value,
+    lock_style: $("#preset-lock-style").checked,
     lock_character: $("#preset-lock-character").checked,
+    style_strength: Number($("#preset-style-strength").value || 1.35),
+    character_strength: Number($("#preset-character-strength").value || 1.25),
+    quality_override: $("#preset-quality-override").value,
     description: $("#preset-description").value.trim(),
     style_prompt: $("#preset-style").value.trim(),
     character_prompt: $("#preset-character").value.trim(),
@@ -577,7 +604,7 @@ $$('[data-config]').forEach((element) => {
         ? Number(element.value)
         : element.value;
     markDirty();
-    if (["provider", "model", "openai_auth_header", "openai_auth_prefix", "invoke_mode", "dedupe_window_seconds"].includes(element.dataset.config)) {
+    if (["provider", "model", "openai_auth_header", "openai_auth_prefix", "invoke_mode", "dedupe_window_seconds", "retry_mode"].includes(element.dataset.config)) {
       renderStatus();
     }
   });

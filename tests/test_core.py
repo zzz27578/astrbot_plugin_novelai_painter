@@ -5,7 +5,7 @@ import json
 import tempfile
 import zipfile
 import unittest
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,6 +16,8 @@ class FakeEvent:
     unified_msg_origin = "test:group:1"
     role = "admin"
     message_obj = SimpleNamespace(message_id="m-1")
+    def __init__(self): self.sent = []
+    async def send(self, message): self.sent.append(message)
     def is_private_chat(self): return False
     def is_admin(self): return True
     def get_sender_id(self): return "u-1"
@@ -26,9 +28,10 @@ class FakeEvent:
 class CoreTests(unittest.TestCase):
     def make_plugin(self):
         p = object.__new__(NovelAIPainterPlugin)
-        p.config = {"model":"nai-diffusion-5-full", "negative_prompt":DEFAULT_NEGATIVE, "quality_toggle":True, "width":832, "height":1216, "steps":28, "scale":5.0, "sampler":"k_euler_ancestral", "reference_strength":.6, "reference_fidelity":.6, "reference_information_extracted":1.0, "provider":"novelai_official", "invoke_mode":"both", "group_access":"admin_only", "admin_bypass":True, "private_access":"all", "dedupe_window_seconds":30, "queue_timeout":1, "auto_clean_delay":300}
-        p.presets = [{"id":"p1", "name":"P1", "style_prompt":"watercolor", "character_prompt":"blue eyes", "negative_prompt":"extra arms", "reference_id":"r1", "reference_type":"style"}]
+        p.config = {"model":"nai-diffusion-5-full", "negative_prompt":DEFAULT_NEGATIVE, "quality_toggle":True, "width":832, "height":1216, "steps":28, "scale":5.0, "sampler":"k_euler_ancestral", "reference_strength":.6, "reference_fidelity":.6, "reference_information_extracted":1.0, "provider":"novelai_official", "invoke_mode":"both", "group_access":"admin_only", "admin_bypass":True, "private_access":"all", "dedupe_window_seconds":30, "queue_timeout":1, "retry_mode":"none", "retry_delay":1, "show_retry_notice":False, "auto_clean_delay":300}
+        p.presets = [{"id":"p1", "name":"P1", "style_prompt":"watercolor", "character_prompt":"blue eyes", "negative_prompt":"extra arms", "reference_id":"r1", "reference_type":"style", "lock_style":True, "lock_character":True, "style_strength":1.35, "character_strength":1.25, "quality_override":"off"}]
         p._recent_jobs = {}
+        p._delivered_jobs = {}
         p._jobs = []
         p.lock = asyncio.Lock()
         temp_dir = tempfile.TemporaryDirectory()
@@ -42,20 +45,49 @@ class CoreTests(unittest.TestCase):
         p = self.make_plugin(); p.config["default_preset_id"] = "p1"
         prompt, pid, negative = p._compose_prompt("a city", FakeEvent())
         self.assertEqual(pid, "p1")
-        self.assertIn("watercolor", prompt)
-        self.assertIn("blue eyes", prompt)
+        self.assertTrue(prompt.startswith("1.35::watercolor::"))
+        self.assertIn("1.25::blue eyes::", prompt)
+        self.assertIn("consistent art style", prompt)
+        self.assertNotIn("masterpiece", prompt)
         self.assertEqual(negative, "extra arms")
 
     def test_official_reference_payload(self):
         p = self.make_plugin(); p.config["default_preset_id"] = "p1"
-        params = p._official_parameters("a city", "reference", None, {"image_b64":"abc", "reference_type":"style"})
+        params = p._official_parameters("a city", "reference", None, {"image_b64":"abc", "reference_type":"style"}, preset=p.presets[0])
         self.assertEqual(params["director_reference_descriptions"][0]["caption"]["base_caption"], "style")
         self.assertEqual(params["n_samples"], 1)
+        self.assertFalse(params["qualityToggle"])
 
-    def test_http_errors_never_retry(self):
-        self.assertFalse(ProviderError("429", "x", retryable=False).retryable)
-        self.assertEqual(NovelAIPainterPlugin._http_error(429, b"").code, "429")
-        self.assertEqual(NovelAIPainterPlugin._http_error(401, b"").code, "auth")
+    def test_official_request_uses_anchored_prompt_and_one_sample(self):
+        async def run():
+            p = self.make_plugin()
+            p.config["default_preset_id"] = "p1"
+            p.config["api_token"] = "token"
+            prompt, preset_id, negative = p._compose_prompt("running in rain", FakeEvent())
+            p._post_image_request = AsyncMock(return_value="image.png")
+            await p._call_official(prompt, "generate", "job-1", None, None, negative, p._get_preset(preset_id))
+            payload = p._post_image_request.await_args.args[2]
+            self.assertTrue(payload["input"].startswith("1.35::watercolor::"))
+            self.assertEqual(payload["parameters"]["n_samples"], 1)
+            self.assertFalse(payload["parameters"]["qualityToggle"])
+        asyncio.run(run())
+
+    def test_openai_preset_uses_explicit_fixed_instructions(self):
+        p = self.make_plugin()
+        p.config["provider"] = "openai_compatible"
+        p.config["default_preset_id"] = "p1"
+        prompt, preset_id, _ = p._compose_prompt("running in rain", FakeEvent())
+        self.assertEqual(preset_id, "p1")
+        self.assertIn("Art style (FIXED; do not reinterpret or replace): watercolor", prompt)
+        self.assertIn("Character design (FIXED; preserve identity", prompt)
+        self.assertIn("Requested change: running in rain", prompt)
+
+    def test_only_429_is_retryable(self):
+        limited = NovelAIPainterPlugin._http_error(429, b"", {"Retry-After": "7"})
+        self.assertTrue(limited.retryable)
+        self.assertEqual(limited.retry_after, 7)
+        self.assertFalse(NovelAIPainterPlugin._http_error(401, b"").retryable)
+        self.assertFalse(NovelAIPainterPlugin._http_error(503, b"").retryable)
 
     def test_zip_decode(self):
         out = io.BytesIO()
@@ -79,15 +111,71 @@ class CoreTests(unittest.TestCase):
             p._call_official = AsyncMock(return_value="image.png")
             p._load_reference = AsyncMock(return_value=(None, None))
             e = FakeEvent()
-            first, second = await asyncio.gather(p._run_job(e, "a scene"), p._run_job(e, "a scene"))
+            first, second = await asyncio.gather(p._run_job(e, "a scene"), p._run_job(e, "a rewritten scene"))
             self.assertEqual(p._call_official.await_count, 1)
             self.assertEqual(first.ok, second.ok)
+            self.assertNotEqual(first.send_image, second.send_image)
         asyncio.run(run())
 
-    def test_event_key_stable(self):
+    def test_event_key_is_one_per_incoming_message(self):
         p = self.make_plugin(); e = FakeEvent()
-        self.assertEqual(p._event_key(e, "x", "generate"), p._event_key(e, "x", "generate"))
-        self.assertNotEqual(p._event_key(e, "x", "generate"), p._event_key(e, "x", "img2img"))
+        first = p._event_key(e, "x", "generate")
+        self.assertEqual(first, p._event_key(e, "rewritten prompt", "img2img"))
+
+    def test_429_retry_options_are_bounded(self):
+        async def run():
+            p = self.make_plugin()
+            p.config["retry_mode"] = "rate_limit_once"
+            p._call_official = AsyncMock(side_effect=[
+                ProviderError("429", "limited", retryable=True),
+                "image.png",
+            ])
+            p._load_reference = AsyncMock(return_value=(None, None))
+            with patch("main.asyncio.sleep", new=AsyncMock()) as sleeper:
+                result = await p._run_job(FakeEvent(), "a scene")
+            self.assertTrue(result.ok)
+            self.assertEqual(result.attempts, 2)
+            self.assertEqual(p._call_official.await_count, 2)
+            sleeper.assert_awaited_once()
+
+            p = self.make_plugin()
+            p.config["retry_mode"] = "rate_limit_twice"
+            p._call_official = AsyncMock(side_effect=ProviderError("429", "limited", retryable=True))
+            p._load_reference = AsyncMock(return_value=(None, None))
+            with patch("main.asyncio.sleep", new=AsyncMock()):
+                result = await p._run_job(FakeEvent(), "a scene")
+            self.assertFalse(result.ok)
+            self.assertEqual(result.attempts, 3)
+            self.assertEqual(p._call_official.await_count, 3)
+        asyncio.run(run())
+
+    def test_non_429_error_never_retries(self):
+        async def run():
+            p = self.make_plugin()
+            p.config["retry_mode"] = "rate_limit_twice"
+            p._call_official = AsyncMock(side_effect=ProviderError("network", "uncertain", retryable=True))
+            p._load_reference = AsyncMock(return_value=(None, None))
+            result = await p._run_job(FakeEvent(), "a scene")
+            self.assertFalse(result.ok)
+            self.assertEqual(result.attempts, 1)
+            self.assertEqual(p._call_official.await_count, 1)
+        asyncio.run(run())
+
+    def test_same_job_image_is_sent_only_once(self):
+        async def run():
+            p = self.make_plugin()
+            p.config["auto_clean_delay"] = 0
+            image_path = p.temp_dir / "one.png"
+            image_path.write_bytes(b"png")
+            event = FakeEvent()
+            result = GenerationResult(True, "job-once", "novelai_official", path=str(image_path), message="ok")
+            first = await p._finish_event(event, result)
+            second = await p._finish_event(event, result)
+            await asyncio.sleep(0)
+            self.assertEqual(first, "ok")
+            self.assertIn("重复发送", second)
+            self.assertEqual(len(event.sent), 1)
+        asyncio.run(run())
 
     def test_delete_preset_cleans_all_config_references(self):
         p = self.make_plugin()
@@ -157,6 +245,9 @@ class CoreTests(unittest.TestCase):
         self.assertIn("width: min(420px, calc(100vw - 32px))", css)
         self.assertIn(".field > span", css)
         self.assertIn("word-break: break-word", css)
+        self.assertIn('value="rate_limit_once"', html)
+        self.assertIn('id="preset-lock-style"', html)
+        self.assertIn("preset-badges", script)
 
 
 if __name__ == "__main__":
