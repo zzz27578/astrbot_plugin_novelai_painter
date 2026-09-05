@@ -236,14 +236,14 @@ function renderActivePresets() {
   });
   items.push(...mapped);
   box.innerHTML = items.length
-    ? items.map((item) => `<article class="preset-card"><div class="preset-meta"><strong>${esc(item.label)}</strong><p>${item.active ? "当前生图会自动应用" : "映射已保留；重新启用预设后才会应用"}</p></div></article>`).join("")
-    : '<div class="empty">当前没有应用预设。</div>';
+    ? items.map((item) => `<article class="preset-card"><div class="preset-meta"><strong>${esc(item.label)}</strong><p>${item.active ? "当前生图会自动应用" : "映射已保留；重新启用角色卡后才会应用"}</p></div></article>`).join("")
+    : '<div class="empty">当前没有应用角色卡。</div>';
 }
 
 function renderPresets() {
   const select = $("#default-preset");
   if (select) {
-    select.innerHTML = '<option value="">不使用默认预设</option>' + state.presets
+    select.innerHTML = '<option value="">不使用默认角色卡</option>' + state.presets
       .map((preset) => `<option value="${esc(preset.id)}">${esc(preset.name || preset.id)}${preset.enabled === false ? "（已禁用）" : ""}</option>`)
       .join("");
     select.value = state.config.default_preset_id || "";
@@ -251,26 +251,24 @@ function renderPresets() {
 
   const box = $("#preset-list");
   if (!state.presets.length) {
-    box.innerHTML = '<div class="empty">还没有预设。点击“新建预设”创建人物或画风锚定配置。</div>';
+    box.innerHTML = '<div class="empty">还没有角色卡。点击“新建角色卡”填写正向与负面 Tag。</div>';
     renderActivePresets();
     return;
   }
 
   box.innerHTML = state.presets.map((preset) => {
-    const styleLocked = preset.lock_style !== false && Boolean(preset.style_prompt);
-    const characterLocked = preset.lock_character !== false && Boolean(preset.character_prompt);
-    const qualityMode = preset.quality_override || (styleLocked ? "off" : "inherit");
+    const cardLocked = preset.lock_positive !== false && Boolean(preset.positive_prompt);
+    const qualityMode = preset.quality_override || (cardLocked ? "off" : "inherit");
     const badges = [
       preset.enabled === false ? "已禁用" : "已启用",
-      styleLocked ? `画风 ${Number(preset.style_strength || 1.35).toFixed(2)}×` : "画风未锁定",
-      characterLocked ? `人物 ${Number(preset.character_strength || 1.25).toFixed(2)}×` : "人物未锁定",
+      cardLocked ? `角色卡 ${Number(preset.positive_strength || 1.35).toFixed(2)}×` : "角色卡未锁定",
       qualityMode === "off" ? "质量标签关闭" : qualityMode === "on" ? "质量标签开启" : "质量标签跟随全局",
     ];
     return `
     <article class="preset-card">
       <div class="preset-meta">
         <strong>${esc(preset.name || preset.id)}</strong>
-        <p>${esc(preset.description || preset.character_prompt || preset.style_prompt || "未填写说明")}</p>
+        <p>${esc(preset.description || preset.positive_prompt || "未填写说明")}</p>
         <div class="preset-badges">${badges.map((badge) => `<span>${esc(badge)}</span>`).join("")}</div>
       </div>
       <div class="card-actions">
@@ -293,7 +291,7 @@ function renderPersonaMappings() {
   const box = $("#persona-mappings");
   if (!box) return;
   if (!state.personas.length) {
-    box.innerHTML = '<div class="empty">未读取到 AstrBot 人设。仍可在预设中手动绑定人设 ID。</div>';
+    box.innerHTML = '<div class="empty">未读取到 AstrBot 人设。仍可在角色卡中手动绑定人设 ID。</div>';
     return;
   }
 
@@ -335,7 +333,7 @@ function renderReferences() {
   renderReferenceOptions(editingPreset?.reference_id || "");
   const box = $("#reference-list");
   if (!state.references.length) {
-    box.innerHTML = '<div class="empty">还没有参考图。上传后可绑定到人物或画风预设。</div>';
+    box.innerHTML = '<div class="empty">还没有参考图。上传后可绑定到角色卡。</div>';
     return;
   }
   box.innerHTML = state.references.map((reference) => `
@@ -368,7 +366,7 @@ async function renderJobs({ reportErrors = true } = {}) {
           <div class="${job.ok ? "job-ok" : "job-fail"}">${job.ok ? "成功" : "失败"} · ${esc(job.operation || "generate")}</div>
           <small>Job ${esc(job.job_id)} · ${esc(job.provider)} · 尝试 ${esc(job.attempts || 0)} 次 · ${new Date((job.created_at || 0) * 1000).toLocaleString()}</small>
         </div>
-        <div><small>${job.preset_id ? `预设 ${esc(job.preset_id)} · ` : "未使用预设 · "}${esc(job.message || job.error_code || "")}</small></div>
+        <div><small>${job.preset_id ? `角色卡 ${esc(job.preset_id)} · ` : "未使用角色卡 · "}${esc(job.message || job.error_code || "")}</small></div>
       </article>`).join("");
   } catch (error) {
     if (reportErrors) toast(readableError(error), "error");
@@ -378,7 +376,7 @@ async function renderJobs({ reportErrors = true } = {}) {
 function openPreset(id = "") {
   editingPreset = state.presets.find((preset) => preset.id === id) || null;
   $("#preset-editor").classList.remove("hidden");
-  $("#preset-editor-title").textContent = editingPreset ? "编辑预设" : "新建预设";
+  $("#preset-editor-title").textContent = editingPreset ? "编辑角色卡" : "新建角色卡";
   $("#delete-preset").style.display = editingPreset ? "inline-flex" : "none";
   const preset = editingPreset || {};
   $("#preset-id").value = preset.id || "";
@@ -387,14 +385,11 @@ function openPreset(id = "") {
   renderReferenceOptions(preset.reference_id || "");
   $("#preset-reference-type").value = preset.reference_type || "character";
   $("#preset-enabled").checked = preset.enabled !== false;
-  $("#preset-lock-style").checked = preset.lock_style !== false;
-  $("#preset-lock-character").checked = preset.lock_character !== false;
-  $("#preset-style-strength").value = preset.style_strength || 1.35;
-  $("#preset-character-strength").value = preset.character_strength || 1.25;
+  $("#preset-lock-positive").checked = preset.lock_positive !== false;
+  $("#preset-positive-strength").value = preset.positive_strength || 1.35;
   $("#preset-quality-override").value = preset.quality_override || "off";
   $("#preset-description").value = preset.description || "";
-  $("#preset-style").value = preset.style_prompt || "";
-  $("#preset-character").value = preset.character_prompt || "";
+  $("#preset-positive").value = preset.positive_prompt || "";
   $("#preset-negative").value = preset.negative_prompt || "";
   $("#preset-name").focus();
 }
@@ -422,19 +417,16 @@ async function savePreset() {
     persona_id: $("#preset-persona").value.trim(),
     reference_id: $("#preset-reference").value.trim(),
     reference_type: $("#preset-reference-type").value,
-    lock_style: $("#preset-lock-style").checked,
-    lock_character: $("#preset-lock-character").checked,
-    style_strength: Number($("#preset-style-strength").value || 1.35),
-    character_strength: Number($("#preset-character-strength").value || 1.25),
+    lock_positive: $("#preset-lock-positive").checked,
+    positive_strength: Number($("#preset-positive-strength").value || 1.35),
     quality_override: $("#preset-quality-override").value,
     description: $("#preset-description").value.trim(),
-    style_prompt: $("#preset-style").value.trim(),
-    character_prompt: $("#preset-character").value.trim(),
+    positive_prompt: $("#preset-positive").value.trim(),
     negative_prompt: $("#preset-negative").value.trim(),
     enabled: $("#preset-enabled").checked,
   };
   if (!payload.name) {
-    toast("预设名称不能为空", "error");
+    toast("角色卡名称不能为空", "error");
     $("#preset-name").focus();
     return;
   }
@@ -448,16 +440,16 @@ async function savePreset() {
     const data = ensureOk(await withTimeout(
       bridge.apiPost("presets/manage", body),
       15000,
-      "保存预设超时",
+      "保存角色卡超时",
     ));
     await reloadState();
     closePreset();
-    toast(data.message || "预设已保存");
+    toast(data.message || "角色卡已保存");
   } catch (error) {
     toast(readableError(error), "error", 7000);
   } finally {
     button.disabled = false;
-    button.textContent = "保存预设";
+    button.textContent = "保存角色卡";
   }
 }
 
@@ -475,9 +467,9 @@ function cleanDeletedPresetFromClient(presetId) {
 async function deletePreset(id, trigger = null) {
   if (!id) return false;
   const confirmed = await askConfirmation({
-    title: "删除这个预设？",
-    message: "删除后无法恢复；相关默认预设和 AstrBot 人设映射会一并清理。",
-    confirmText: "删除预设",
+    title: "删除这个角色卡？",
+    message: "删除后无法恢复；相关默认角色卡和 AstrBot 人设映射会一并清理。",
+    confirmText: "删除角色卡",
   });
   if (!confirmed) return false;
   if (trigger) trigger.disabled = true;
@@ -485,7 +477,7 @@ async function deletePreset(id, trigger = null) {
     const data = ensureOk(await withTimeout(
       bridge.apiPost("presets/manage", { action: "delete", id }),
       15000,
-      "删除预设超时",
+      "删除角色卡超时",
     ));
     cleanDeletedPresetFromClient(id);
     if (Array.isArray(data.presets)) state.presets = data.presets;
@@ -493,7 +485,7 @@ async function deletePreset(id, trigger = null) {
     renderPresets();
     renderPersonaMappings();
     if (editingPreset?.id === id) closePreset();
-    toast(data.message || "预设已删除");
+    toast(data.message || "角色卡已删除");
     return true;
   } catch (error) {
     toast(readableError(error), "error", 7000);
@@ -507,7 +499,7 @@ async function deleteReference(id, trigger = null) {
   if (!id) return false;
   const confirmed = await askConfirmation({
     title: "删除这张参考图？",
-    message: "删除后无法恢复；绑定该图片的预设会自动解除引用。",
+    message: "删除后无法恢复；绑定该图片的角色卡会自动解除引用。",
     confirmText: "删除参考图",
   });
   if (!confirmed) return false;

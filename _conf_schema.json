@@ -1,7 +1,7 @@
 {
   "config_version": {
     "type": "int",
-    "default": 4,
+    "default": 5,
     "invisible": true
   },
   "provider": {
@@ -326,21 +326,21 @@
     "max": 86400
   },
   "default_preset_id": {
-    "description": "默认预设 ID",
+    "description": "默认角色卡 ID",
     "type": "string",
     "default": ""
   },
   "persona_preset_map": {
-    "description": "AstrBot 人设到预设的映射",
+    "description": "AstrBot 人设到角色卡的映射",
     "type": "dict",
     "default": {},
     "invisible": true
   },
   "llm_auto_reference": {
-    "description": "LLM 自动应用预设绑定参考图",
+    "description": "LLM 自动应用角色卡绑定参考图",
     "type": "bool",
     "default": true,
-    "hint": "启用后，LLM 生图会自动使用当前人设预设绑定的参考图；NovelAI 官方使用 Precise Reference，兼容后端使用图生图。"
+    "hint": "启用后，LLM 生图会自动使用当前人设角色卡绑定的参考图；NovelAI 官方使用 Precise Reference，兼容后端使用图生图。"
   },
   "img2img_enabled": {
     "description": "启用图生图",

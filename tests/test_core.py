@@ -33,7 +33,7 @@ class CoreTests(unittest.TestCase):
     def make_plugin(self):
         p = object.__new__(NovelAIPainterPlugin)
         p.config = {"model":"nai-diffusion-5-full", "negative_prompt":DEFAULT_NEGATIVE, "quality_toggle":True, "width":832, "height":1216, "steps":28, "scale":5.0, "sampler":"k_euler_ancestral", "reference_strength":.6, "reference_fidelity":.6, "reference_information_extracted":1.0, "provider":"novelai_official", "invoke_mode":"both", "group_access":"admin_only", "admin_bypass":True, "private_access":"all", "dedupe_window_seconds":30, "queue_timeout":1, "retry_mode":"none", "retry_delay":1, "show_retry_notice":False, "auto_clean_delay":300, "llm_auto_reference":True, "reference_enabled":True, "img2img_enabled":True, "persona_preset_map":{}}
-        p.presets = [{"id":"p1", "name":"P1", "style_prompt":"watercolor", "character_prompt":"blue eyes", "negative_prompt":"extra arms", "reference_id":"r1", "reference_type":"style", "lock_style":True, "lock_character":True, "style_strength":1.35, "character_strength":1.25, "quality_override":"off"}]
+        p.presets = [{"id":"p1", "name":"P1", "positive_prompt":"watercolor, blue eyes, blonde hair, side ponytail, black bodysuit", "negative_prompt":"extra arms", "reference_id":"r1", "reference_type":"style", "lock_positive":True, "positive_strength":1.35, "quality_override":"off"}]
         p._recent_jobs = {}
         p._delivered_jobs = {}
         p._jobs = []
@@ -46,10 +46,9 @@ class CoreTests(unittest.TestCase):
 
     def test_prompt_and_negative_preset(self):
         p = self.make_plugin(); p.config["default_preset_id"] = "p1"
-        prompt, pid, negative = p._compose_prompt("a city", FakeEvent())
+        prompt, pid, negative = p._compose_prompt("a city", FakeEvent("画一张城市里的全身像"))
         self.assertEqual(pid, "p1")
-        self.assertTrue(prompt.startswith("1.35::watercolor::"))
-        self.assertIn("1.25::blue eyes::", prompt)
+        self.assertTrue(prompt.startswith("1.35::watercolor, blue eyes, blonde hair, side ponytail, black bodysuit::"))
         self.assertIn("consistent art style", prompt)
         self.assertNotIn("masterpiece", prompt)
         self.assertEqual(negative, "extra arms")
@@ -66,24 +65,27 @@ class CoreTests(unittest.TestCase):
             p = self.make_plugin()
             p.config["default_preset_id"] = "p1"
             p.config["api_token"] = "token"
-            prompt, preset_id, negative = p._compose_prompt("running in rain", FakeEvent())
+            prompt, preset_id, negative = p._compose_prompt("running in rain", FakeEvent("画她在雨中奔跑"))
             p._post_image_request = AsyncMock(return_value="image.png")
             await p._call_official(prompt, "generate", "job-1", None, None, negative, p._get_preset(preset_id))
             payload = p._post_image_request.await_args.args[2]
-            self.assertTrue(payload["input"].startswith("1.35::watercolor::"))
+            self.assertTrue(payload["input"].startswith("1.35::watercolor, blue eyes"))
             self.assertEqual(payload["parameters"]["n_samples"], 1)
             self.assertFalse(payload["parameters"]["qualityToggle"])
+            self.assertIn("extra arms", payload["parameters"]["negative_prompt"])
         asyncio.run(run())
 
     def test_openai_preset_uses_explicit_fixed_instructions(self):
         p = self.make_plugin()
         p.config["provider"] = "openai_compatible"
         p.config["default_preset_id"] = "p1"
-        prompt, preset_id, _ = p._compose_prompt("running in rain", FakeEvent())
+        prompt, preset_id, _ = p._compose_prompt("running in rain", FakeEvent("画她在雨中奔跑"))
         self.assertEqual(preset_id, "p1")
-        self.assertIn("Art style (FIXED; do not reinterpret or replace): watercolor", prompt)
-        self.assertIn("Character design (FIXED; preserve identity", prompt)
+        self.assertIn("Role-card positive prompt (FIXED; preserve every unspecified identity and style detail): watercolor, blue eyes", prompt)
         self.assertIn("Requested change: running in rain", prompt)
+        compatible_prompt = p._openai_prompt_with_negative(prompt, "extra arms")
+        self.assertIn(DEFAULT_NEGATIVE, compatible_prompt)
+        self.assertIn("extra arms", compatible_prompt)
 
     def test_only_429_is_retryable(self):
         limited = NovelAIPainterPlugin._http_error(429, b"", {"Retry-After": "7"})
@@ -146,6 +148,32 @@ class CoreTests(unittest.TestCase):
         self.assertNotEqual(created["id"], "client-id")
         updated = p._normalize_preset_fields({"id": "replacement", "name": "Updated"}, p.presets[0])
         self.assertEqual(updated["id"], "p1")
+
+    def test_legacy_style_and_character_fields_migrate_to_one_positive_prompt(self):
+        p = object.__new__(NovelAIPainterPlugin)
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        p.presets_path = Path(temp_dir.name) / "presets.json"
+        p.presets_path.write_text(json.dumps([{
+            "id": "legacy",
+            "name": "Legacy",
+            "style_prompt": "watercolor",
+            "character_prompt": "blonde hair, elf ears",
+            "lock_style": True,
+            "lock_character": True,
+            "style_strength": 1.35,
+            "character_strength": 1.25,
+            "negative_prompt": "pink hair",
+        }]), encoding="utf-8")
+        p._preset_schema_migrated = False
+        migrated = p._load_presets()[0]
+        self.assertEqual(migrated["positive_prompt"], "watercolor, blonde hair, elf ears")
+        self.assertEqual(migrated["negative_prompt"], "pink hair")
+        self.assertTrue(migrated["lock_positive"])
+        self.assertEqual(migrated["positive_strength"], 1.35)
+        self.assertNotIn("style_prompt", migrated)
+        self.assertNotIn("character_prompt", migrated)
+        self.assertTrue(p._preset_schema_migrated)
 
     def test_old_embedded_persona_binding_is_migrated_without_overwriting_explicit_map(self):
         p = self.make_plugin()
@@ -249,6 +277,7 @@ class CoreTests(unittest.TestCase):
 
     def test_explicit_character_change_is_preserved(self):
         p = self.make_plugin()
+        p.presets[0]["negative_prompt"] = "pink hair, wedding dress, extra arms"
         event = FakeEvent("把衣服换成婚纱")
         filtered = p._filter_llm_prompt_conflicts(
             "pink hair, wedding dress, standing",
@@ -257,6 +286,26 @@ class CoreTests(unittest.TestCase):
         )
         self.assertIn("wedding dress", filtered)
         self.assertNotIn("pink hair", filtered)
+        composed, _, negative = p._compose_prompt("wedding dress, standing", event, "p1")
+        self.assertNotIn("black bodysuit", composed)
+        self.assertIn("blonde hair", composed)
+        self.assertIn("wedding dress", composed)
+        self.assertNotIn("wedding dress", negative)
+        self.assertIn("pink hair", negative)
+        self.assertIn("extra arms", negative)
+
+    def test_openai_job_receives_role_card_negative_prompt(self):
+        async def run():
+            p = self.make_plugin()
+            p.config["provider"] = "openai_compatible"
+            p.config["default_preset_id"] = "p1"
+            p._call_openai = AsyncMock(return_value="image.png")
+            p._load_reference = AsyncMock(return_value=(None, None))
+            result = await p._run_job(FakeEvent("画她在雨中奔跑"), "running in rain")
+            self.assertTrue(result.ok)
+            self.assertEqual(p._call_openai.await_args.args[4], "extra arms")
+
+        asyncio.run(run())
 
     def test_duplicate_event_has_one_provider_call(self):
         async def run():
@@ -405,7 +454,8 @@ class CoreTests(unittest.TestCase):
             p._finish_event = AsyncMock(return_value="ok")
             event = FakeEvent()
             result = await p.novelai_generate_image(event)
-            self.assertIsNone(result)
+            self.assertIn("FINAL_IMAGE_TOOL_RESULT", result)
+            self.assertIn("reply to the user once", result)
             p._run_job.assert_awaited_once_with(
                 event,
                 "1girl, silver hair, blue eyes, night city",
@@ -436,16 +486,31 @@ class CoreTests(unittest.TestCase):
                 event,
                 "full body, pink hair, wedding dress, looking at viewer",
             )
-            self.assertIsNone(result)
+            self.assertIn("FINAL_IMAGE_TOOL_RESULT", result)
             args = p._call_official.await_args.args
-            self.assertTrue(args[0].startswith("1.35::watercolor::"))
-            self.assertIn("1.25::blue eyes::", args[0])
+            self.assertTrue(args[0].startswith("1.35::watercolor, blue eyes"))
             self.assertNotIn("pink hair", args[0])
             self.assertNotIn("wedding dress", args[0])
             self.assertEqual(args[1], "reference")
             self.assertIsNotNone(args[4])
             self.assertEqual(args[4]["reference_type"], "style")
             p._finish_event.assert_awaited_once()
+        asyncio.run(run())
+
+    def test_repeated_llm_tool_call_keeps_followup_result_but_uses_provider_once(self):
+        async def run():
+            p = self.make_plugin()
+            p.config["default_preset_id"] = "p1"
+            p.config["llm_auto_reference"] = False
+            p._call_official = AsyncMock(return_value="image.png")
+            p._load_reference = AsyncMock(return_value=(None, None))
+            p._finish_event = AsyncMock(return_value="图片已发送")
+            event = FakeEvent("给我画一张你现在的样子")
+            first = await p.novelai_generate_image(event, "full body, standing")
+            second = await p.novelai_generate_image(event, "full body, standing")
+            self.assertIn("reply to the user once", first)
+            self.assertIn("reply to the user once", second)
+            self.assertEqual(p._call_official.await_count, 1)
         asyncio.run(run())
 
     def test_command_keeps_complete_prompt_and_does_not_mutate_reference_type(self):
@@ -455,8 +520,8 @@ class CoreTests(unittest.TestCase):
             p._run_job = AsyncMock(return_value=GenerationResult(True, "job-1", "novelai_official", send_image=False))
             p._finish_event = AsyncMock()
             event = FakeEvent("/nai draw 1girl, blonde hair, blue eyes")
-            async for _ in p.cmd_draw(event):
-                pass
+            command_results = [item async for item in p.cmd_draw(event)]
+            self.assertEqual(command_results, [])
             self.assertEqual(p._run_job.await_args.args[1], "1girl, blonde hair, blue eyes")
 
             original_type = p.presets[0]["reference_type"]
@@ -479,7 +544,11 @@ class CoreTests(unittest.TestCase):
         self.assertIn(".field > span", css)
         self.assertIn("word-break: break-word", css)
         self.assertIn('value="rate_limit_once"', html)
-        self.assertIn('id="preset-lock-style"', html)
+        self.assertIn('id="preset-lock-positive"', html)
+        self.assertIn('id="preset-positive"', html)
+        self.assertIn('id="preset-negative"', html)
+        self.assertNotIn('id="preset-lock-style"', html)
+        self.assertNotIn('id="preset-character"', html)
         self.assertIn("preset-badges", script)
         self.assertIn('id="preset-enabled"', html)
         self.assertIn('data-config="llm_auto_reference"', html)

@@ -1,7 +1,7 @@
 name: astrbot_plugin_novelai_painter
 display_name: NovelAI 灵动画师
-desc: 可控的 NovelAI / OpenAI 兼容生图插件，支持命令、LLM 工具、图生图、Precise Reference 与 WebUI 预设管理。
-version: 2.2.0
+desc: 可控的 NovelAI / OpenAI 兼容生图插件，支持命令、LLM 工具、角色卡正负 Tag、图生图、Precise Reference 与 WebUI 管理。
+version: 2.3.0
 author: AstrBot 社区
 repo: "https://github.com/zzz27578/astrbot_plugin_novelai_painter"
 astrbot_version: ">=4.27.3"

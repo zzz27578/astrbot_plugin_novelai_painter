@@ -34,7 +34,7 @@ except ImportError:
 from astrbot.core.message.message_event_result import MessageChain
 
 PLUGIN_NAME = "astrbot_plugin_novelai_painter"
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 MAX_RESPONSE_BYTES = 48 * 1024 * 1024
 DEFAULT_MODEL = "nai-diffusion-5-full"
@@ -103,15 +103,21 @@ class NovelAIPainterPlugin(Star):
         self._inflight_jobs: dict[str, str] = {}
         self._delivered_jobs: dict[str, float] = {}
         self._jobs: list[dict[str, Any]] = []
+        self._preset_schema_migrated = False
         self.presets = self._load_presets()
         self._ensure_defaults()
+        if self._preset_schema_migrated:
+            try:
+                self._save_presets()
+            except Exception as exc:
+                logger.warning(f"[{PLUGIN_NAME}] 保存角色卡迁移结果失败: {exc}")
         self._migrate_embedded_persona_bindings()
         self._register_web_api()
 
     # --------------------------- configuration ---------------------------
     def _ensure_defaults(self) -> None:
         defaults = {
-            "config_version": 4,
+            "config_version": 5,
             "provider": "novelai_official",
             "api_token": "",
             "api_key": "",
@@ -170,8 +176,8 @@ class NovelAIPainterPlugin(Star):
             config_version = int(self.config.get("config_version", 0) or 0)
         except (TypeError, ValueError):
             config_version = 0
-        if config_version < 4:
-            self.config["config_version"] = 4
+        if config_version < 5:
+            self.config["config_version"] = 5
             self.config["images_per_request"] = 1
             self.config["max_api_requests_per_job"] = 3
             changed = True
@@ -238,17 +244,52 @@ class NovelAIPainterPlugin(Star):
                 if not isinstance(item, dict):
                     continue
                 preset = dict(item)
-                preset["lock_style"] = self._as_bool(preset.get("lock_style", True), True)
-                preset["lock_character"] = self._as_bool(preset.get("lock_character", True), True)
+                legacy_style = str(preset.get("style_prompt", "") or "").strip()
+                legacy_character = str(preset.get("character_prompt", "") or "").strip()
+                positive_prompt = str(preset.get("positive_prompt", "") or "").strip()
+                if not positive_prompt:
+                    positive_prompt = ", ".join(
+                        part for part in (legacy_style, legacy_character) if part
+                    )
+                if any(key not in preset for key in ("positive_prompt", "lock_positive", "positive_strength")) or any(
+                    key in preset
+                    for key in (
+                        "style_prompt", "character_prompt", "lock_style",
+                        "lock_character", "style_strength", "character_strength",
+                    )
+                ):
+                    self._preset_schema_migrated = True
+                preset["positive_prompt"] = positive_prompt
+                preset["lock_positive"] = self._as_bool(
+                    preset.get(
+                        "lock_positive",
+                        self._as_bool(preset.get("lock_style", True), True)
+                        or self._as_bool(preset.get("lock_character", True), True),
+                    ),
+                    True,
+                )
                 preset["enabled"] = self._as_bool(preset.get("enabled", True), True)
-                preset["style_strength"] = self._preset_strength(preset.get("style_strength", 1.35), 1.35)
-                preset["character_strength"] = self._preset_strength(preset.get("character_strength", 1.25), 1.25)
+                preset["positive_strength"] = self._preset_strength(
+                    preset.get(
+                        "positive_strength",
+                        max(
+                            self._preset_strength(preset.get("style_strength", 1.35), 1.35),
+                            self._preset_strength(preset.get("character_strength", 1.25), 1.25),
+                        ),
+                    ),
+                    1.35,
+                )
                 if str(preset.get("quality_override", "")) not in {"inherit", "on", "off"}:
-                    preset["quality_override"] = "off" if str(preset.get("style_prompt", "") or "").strip() else "inherit"
+                    preset["quality_override"] = "off" if positive_prompt else "inherit"
+                for legacy_key in (
+                    "style_prompt", "character_prompt", "lock_style",
+                    "lock_character", "style_strength", "character_strength",
+                ):
+                    preset.pop(legacy_key, None)
                 normalized.append(preset)
             return normalized
         except Exception as exc:
-            logger.warning(f"[{PLUGIN_NAME}] 读取预设失败: {exc}")
+            logger.warning(f"[{PLUGIN_NAME}] 读取角色卡失败: {exc}")
             return []
 
     def _save_presets(self) -> None:
@@ -282,7 +323,7 @@ class NovelAIPainterPlugin(Star):
             try:
                 self._save_config()
             except Exception as exc:
-                logger.warning(f"[{PLUGIN_NAME}] 迁移人设预设映射失败: {exc}")
+                logger.warning(f"[{PLUGIN_NAME}] 迁移人设角色卡映射失败: {exc}")
 
     def _sync_preset_persona_binding(self, preset: dict[str, Any], previous_persona_id: str = "") -> bool:
         """Synchronize the preset editor binding with persona_preset_map."""
@@ -313,7 +354,7 @@ class NovelAIPainterPlugin(Star):
         merged.update(payload)
         name = str(merged.get("name", "") or "").strip()
         if not name:
-            raise ValueError("预设名称不能为空")
+            raise ValueError("角色卡名称不能为空")
         reference_type = str(merged.get("reference_type", "character") or "character").strip().lower()
         if reference_type == "character&style":
             reference_type = "both"
@@ -325,21 +366,42 @@ class NovelAIPainterPlugin(Star):
         preset_id = str((current or {}).get("id", "") or "").strip()
         if not preset_id:
             preset_id = uuid.uuid4().hex[:10]
+        positive_prompt = str(merged.get("positive_prompt", "") or "").strip()
+        if not positive_prompt:
+            positive_prompt = ", ".join(
+                part
+                for part in (
+                    str(merged.get("style_prompt", "") or "").strip(),
+                    str(merged.get("character_prompt", "") or "").strip(),
+                )
+                if part
+            )
+        lock_positive_default = (
+            self._as_bool(merged.get("lock_style", True), True)
+            or self._as_bool(merged.get("lock_character", True), True)
+        )
+        positive_strength_default = max(
+            self._preset_strength(merged.get("style_strength", 1.35), 1.35),
+            self._preset_strength(merged.get("character_strength", 1.25), 1.25),
+        )
         return {
             # Preset IDs are server-owned and immutable. Accepting an ID from
             # a create/update payload can create duplicates or orphan mappings.
             "id": preset_id,
             "name": name[:80],
             "description": str(merged.get("description", "") or "").strip()[:300],
-            "style_prompt": str(merged.get("style_prompt", "") or "").strip()[:4000],
-            "character_prompt": str(merged.get("character_prompt", "") or "").strip()[:4000],
+            "positive_prompt": positive_prompt[:8000],
             "negative_prompt": str(merged.get("negative_prompt", "") or "").strip()[:4000],
             "reference_id": reference_id,
             "reference_type": reference_type,
-            "lock_character": self._as_bool(merged.get("lock_character", True), True),
-            "lock_style": self._as_bool(merged.get("lock_style", True), True),
-            "style_strength": self._preset_strength(merged.get("style_strength", 1.35), 1.35),
-            "character_strength": self._preset_strength(merged.get("character_strength", 1.25), 1.25),
+            "lock_positive": self._as_bool(
+                merged.get("lock_positive", lock_positive_default),
+                True,
+            ),
+            "positive_strength": self._preset_strength(
+                merged.get("positive_strength", positive_strength_default),
+                1.35,
+            ),
             "quality_override": str(merged.get("quality_override", "off"))
             if str(merged.get("quality_override", "off")) in {"inherit", "on", "off"}
             else "off",
@@ -544,8 +606,8 @@ class NovelAIPainterPlugin(Star):
     def _preset_quality_toggle(self, preset: dict[str, Any] | None) -> bool:
         raw_override = (preset or {}).get("quality_override")
         if raw_override is None and preset:
-            has_locked_style = bool(str(preset.get("style_prompt", "") or "").strip()) and self._as_bool(preset.get("lock_style", True), True)
-            if has_locked_style:
+            has_locked_card = bool(str(preset.get("positive_prompt", "") or "").strip()) and self._as_bool(preset.get("lock_positive", True), True)
+            if has_locked_card:
                 return False
         override = str(raw_override or "inherit")
         if override == "on":
@@ -553,6 +615,111 @@ class NovelAIPainterPlugin(Star):
         if override == "off":
             return False
         return self._as_bool(self._cfg("quality_toggle", True))
+
+    @staticmethod
+    def _requested_change_categories(event: AstrMessageEvent | None) -> set[str]:
+        try:
+            raw_request = str(event.get_message_str() or "").lower().replace("_", " ") if event else ""
+        except Exception:
+            raw_request = ""
+        patterns = {
+            "identity": r"(性别|男生|女生|男孩|女孩|男人|女人|少年|少女|\b(?:1|2|multiple)?\s*(?:girls?|boys?)\b|\bmale\b|\bfemale\b|\bman\b|\bwoman\b)",
+            "hair": r"(头发|发型|发色|马尾|辫子?|刘海|呆毛|[粉金银白黑红蓝绿紫棕]毛|\bhair\b|\bponytails?\b|\btwintails?\b|\bbraids?\b|\bbangs?\b)",
+            "eyes": r"(眼睛|眼色|瞳色?|异色瞳|\beyes?\b|\biris\b|\bheterochromia\b)",
+            "ears_species": r"(耳朵|精灵耳|兽耳|种族|猫娘|狐娘|狼娘|兔娘|龙娘|恶魔|天使|\bears?\b|\belf\b|\bkemonomimi\b|\bfox\b|\bcat\b|\bwolf\b|\bdog\b|\brabbit\b|\bbunny\b|\bdragon\b|\bdemon\b|\bangel\b|\bhuman\b)",
+            "clothing": r"(衣服|服装|换装|穿(?:着|上|了|一|件|身)|婚纱|礼服|裙|裤|鞋|帽|配饰|饰品|\boutfit\b|\bclothes?\b|\bclothing\b|\bwear(?:ing)?\b|\bdress\b|\bgown\b|\bskirt\b|\buniform\b|\baccessor(?:y|ies)\b|\bbikini\b|\bswimsuit\b|\blingerie\b|\barmor\b|\bkimono\b|\bhoodie\b|\bsuit\b)",
+            "body_features": r"(肤色|皮肤|身材|体型|胸部?|年龄|\bskin\b|\bbody shape\b|\bbreasts?\b|\bmuscular\b|\bpetite\b|\byoung\b|\badult\b|\bchild\b|\bteen(?:age|ager)?\b)",
+            "style": r"(画风|风格|二次元|水彩|油画|写实|线稿|素描|赛璐璐|像素|\bstyle\b|\bwatercolor\b|\bphotorealistic\b|\brealistic\b|\bscreencap\b|\bsketch\b|\bcel shading\b|\banime\b|\bmanga\b|\bcartoon\b|\bcomic\b|\bpainting\b|\bdigital art\b|\billustration\b|\bpixel art\b|\b3d\b)",
+        }
+        return {
+            category
+            for category, pattern in patterns.items()
+            if re.search(pattern, raw_request, re.I)
+        }
+
+    @staticmethod
+    def _card_tag_patterns() -> dict[str, re.Pattern[str]]:
+        return {
+            "identity": re.compile(
+                r"\b((?:1|2|multiple)[ _]?(?:girls?|boys?)|girls?|boys?|male|female|man|woman)\b",
+                re.I,
+            ),
+            "hair": re.compile(
+                r"\b(hair|ponytails?|twintails?|braids?|bangs?|ahoge|blonde|brunette)\b",
+                re.I,
+            ),
+            "eyes": re.compile(r"\b(eyes?|iris|heterochromia)\b", re.I),
+            "ears_species": re.compile(
+                r"\b(ears?|elf|kemonomimi|fox|cat|wolf|dog|rabbit|bunny|dragon|demon|angel|human)\b",
+                re.I,
+            ),
+            "clothing": re.compile(
+                r"\b(dress|gown|shirt|skirt|pants|stockings?|bodysuit|outfit|clothes?|clothing|"
+                r"uniform|jacket|coat|shoes?|boots?|gloves?|hat|ribbon|necklace|earrings?|"
+                r"accessor(?:y|ies)|bikini|swimsuit|lingerie|armor|robe|kimono|hoodie|suit)\b",
+                re.I,
+            ),
+            "body_features": re.compile(
+                r"\b(skin|pale|tan|dark-skinned|body shape|breasts?|muscular|petite|young|"
+                r"adult|child|teen(?:age|ager)?)\b",
+                re.I,
+            ),
+            "style": re.compile(
+                r"\b(artist|art style|screencap|watercolor|oil painting|photorealistic|realistic|"
+                r"3d|cel shading|lineart|line art|sketch|anime|manga|cartoon|comic|painting|"
+                r"digital art|illustration|pixel art|style)\b",
+                re.I,
+            ),
+        }
+
+    def _adapt_positive_prompt(
+        self,
+        positive_prompt: str,
+        event: AstrMessageEvent | None,
+        locked: bool,
+    ) -> str:
+        """Apply request-local role-card overrides without mutating the card."""
+        if not locked:
+            return positive_prompt
+        requested_changes = self._requested_change_categories(event)
+        if not requested_changes:
+            return positive_prompt
+        patterns = self._card_tag_patterns()
+        kept: list[str] = []
+        for part in re.split(r"[,\n]+", positive_prompt):
+            tag = part.strip()
+            if not tag:
+                continue
+            if any(
+                category in requested_changes and pattern.search(tag.replace("_", " "))
+                for category, pattern in patterns.items()
+            ):
+                continue
+            kept.append(tag)
+        return ", ".join(kept)
+
+    def _adapt_negative_prompt(
+        self,
+        negative_prompt: str,
+        event: AstrMessageEvent | None,
+    ) -> str:
+        """Let an explicit request override role-card negatives for that category."""
+        requested_changes = self._requested_change_categories(event)
+        if not requested_changes:
+            return negative_prompt
+        patterns = self._card_tag_patterns()
+        kept: list[str] = []
+        for part in re.split(r"[,\n]+", negative_prompt):
+            tag = part.strip()
+            if not tag:
+                continue
+            if any(
+                category in requested_changes and pattern.search(tag.replace("_", " "))
+                for category, pattern in patterns.items()
+            ):
+                continue
+            kept.append(tag)
+        return ", ".join(kept)
 
     def _compose_prompt(self, prompt: str, event: AstrMessageEvent | None = None, preset_id: str | None = None) -> tuple[str, str, str]:
         preset = self._resolve_preset(event, preset_id)
@@ -562,43 +729,53 @@ class NovelAIPainterPlugin(Star):
                 user_prompt = f"high quality, highly detailed, {user_prompt}"
             return user_prompt[:12000], "", ""
 
-        style_prompt = str(preset.get("style_prompt", "") or "").strip()
-        character_prompt = str(preset.get("character_prompt", "") or "").strip()
-        lock_style = self._as_bool(preset.get("lock_style", True), True)
-        lock_character = self._as_bool(preset.get("lock_character", True), True)
-        style_strength = self._preset_strength(preset.get("style_strength", 1.35), 1.35)
-        character_strength = self._preset_strength(preset.get("character_strength", 1.25), 1.25)
+        positive_prompt = str(preset.get("positive_prompt", "") or "").strip()
+        lock_positive = self._as_bool(preset.get("lock_positive", True), True)
+        positive_strength = self._preset_strength(preset.get("positive_strength", 1.35), 1.35)
+        effective_positive = self._adapt_positive_prompt(
+            positive_prompt,
+            event,
+            lock_positive,
+        )
+        requested_changes = self._requested_change_categories(event)
 
         if self._provider_name() == "novelai_official":
             model = self._active_model()
             modern_model = model.startswith("nai-diffusion-4") or model.startswith("nai-diffusion-5")
             parts: list[str] = []
-            if style_prompt:
-                parts.append(self._nai_anchor(style_prompt, style_strength if lock_style else 1.0, modern_model))
-            if character_prompt:
-                parts.append(self._nai_anchor(character_prompt, character_strength if lock_character else 1.0, modern_model))
-            if style_prompt and lock_style:
-                parts.append(self._nai_anchor("consistent art style, same art style, stable visual style", 1.15, modern_model))
-            if character_prompt and lock_character:
-                parts.append(self._nai_anchor("same character, consistent character design, same facial features, same hairstyle, same outfit, same accessories", 1.15, modern_model))
+            if effective_positive:
+                parts.append(self._nai_anchor(effective_positive, positive_strength if lock_positive else 1.0, modern_model))
+            if positive_prompt and lock_positive:
+                consistency = ["same character", "consistent character design"]
+                if "style" not in requested_changes:
+                    consistency.extend(["consistent art style", "stable visual style"])
+                if "eyes" not in requested_changes and "body_features" not in requested_changes:
+                    consistency.append("same facial features")
+                if "hair" not in requested_changes:
+                    consistency.append("same hairstyle")
+                if "ears_species" not in requested_changes:
+                    consistency.append("same species and ear shape")
+                if "clothing" not in requested_changes:
+                    consistency.extend(["same outfit", "same accessories"])
+                parts.append(self._nai_anchor(", ".join(consistency), 1.15, modern_model))
             parts.append(user_prompt)
             composed = ", ".join(part for part in parts if part)
         else:
             instructions: list[str] = []
-            if style_prompt:
-                qualifier = "FIXED; do not reinterpret or replace" if lock_style else "preferred"
-                instructions.append(f"Art style ({qualifier}): {style_prompt}")
-            if character_prompt:
-                qualifier = "FIXED; preserve identity and all unspecified details" if lock_character else "preferred"
-                instructions.append(f"Character design ({qualifier}): {character_prompt}")
+            if effective_positive:
+                qualifier = "FIXED; preserve every unspecified identity and style detail" if lock_positive else "preferred"
+                instructions.append(f"Role-card positive prompt ({qualifier}): {effective_positive}")
             instructions.append(f"Requested change: {user_prompt}")
-            if lock_style or lock_character:
-                instructions.append("Only apply the requested action, pose, expression, camera or scene changes; preserve every unspecified anchored detail")
+            if lock_positive:
+                instructions.append("Apply only changes explicitly requested by the user; preserve every other role-card detail")
             if self._preset_quality_toggle(preset):
                 instructions.append("Output quality: high quality, highly detailed")
             composed = ". ".join(part for part in instructions if part)
 
-        preset_negative = str(preset.get("negative_prompt", "") or "").strip()
+        preset_negative = self._adapt_negative_prompt(
+            str(preset.get("negative_prompt", "") or "").strip(),
+            event,
+        )
         return composed[:12000], str(preset.get("id", "")), preset_negative
 
     def _filter_llm_prompt_conflicts(
@@ -615,65 +792,24 @@ class NovelAIPainterPlugin(Star):
         """
         if not preset:
             return prompt
-        try:
-            raw_request = str(event.get_message_str() or "").lower()
-        except Exception:
-            raw_request = ""
-        requested_character_changes = {
-            category
-            for category, pattern in {
-                "hair": r"(头发|发型|发色|马尾|辫子?|刘海|呆毛|[粉金银白黑红蓝绿紫棕]毛|\bhair\b|\bponytails?\b|\btwintails?\b|\bbraids?\b|\bbangs?\b)",
-                "eyes": r"(眼睛|眼色|瞳色?|异色瞳|\beyes?\b|\biris\b|\bheterochromia\b)",
-                "ears_species": r"(耳朵|精灵耳|兽耳|种族|\bears?\b|\belf\b|\bkemonomimi\b)",
-                "clothing": r"(衣服|服装|换装|穿着|婚纱|礼服|裙|裤|鞋|帽|配饰|饰品|\boutfit\b|\bclothes?\b|\bclothing\b|\bwear\b|\bdress\b|\bgown\b|\bskirt\b|\buniform\b|\baccessor(?:y|ies)\b)",
-            }.items()
-            if re.search(pattern, raw_request, re.I)
-        }
-        style_change = bool(re.search(
-            r"(画风|风格|水彩|油画|写实|线稿|素描|\bart style\b|\bwatercolor\b|\bphotorealistic\b|\bscreencap\b|\bsketch\b)",
-            raw_request,
-        ))
-        lock_character = self._as_bool(preset.get("lock_character", True), True)
-        lock_style = self._as_bool(preset.get("lock_style", True), True)
-        character_tags = {
-            "hair": re.compile(
-                r"\b(hair|ponytails?|twintails?|braids?|bangs?|ahoge|blonde|brunette)\b",
-                re.I,
-            ),
-            "eyes": re.compile(r"\b(eyes?|iris|heterochromia)\b", re.I),
-            "ears_species": re.compile(r"\b(ears?|elf|kemonomimi)\b", re.I),
-            "clothing": re.compile(
-                r"\b(dress|gown|shirt|skirt|pants|stockings?|bodysuit|outfit|clothes?|clothing|"
-                r"uniform|jacket|coat|shoes?|boots?|gloves?|hat|ribbon|necklace|earrings?|"
-                r"accessor(?:y|ies))\b",
-                re.I,
-            ),
-        }
-        style_tag = re.compile(
-            r"\b(artist|art style|screencap|watercolor|oil painting|photorealistic|realistic|3d|"
-            r"cel shading|lineart|sketch)\b",
-            re.I,
-        )
+        requested_changes = self._requested_change_categories(event)
+        lock_positive = self._as_bool(preset.get("lock_positive", True), True)
+        tag_patterns = self._card_tag_patterns()
         kept: list[str] = []
         removed = 0
         for part in re.split(r"[,\n]+", str(prompt or "")):
             tag = part.strip()
             if not tag:
                 continue
-            if lock_character:
-                blocked_character_tag = any(
-                    pattern.search(tag) and category not in requested_character_changes
-                    for category, pattern in character_tags.items()
-                )
-                if blocked_character_tag:
-                    removed += 1
-                    continue
-            if lock_style and not style_change and style_tag.search(tag):
+            if lock_positive and any(
+                pattern.search(tag.replace("_", " ")) and category not in requested_changes
+                for category, pattern in tag_patterns.items()
+            ):
                 removed += 1
                 continue
             kept.append(tag)
         if removed:
-            logger.info(f"[{PLUGIN_NAME}] 已移除 {removed} 个与锁定人物/画风冲突的 LLM 标签")
+            logger.info(f"[{PLUGIN_NAME}] 已移除 {removed} 个与锁定角色卡冲突的 LLM 标签")
         return ", ".join(kept) if kept else "portrait, looking at viewer"
 
     # --------------------------- permissions and dedupe ---------------------------
@@ -823,10 +959,22 @@ class NovelAIPainterPlugin(Star):
             raise ProviderError("response_parse", "服务端返回中没有可用图片")
         return self._save_image(image_bytes, job_id)
 
+    def _merged_negative_prompt(self, negative_override: str = "") -> str:
+        negative_parts = [
+            str(self._cfg("negative_prompt", DEFAULT_NEGATIVE) or "").strip(),
+            str(negative_override or "").strip(),
+        ]
+        return ", ".join(dict.fromkeys(part for part in negative_parts if part))
+
+    def _openai_prompt_with_negative(self, prompt: str, negative_override: str = "") -> str:
+        negative = self._merged_negative_prompt(negative_override)
+        if not negative:
+            return prompt
+        return f"{prompt}. Avoid these negative prompt traits: {negative}"
+
     def _official_parameters(self, prompt: str, operation: str, image_b64: str | None, reference: dict[str, Any] | None, negative_override: str = "", preset: dict[str, Any] | None = None) -> dict[str, Any]:
         model = self._active_model()
-        negative_parts = [str(self._cfg("negative_prompt", DEFAULT_NEGATIVE) or "").strip(), str(negative_override or "").strip()]
-        negative = ", ".join(dict.fromkeys(part for part in negative_parts if part))
+        negative = self._merged_negative_prompt(negative_override)
         params: dict[str, Any] = {
             "params_version": 3,
             "width": max(64, min(2048, int(self._cfg("width", 832) or 832))),
@@ -874,7 +1022,14 @@ class NovelAIPainterPlugin(Star):
         payload = {"input": prompt, "model": self._active_model(), "action": "generate", "parameters": self._official_parameters(prompt, operation, image_b64, reference, negative_override, preset)}
         return await self._post_image_request(url, headers, payload, job_id)
 
-    async def _call_openai(self, prompt: str, operation: str, job_id: str, image_bytes: bytes | None) -> str:
+    async def _call_openai(
+        self,
+        prompt: str,
+        operation: str,
+        job_id: str,
+        image_bytes: bytes | None,
+        negative_override: str = "",
+    ) -> str:
         base_url = str(self._cfg("openai_base_url", "") or "").strip().rstrip("/")
         api_key = str(self._cfg("api_key", "") or "").strip()
         if not base_url or not api_key:
@@ -883,6 +1038,7 @@ class NovelAIPainterPlugin(Star):
         endpoint = str(self._cfg(endpoint_key, "/v1/images/edits" if image_bytes else "/v1/images/generations") or "")
         url = endpoint if endpoint.startswith("http") else f"{base_url}/{endpoint.lstrip('/')}"
         headers = self._openai_headers(api_key)
+        prompt = self._openai_prompt_with_negative(prompt, negative_override)
         timeout = aiohttp.ClientTimeout(total=180)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             try:
@@ -1015,6 +1171,13 @@ class NovelAIPainterPlugin(Star):
             event,
             resolved_preset_id or None,
         )
+        if active_preset_id:
+            logger.info(
+                f"[{PLUGIN_NAME}] job={job_id} 已合并角色卡 {active_preset_id}: "
+                f"正向={len(str((resolved_preset or {}).get('positive_prompt', '') or ''))} 字符, "
+                f"负向={len(preset_negative)} 字符, 最终正向={len(composed_prompt)} 字符"
+            )
+            logger.debug(f"[{PLUGIN_NAME}] job={job_id} 最终正向提示词: {composed_prompt}")
         key = self._event_key(event, composed_prompt, operation)
         now = time.time()
         window = max(1, int(self._cfg("dedupe_window_seconds", 30) or 30))
@@ -1046,7 +1209,7 @@ class NovelAIPainterPlugin(Star):
                 effective_reference_type = "character"
             image_bytes, reference = await self._load_reference(reference_id)
             if operation in {"img2img", "reference"} and not image_bytes:
-                result = GenerationResult(False, job_id, provider, error_code="missing_reference", message="请先在 WebUI 上传参考图并绑定到默认预设。", attempts=0)
+                result = GenerationResult(False, job_id, provider, error_code="missing_reference", message="请先在 WebUI 上传参考图并绑定到当前角色卡。", attempts=0)
                 self._recent_jobs[key] = (time.time(), result)
                 return result
             if reference:
@@ -1081,6 +1244,7 @@ class NovelAIPainterPlugin(Star):
                                 operation,
                                 job_id,
                                 image_bytes if operation == "img2img" else None,
+                                preset_negative,
                             )
                     finally:
                         self.lock.release()
@@ -1190,16 +1354,19 @@ class NovelAIPainterPlugin(Star):
         operation: str = "generate",
         reference_type: str = "",
     ):
-        """仅在用户明确要求生成、绘制或修改图片时调用；每条用户消息最多生成并发送一张图片。插件会强制应用当前 AstrBot 人设映射或默认人物/画风预设，并可自动使用预设绑定的参考图。工具会直接向用户发送最终结果，完成后不要再次调用任何工具。
+        """仅在用户明确要求生成、绘制或修改图片时调用；每条用户消息最多生成并发送一张图片。插件会强制应用当前 AstrBot 人设映射或默认角色卡正向/负向 Tag，并可自动使用角色卡绑定的参考图。图片发送后必须停止调用工具，并用当前人设向用户简短回复。
 
         Args:
-            prompt(string): 必须传入用户本次要求的动作、姿势、表情、构图或场景变化。优先整理为具体的英文 NovelAI / Danbooru 风格标签；不要自行重写、替换或重复人物与画风设定，插件会从已选预设中自动加入并强化这些锚定词。不得省略该参数。
-            operation(string): 生成方式，只能是 generate、img2img 或 reference。普通生图使用 generate；用户明确要求基于绑定图片修改时使用 img2img；NovelAI 精确参考使用 reference。省略时若开启自动参考且当前预设绑定了参考图，插件会自动选择合适方式。
-            reference_type(string): reference 模式的参考类型，只能是 character、style 或 both；省略时继承当前预设保存的参考类型，无预设时使用 character。
+            prompt(string): 必须传入根据用户本次要求整理出的动作、姿势、表情、构图、场景或明确修改项。优先整理为具体的英文 NovelAI / Danbooru Tag；不要重复角色卡的固定主体与画风，插件会在后端拼接角色卡正向 Tag 并加入负面 Tag。不得省略该参数。
+            operation(string): 生成方式，只能是 generate、img2img 或 reference。普通生图使用 generate；用户明确要求基于绑定图片修改时使用 img2img；NovelAI 精确参考使用 reference。省略时若开启自动参考且当前角色卡绑定了参考图，插件会自动选择合适方式。
+            reference_type(string): reference 模式的参考类型，只能是 character、style 或 both；省略时继承当前角色卡保存的参考类型，无角色卡时使用 character。
         """
         if not self._mode_allows("llm_tool"):
             await self._notify(event, "当前未启用自然语言生图入口。", "error")
-            return None
+            return (
+                "FINAL_IMAGE_TOOL_RESULT: Natural-language image generation is disabled. "
+                "Do not call any tool again for this message. Reply to the user briefly."
+            )
 
         normalized_prompt = str(prompt or "").strip()
         if not normalized_prompt:
@@ -1209,7 +1376,10 @@ class NovelAIPainterPlugin(Star):
                 normalized_prompt = ""
         if not normalized_prompt:
             await self._notify(event, "生图工具缺少画面描述，本次任务已停止。", "error")
-            return None
+            return (
+                "FINAL_IMAGE_TOOL_RESULT: Generation stopped because the request had no usable description. "
+                "Do not call any tool again for this message. Explain this briefly to the user."
+            )
 
         active_preset = await self._resolve_active_preset(event)
         normalized_prompt = self._filter_llm_prompt_conflicts(
@@ -1231,11 +1401,19 @@ class NovelAIPainterPlugin(Star):
             preset_id=str(active_preset.get("id", "")) if active_preset else None,
             reference_type=normalized_reference_type,
         )
-        await self._finish_event(event, result)
-        # AstrBot treats None as a direct-result terminal signal. Returning a
-        # status string here keeps the LLM tool loop alive and caused repeated
-        # generation attempts followed by unrelated shell/file tool calls.
-        return None
+        user_visible_result = await self._finish_event(event, result)
+        if result.ok:
+            return (
+                "FINAL_IMAGE_TOOL_RESULT: The image generation task is complete and the image has already "
+                "been sent to the current conversation. Do not call novelai_generate_image or any other "
+                "tool again for this user message. Now reply to the user once, briefly, in your current "
+                f"persona. Internal status: {user_visible_result}"
+            )
+        return (
+            "FINAL_IMAGE_TOOL_RESULT: The image generation task ended with a final error already shown to "
+            "the user. Do not call novelai_generate_image or any other tool again for this user message. "
+            f"Reply once with a brief explanation. Internal status: {user_visible_result}"
+        )
 
     @filter.regex(r"^/[A-Za-z][A-Za-z0-9_-]*(?:@[A-Za-z0-9_-]+)?(?:\s|$)")
     async def cmd_draw(self, event: AstrMessageEvent):
@@ -1272,9 +1450,9 @@ class NovelAIPainterPlugin(Star):
         elif command == "preset":
             if remainder.strip().lower() == "list":
                 names = [str(p.get("name", p.get("id", ""))) for p in self.presets]
-                yield event.plain_result("可用预设：" + ("、".join(names) if names else "暂无预设，请在 WebUI 创建。"))
+                yield event.plain_result("可用角色卡：" + ("、".join(names) if names else "暂无角色卡，请在 WebUI 创建。"))
             else:
-                yield event.plain_result("预设管理请使用 AstrBot WebUI 页面。")
+                yield event.plain_result("角色卡管理请使用 AstrBot WebUI 页面。")
             return
         elif not self._as_bool(self._cfg("legacy_command_enabled", True)):
             yield event.plain_result("请使用 /nai draw、/nai img2img 或 /nai reference 命令。")
@@ -1417,7 +1595,7 @@ class NovelAIPainterPlugin(Star):
         if "default_preset_id" in fields:
             default_id = str(fields["default_preset_id"] or "").strip()
             if default_id and not self._get_preset(default_id, include_disabled=True):
-                return self._page_error("默认预设不存在")
+                return self._page_error("默认角色卡不存在")
             fields["default_preset_id"] = default_id
         allowed_enums = {
             "provider": {"novelai_official", "openai_compatible"},
@@ -1432,7 +1610,7 @@ class NovelAIPainterPlugin(Star):
                 return self._page_error(f"{key} 的值不受支持")
         previous_config = dict(self.config)
         self.config.update(fields)
-        self.config["config_version"] = 4
+        self.config["config_version"] = 5
         try:
             self._save_config()
         except Exception as exc:
@@ -1478,51 +1656,51 @@ class NovelAIPainterPlugin(Star):
     async def page_create_preset(self):
         payload = await request.json(default={})
         if not isinstance(payload, dict):
-            return self._page_error("预设格式错误")
+            return self._page_error("角色卡格式错误")
         try:
             preset = self._create_preset_record(payload)
         except ValueError as exc:
             return self._page_error(str(exc))
         except Exception as exc:
-            logger.exception(f"[{PLUGIN_NAME}] 创建预设失败: {exc}")
-            return self._page_error("创建预设失败，请检查插件数据目录权限和 AstrBot 日志")
-        return json_response({"saved": True, "message": "预设已创建并同步人设映射", "preset": preset, "config": self._public_config()})
+            logger.exception(f"[{PLUGIN_NAME}] 创建角色卡失败: {exc}")
+            return self._page_error("创建角色卡失败，请检查插件数据目录权限和 AstrBot 日志")
+        return json_response({"saved": True, "message": "角色卡已创建并同步人设映射", "preset": preset, "config": self._public_config()})
 
 
     async def page_manage_preset(self):
         payload = await request.json(default={})
         if not isinstance(payload, dict):
-            return self._page_error("预设格式错误")
+            return self._page_error("角色卡格式错误")
         action = str(payload.get("action", "")).lower()
         preset_id = str(payload.get("id", ""))
         if action not in {"create", "update", "delete"}:
-            return self._page_error("不支持的预设操作")
+            return self._page_error("不支持的角色卡操作")
         if action == "delete":
             try:
                 deleted = self._delete_preset_record(preset_id)
             except Exception as exc:
-                logger.exception(f"[{PLUGIN_NAME}] 删除预设失败: {exc}")
-                return self._page_error("删除预设失败，请检查插件数据目录权限和 AstrBot 日志")
+                logger.exception(f"[{PLUGIN_NAME}] 删除角色卡失败: {exc}")
+                return self._page_error("删除角色卡失败，请检查插件数据目录权限和 AstrBot 日志")
             if not deleted:
-                return self._page_error("预设不存在", status_code=404)
+                return self._page_error("角色卡不存在", status_code=404)
             return json_response({
                 "saved": True,
-                "message": "预设已删除，相关默认项和人设映射已清理",
+                "message": "角色卡已删除，相关默认项和人设映射已清理",
                 "presets": self.presets,
                 "config": self._public_config(),
             })
         if action == "update":
             preset = self._get_preset(preset_id, include_disabled=True)
             if not preset:
-                return self._page_error("预设不存在", status_code=404)
+                return self._page_error("角色卡不存在", status_code=404)
             try:
                 self._update_preset_record(preset, payload)
             except ValueError as exc:
                 return self._page_error(str(exc))
             except Exception as exc:
-                logger.exception(f"[{PLUGIN_NAME}] 更新预设失败: {exc}")
-                return self._page_error("更新预设失败，请检查插件数据目录权限和 AstrBot 日志")
-            return json_response({"saved": True, "message": "预设已更新并同步人设映射", "preset": preset, "config": self._public_config()})
+                logger.exception(f"[{PLUGIN_NAME}] 更新角色卡失败: {exc}")
+                return self._page_error("更新角色卡失败，请检查插件数据目录权限和 AstrBot 日志")
+            return json_response({"saved": True, "message": "角色卡已更新并同步人设映射", "preset": preset, "config": self._public_config()})
         return self._create_preset_response(payload)
 
     def _create_preset_response(self, payload: dict[str, Any]):
@@ -1531,37 +1709,37 @@ class NovelAIPainterPlugin(Star):
         except ValueError as exc:
             return self._page_error(str(exc))
         except Exception as exc:
-            logger.exception(f"[{PLUGIN_NAME}] 创建预设失败: {exc}")
-            return self._page_error("创建预设失败，请检查插件数据目录权限和 AstrBot 日志")
-        return json_response({"saved": True, "message": "预设已创建并同步人设映射", "preset": preset, "config": self._public_config()})
+            logger.exception(f"[{PLUGIN_NAME}] 创建角色卡失败: {exc}")
+            return self._page_error("创建角色卡失败，请检查插件数据目录权限和 AstrBot 日志")
+        return json_response({"saved": True, "message": "角色卡已创建并同步人设映射", "preset": preset, "config": self._public_config()})
 
     async def page_update_preset(self, preset_id: str):
         preset = self._get_preset(preset_id, include_disabled=True)
         if not preset:
-            return self._page_error("预设不存在", status_code=404)
+            return self._page_error("角色卡不存在", status_code=404)
         payload = await request.json(default={})
         if not isinstance(payload, dict):
-            return self._page_error("预设格式错误")
+            return self._page_error("角色卡格式错误")
         try:
             self._update_preset_record(preset, payload)
         except ValueError as exc:
             return self._page_error(str(exc))
         except Exception as exc:
-            logger.exception(f"[{PLUGIN_NAME}] 更新预设失败: {exc}")
-            return self._page_error("更新预设失败，请检查插件数据目录权限和 AstrBot 日志")
-        return json_response({"saved": True, "message": "预设已更新并同步人设映射", "preset": preset, "config": self._public_config()})
+            logger.exception(f"[{PLUGIN_NAME}] 更新角色卡失败: {exc}")
+            return self._page_error("更新角色卡失败，请检查插件数据目录权限和 AstrBot 日志")
+        return json_response({"saved": True, "message": "角色卡已更新并同步人设映射", "preset": preset, "config": self._public_config()})
 
     async def page_delete_preset(self, preset_id: str):
         try:
             deleted = self._delete_preset_record(preset_id)
         except Exception as exc:
-            logger.exception(f"[{PLUGIN_NAME}] 删除预设失败: {exc}")
-            return self._page_error("删除预设失败，请检查插件数据目录权限和 AstrBot 日志")
+            logger.exception(f"[{PLUGIN_NAME}] 删除角色卡失败: {exc}")
+            return self._page_error("删除角色卡失败，请检查插件数据目录权限和 AstrBot 日志")
         if not deleted:
-            return self._page_error("预设不存在", status_code=404)
+            return self._page_error("角色卡不存在", status_code=404)
         return json_response({
             "saved": True,
-            "message": "预设已删除，相关默认项和人设映射已清理",
+            "message": "角色卡已删除，相关默认项和人设映射已清理",
             "presets": self.presets,
             "config": self._public_config(),
         })
@@ -1627,7 +1805,7 @@ class NovelAIPainterPlugin(Star):
         except Exception as exc:
             logger.exception(f"[{PLUGIN_NAME}] 删除参考图失败: {exc}")
             return self._page_error("删除参考图失败，请检查插件数据目录权限和 AstrBot 日志")
-        return json_response({"saved": True, "message": "参考图已删除，相关预设引用已清理"})
+        return json_response({"saved": True, "message": "参考图已删除，相关角色卡引用已清理"})
 
     async def page_jobs(self):
         return json_response({"jobs": self._jobs[-50:]})
