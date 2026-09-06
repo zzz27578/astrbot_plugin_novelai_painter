@@ -156,6 +156,25 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(event.get_extra("sticker_visual_hint"), "side-eye")
         asyncio.run(run())
 
+    def test_sticker_emotion_tool_is_hidden_when_sticker_mode_is_off(self):
+        p = self.make_plugin()
+        tool = SimpleNamespace(active=True)
+        manager = SimpleNamespace(get_func=lambda name: tool if name == "novelai_set_emotion" else None)
+        p.context = SimpleNamespace(get_llm_tool_manager=lambda: manager)
+
+        p.config["sticker_enabled"] = False
+        p._sync_sticker_emotion_tool()
+        self.assertFalse(tool.active)
+
+        p.config["sticker_enabled"] = True
+        p.config["sticker_emotion_tool"] = True
+        p._sync_sticker_emotion_tool()
+        self.assertTrue(tool.active)
+
+        p.config["sticker_emotion_tool"] = False
+        p._sync_sticker_emotion_tool()
+        self.assertFalse(tool.active)
+
     def test_sticker_final_reply_is_captured_from_llm_response(self):
         async def run():
             p = self.make_plugin()

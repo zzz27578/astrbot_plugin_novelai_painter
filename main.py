@@ -37,7 +37,8 @@ from astrbot.core.message.components import Image
 from astrbot.core.message.message_event_result import MessageChain
 
 PLUGIN_NAME = "astrbot_plugin_novelai_painter"
-VERSION = "2.4.0"
+VERSION = "2.4.1"
+STICKER_EMOTION_TOOL_NAME = "novelai_set_emotion"
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 MAX_RESPONSE_BYTES = 48 * 1024 * 1024
 DEFAULT_MODEL = "nai-diffusion-5-full"
@@ -154,6 +155,7 @@ class NovelAIPainterPlugin(Star):
         self._preset_schema_migrated = False
         self.presets = self._load_presets()
         self._ensure_defaults()
+        self._sync_sticker_emotion_tool()
         if self._preset_schema_migrated:
             try:
                 self._save_presets()
@@ -1645,6 +1647,22 @@ class NovelAIPainterPlugin(Star):
         return "模型命令用法：model current、model list、model use <模型 ID 或别名>。"
 
     # --------------------------- sticker mode ---------------------------
+    def _sync_sticker_emotion_tool(self) -> None:
+        """Expose the emotion tool only while sticker metadata is configured on."""
+        active = self._as_bool(self._cfg("sticker_enabled", False)) and self._as_bool(
+            self._cfg("sticker_emotion_tool", True), True
+        )
+        try:
+            manager = self.context.get_llm_tool_manager()
+            tool = manager.get_func(STICKER_EMOTION_TOOL_NAME)
+            if tool is not None:
+                # Change the runtime flag directly. Calling deactivate_llm_tool()
+                # would persist a dashboard-wide manual deactivation and make a
+                # later WebUI switch-on unexpectedly fail to restore the tool.
+                tool.active = active
+        except Exception as exc:
+            logger.debug(f"[{PLUGIN_NAME}] 同步情绪工具状态失败: {exc}")
+
     def _sticker_card(self) -> dict[str, Any]:
         raw = self._cfg("sticker_role_card", {})
         card = dict(raw) if isinstance(raw, dict) else {}
@@ -1714,7 +1732,7 @@ class NovelAIPainterPlugin(Star):
                 "visual hint. This is internal metadata and must not be shown in your reply."
             )
 
-    @filter.llm_tool(name="novelai_set_emotion")
+    @filter.llm_tool(name=STICKER_EMOTION_TOOL_NAME)
     async def novelai_set_emotion(
         self,
         event: AstrMessageEvent,
@@ -2226,6 +2244,7 @@ class NovelAIPainterPlugin(Star):
             self.config.update(previous_config)
             logger.exception(f"[{PLUGIN_NAME}] WebUI 保存配置失败: {exc}")
             return self._page_error("配置写入失败，已撤销本次修改，请检查 AstrBot 日志")
+        self._sync_sticker_emotion_tool()
         return json_response({"saved": True, "message": "配置已保存", "config": self._public_config()})
 
     async def page_test_provider(self):
