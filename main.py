@@ -7,6 +7,7 @@ import io
 import json
 import mimetypes
 import os
+import random
 import re
 import time
 import uuid
@@ -31,10 +32,12 @@ except ImportError:
     def error_response(message, status_code=400):
         return {"error": message, "status_code": status_code}
 
+from astrbot.api.provider import LLMResponse, ProviderRequest
+from astrbot.core.message.components import Image
 from astrbot.core.message.message_event_result import MessageChain
 
 PLUGIN_NAME = "astrbot_plugin_novelai_painter"
-VERSION = "2.3.1"
+VERSION = "2.4.0"
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 MAX_RESPONSE_BYTES = 48 * 1024 * 1024
 DEFAULT_MODEL = "nai-diffusion-5-full"
@@ -67,6 +70,26 @@ DEFAULT_NEGATIVE = (
     "extra digit, fewer digits, cropped, worst quality, low quality, jpeg artifacts, "
     "signature, username"
 )
+STICKER_DEFAULTS = {
+    "sticker_enabled": False,
+    "sticker_probability": 20,
+    "sticker_send_mode": "after_reply",
+    "sticker_cooldown_seconds": 60,
+    "sticker_context_messages": 8,
+    "sticker_llm_provider_id": "",
+    "sticker_llm_timeout": 45,
+    "sticker_width": 512,
+    "sticker_height": 512,
+    "sticker_auto_reference": True,
+    "sticker_emotion_tool": True,
+    "sticker_prompt": "chibi, reaction sticker, expressive face, upper body, simple background, white background, no text",
+    "sticker_decision_prompt": "根据对话语境和回复情绪选择合适的表情，也可使用嘲笑、无奈、得意、委屈、震惊、吐槽等特殊表情。严肃或不适合插入表情包的场合不发送。",
+    "sticker_role_card": {
+        "name": "表情包角色卡", "positive_prompt": "", "negative_prompt": "",
+        "lock_positive": True, "positive_strength": 1.35, "quality_override": "off",
+        "reference_id": "", "reference_type": "character",
+    },
+}
 CONFIG_KEYS = {
     "config_version", "provider", "api_token", "api_key", "base_url", "openai_base_url",
     "openai_image_endpoint", "openai_edit_endpoint", "openai_auth_header", "openai_auth_prefix",
@@ -78,7 +101,7 @@ CONFIG_KEYS = {
     "default_preset_id", "persona_preset_map", "llm_auto_reference", "img2img_enabled",
     "reference_enabled", "img2img_strength", "img2img_noise", "img2img_color_correct",
     "reference_strength", "reference_fidelity", "reference_information_extracted",
-}
+} | STICKER_DEFAULTS.keys()
 
 
 @dataclass
@@ -142,7 +165,7 @@ class NovelAIPainterPlugin(Star):
     # --------------------------- configuration ---------------------------
     def _ensure_defaults(self) -> None:
         defaults = {
-            "config_version": 5,
+            "config_version": 6,
             "provider": "novelai_official",
             "api_token": "",
             "api_key": "",
@@ -191,11 +214,12 @@ class NovelAIPainterPlugin(Star):
             "reference_strength": 0.6,
             "reference_fidelity": 0.6,
             "reference_information_extracted": 1.0,
+            **STICKER_DEFAULTS,
         }
         changed = False
         for key, value in defaults.items():
             if key not in self.config:
-                self.config[key] = value
+                self.config[key] = dict(value) if isinstance(value, dict) else value
                 changed = True
         try:
             config_version = int(self.config.get("config_version", 0) or 0)
@@ -205,6 +229,9 @@ class NovelAIPainterPlugin(Star):
             self.config["config_version"] = 5
             self.config["images_per_request"] = 1
             self.config["max_api_requests_per_job"] = 3
+            changed = True
+        if config_version < 6:
+            self.config["config_version"] = 6
             changed = True
         if changed:
             saver = getattr(self.config, "save_config", None)
@@ -760,8 +787,8 @@ class NovelAIPainterPlugin(Star):
             kept.append(tag)
         return ", ".join(kept)
 
-    def _compose_prompt(self, prompt: str, event: AstrMessageEvent | None = None, preset_id: str | None = None) -> tuple[str, str, str]:
-        preset = self._resolve_preset(event, preset_id)
+    def _compose_prompt(self, prompt: str, event: AstrMessageEvent | None = None, preset_id: str | None = None, *, preset_override: dict[str, Any] | None = None) -> tuple[str, str, str]:
+        preset = preset_override if preset_override is not None else self._resolve_preset(event, preset_id)
         user_prompt = str(prompt or "").strip()
         if not preset:
             if self._provider_name() == "openai_compatible" and self._as_bool(self._cfg("quality_toggle", True)):
@@ -1040,7 +1067,7 @@ class NovelAIPainterPlugin(Star):
             return prompt
         return f"{prompt}. Avoid these negative prompt traits: {negative}"
 
-    def _official_parameters(self, prompt: str, operation: str, image_b64: str | None, reference: dict[str, Any] | None, negative_override: str = "", preset: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _official_parameters(self, prompt: str, operation: str, image_b64: str | None, reference: dict[str, Any] | None, negative_override: str = "", preset: dict[str, Any] | None = None, *, size: tuple[int, int] | None = None) -> dict[str, Any]:
         model = self._active_model()
         negative = self._merged_negative_prompt(negative_override)
         params: dict[str, Any] = {
@@ -1055,6 +1082,8 @@ class NovelAIPainterPlugin(Star):
             "qualityToggle": self._preset_quality_toggle(preset),
             "negative_prompt": negative,
         }
+        if size is not None:
+            params["width"], params["height"] = size
         if image_b64:
             params.update({
                 "image": image_b64,
@@ -1080,14 +1109,14 @@ class NovelAIPainterPlugin(Star):
             })
         return params
 
-    async def _call_official(self, prompt: str, operation: str, job_id: str, image_b64: str | None, reference: dict[str, Any] | None, negative_override: str = "", preset: dict[str, Any] | None = None) -> str:
+    async def _call_official(self, prompt: str, operation: str, job_id: str, image_b64: str | None, reference: dict[str, Any] | None, negative_override: str = "", preset: dict[str, Any] | None = None, *, size: tuple[int, int] | None = None) -> str:
         base_url = str(self._cfg("base_url", "https://image.novelai.net") or "https://image.novelai.net").strip().rstrip("/")
         url = base_url if base_url.endswith("/ai/generate-image") else f"{base_url}/ai/generate-image"
         token = str(self._cfg("api_token", "") or "").strip()
         if not token:
             raise ProviderError("not_configured", "NovelAI 官方 Token 尚未配置")
         headers = {"Authorization": token if token.lower().startswith("bearer ") else f"Bearer {token}", "Content-Type": "application/json", "Accept": "application/zip, application/json"}
-        payload = {"input": prompt, "model": self._active_model(), "action": "generate", "parameters": self._official_parameters(prompt, operation, image_b64, reference, negative_override, preset)}
+        payload = {"input": prompt, "model": self._active_model(), "action": "generate", "parameters": self._official_parameters(prompt, operation, image_b64, reference, negative_override, preset, size=size)}
         return await self._post_image_request(url, headers, payload, job_id)
 
     async def _call_openai(
@@ -1097,6 +1126,8 @@ class NovelAIPainterPlugin(Star):
         job_id: str,
         image_bytes: bytes | None,
         negative_override: str = "",
+        *,
+        size: tuple[int, int] | None = None,
     ) -> str:
         base_url = str(self._cfg("openai_base_url", "") or "").strip().rstrip("/")
         api_key = str(self._cfg("api_key", "") or "").strip()
@@ -1107,6 +1138,7 @@ class NovelAIPainterPlugin(Star):
         url = endpoint if endpoint.startswith("http") else f"{base_url}/{endpoint.lstrip('/')}"
         headers = self._openai_headers(api_key)
         prompt = self._openai_prompt_with_negative(prompt, negative_override)
+        width, height = size or (int(self._cfg("width", 832)), int(self._cfg("height", 1216)))
         timeout = aiohttp.ClientTimeout(total=180)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             try:
@@ -1115,14 +1147,14 @@ class NovelAIPainterPlugin(Star):
                     form.add_field("model", self._active_model())
                     form.add_field("prompt", prompt)
                     form.add_field("n", "1")
-                    form.add_field("size", f"{int(self._cfg('width', 832))}x{int(self._cfg('height', 1216))}")
+                    form.add_field("size", f"{width}x{height}")
                     form.add_field("image", image_bytes, filename="input.png", content_type="image/png")
                     async with session.post(url, headers=headers, data=form) as response:
                         body = await self._read_limited_response(response)
                         if response.status >= 400:
                             raise self._http_error(response.status, body, response.headers)
                         return await self._parse_image_response(response, body, job_id)
-                payload = {"model": self._active_model(), "prompt": prompt, "n": 1, "size": f"{int(self._cfg('width', 832))}x{int(self._cfg('height', 1216))}", "response_format": "b64_json"}
+                payload = {"model": self._active_model(), "prompt": prompt, "n": 1, "size": f"{width}x{height}", "response_format": "b64_json"}
                 async with session.post(url, headers={**headers, "Content-Type": "application/json"}, json=payload) as response:
                     body = await self._read_limited_response(response)
                     if response.status >= 400:
@@ -1201,6 +1233,12 @@ class NovelAIPainterPlugin(Star):
         preset_id: str | None = None,
         reference_id: str | None = None,
         reference_type: str | None = None,
+        *,
+        preset_override: dict[str, Any] | None = None,
+        size: tuple[int, int] | None = None,
+        quiet: bool = False,
+        job_kind: str = "image",
+        emotion: str = "",
     ) -> GenerationResult:
         allowed, reason = self._can_use(event)
         job_id = uuid.uuid4().hex[:12]
@@ -1232,12 +1270,13 @@ class NovelAIPainterPlugin(Star):
             if provider != "novelai_official":
                 return GenerationResult(False, job_id, provider, error_code="unsupported", message="当前兼容后端不支持 NovelAI Precise Reference。")
         self._cleanup_expired()
-        resolved_preset = await self._resolve_active_preset(event, preset_id)
+        resolved_preset = preset_override if preset_override is not None else await self._resolve_active_preset(event, preset_id)
         resolved_preset_id = str(resolved_preset.get("id", "")) if resolved_preset else ""
         composed_prompt, active_preset_id, preset_negative = self._compose_prompt(
             prompt,
-            event,
+            None if preset_override is not None else event,
             resolved_preset_id or None,
+            preset_override=preset_override,
         )
         if active_preset_id:
             logger.info(
@@ -1267,7 +1306,7 @@ class NovelAIPainterPlugin(Star):
             )
         inflight_jobs[key] = job_id
         try:
-            selected_preset = self._get_preset(active_preset_id)
+            selected_preset = resolved_preset
             if not reference_id and selected_preset and operation in {"img2img", "reference"}:
                 reference_id = str(selected_preset.get("reference_id", "")) or None
             effective_reference_type = reference_type
@@ -1287,7 +1326,7 @@ class NovelAIPainterPlugin(Star):
             while True:
                 try:
                     timeout = max(1, int(self._cfg("queue_timeout", 120) or 120))
-                    if self.lock.locked() and self._as_bool(self._cfg("show_queue_notice", True)):
+                    if not quiet and self.lock.locked() and self._as_bool(self._cfg("show_queue_notice", True)):
                         await self._notify(event, "当前生图通道繁忙，任务已排队。", "queue")
                     await asyncio.wait_for(self.lock.acquire(), timeout=timeout)
                 except asyncio.TimeoutError:
@@ -1305,6 +1344,7 @@ class NovelAIPainterPlugin(Star):
                                 reference if operation == "reference" else None,
                                 preset_negative,
                                 selected_preset,
+                                **({"size": size} if size is not None else {}),
                             )
                         else:
                             path = await self._call_openai(
@@ -1313,6 +1353,7 @@ class NovelAIPainterPlugin(Star):
                                 job_id,
                                 image_bytes if operation == "img2img" else None,
                                 preset_negative,
+                                **({"size": size} if size is not None else {}),
                             )
                     finally:
                         self.lock.release()
@@ -1325,7 +1366,7 @@ class NovelAIPainterPlugin(Star):
                         break
                     configured_delay = max(1.0, min(300.0, float(self._cfg("retry_delay", 5.0) or 5.0)))
                     delay = max(configured_delay, float(exc.retry_after or 0))
-                    if self._as_bool(self._cfg("show_retry_notice", False)):
+                    if not quiet and self._as_bool(self._cfg("show_retry_notice", False)):
                         await self._notify(event, f"图片服务限流，{delay:g} 秒后进行第 {attempts + 1} 次尝试。", "retry")
                     # Do not monopolize the global provider slot while waiting
                     # for a Retry-After window.
@@ -1333,7 +1374,7 @@ class NovelAIPainterPlugin(Star):
             self._recent_jobs[key] = (time.time(), result)
             job_record = asdict(result)
             job_record["has_image"] = bool(job_record.pop("path", None))
-            self._jobs.append({**job_record, "operation": operation, "preset_id": active_preset_id, "created_at": int(time.time())})
+            self._jobs.append({**job_record, "operation": operation, "preset_id": active_preset_id, "kind": job_kind, "emotion": emotion, "created_at": int(time.time())})
             self._jobs = self._jobs[-50:]
             return result
         finally:
@@ -1369,16 +1410,7 @@ class NovelAIPainterPlugin(Star):
             return "图片已生成；重复发送已被拦截。"
         delivered_jobs[result.job_id] = time.time()
         try:
-            await event.send(MessageChain().file_image(result.path))
-            delay = max(0, int(self._cfg("auto_clean_delay", 300) or 300))
-            async def cleanup(path: str, seconds: int):
-                if seconds > 0:
-                    await asyncio.sleep(seconds)
-                try:
-                    Path(path).unlink(missing_ok=True)
-                except Exception:
-                    pass
-            asyncio.create_task(cleanup(result.path, delay))
+            await self._send_generated_image(event, result)
             return result.message
         except Exception as exc:
             logger.warning(f"[{PLUGIN_NAME}] 发送图片失败 job={result.job_id}: {exc}")
@@ -1388,6 +1420,34 @@ class NovelAIPainterPlugin(Star):
                 pass
             await self._notify(event, "图片已生成，但发送到当前会话失败。", "error")
             return "图片已生成，但发送失败。"
+
+    async def _send_generated_image(
+        self,
+        event: AstrMessageEvent,
+        result: GenerationResult,
+        chain: MessageChain | None = None,
+    ) -> bool:
+        """Send an already generated file, optionally alongside the final text."""
+        if not result.path:
+            return False
+        image_chain = MessageChain().file_image(result.path)
+        if chain is not None:
+            outgoing = MessageChain([*chain.chain, *image_chain.chain])
+        else:
+            outgoing = image_chain
+        await event.send(outgoing)
+        delay = max(0, int(self._cfg("auto_clean_delay", 300) or 300))
+
+        async def cleanup(path: str, seconds: int):
+            if seconds > 0:
+                await asyncio.sleep(seconds)
+            try:
+                Path(path).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        asyncio.create_task(cleanup(result.path, delay))
+        return True
 
     def _resolve_llm_operation(
         self,
@@ -1583,6 +1643,242 @@ class NovelAIPainterPlugin(Star):
                 return "NAI 模型切换失败，配置已回滚，请检查 AstrBot 日志。"
             return f"已切换 NAI 模型：{NAI_MODELS[model_id]}（{model_id}）。"
         return "模型命令用法：model current、model list、model use <模型 ID 或别名>。"
+
+    # --------------------------- sticker mode ---------------------------
+    def _sticker_card(self) -> dict[str, Any]:
+        raw = self._cfg("sticker_role_card", {})
+        card = dict(raw) if isinstance(raw, dict) else {}
+        return {
+            "id": "sticker-role-card",
+            "name": str(card.get("name", "表情包角色卡") or "表情包角色卡").strip()[:80],
+            "positive_prompt": str(card.get("positive_prompt", "") or "").strip()[:8000],
+            "negative_prompt": str(card.get("negative_prompt", "") or "").strip()[:4000],
+            "lock_positive": self._as_bool(card.get("lock_positive", True), True),
+            "positive_strength": self._preset_strength(card.get("positive_strength", 1.35), 1.35),
+            "quality_override": str(card.get("quality_override", "off")) if card.get("quality_override") in {"inherit", "on", "off"} else "off",
+            "reference_id": str(card.get("reference_id", "") or "").strip(),
+            "reference_type": str(card.get("reference_type", "character") or "character").strip(),
+        }
+
+    def _sticker_context_text(self, req: ProviderRequest) -> str:
+        contexts = req.contexts if isinstance(getattr(req, "contexts", None), list) else []
+        limit = max(1, min(20, int(self._cfg("sticker_context_messages", 8) or 8)))
+        lines: list[str] = []
+        for item in contexts[-limit:]:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role", "user"))
+            content = item.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(
+                    str(part.get("text", "")) if isinstance(part, dict) else str(part)
+                    for part in content
+                )
+            content = str(content or "").strip()
+            if content:
+                lines.append(f"{role}: {content[:1200]}")
+        if req.prompt:
+            lines.append(f"current request: {str(req.prompt)[:1200]}")
+        return "\n".join(lines)[-12000:]
+
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=5)
+    async def sticker_prepare_event(self, event: AstrMessageEvent) -> None:
+        """Reserve a non-streaming turn when same-bubble sticker mode is active."""
+        if not self._as_bool(self._cfg("sticker_enabled", False)):
+            return
+        if str(self._cfg("sticker_send_mode", "after_reply")) != "same_bubble":
+            return
+        try:
+            if str(event.get_message_str() or "").lstrip().startswith("/"):
+                return
+        except Exception:
+            pass
+        # The final response is decorated after it has been assembled. Streaming
+        # has already left the adapter by then, so reserve a normal result.
+        event.set_extra("enable_streaming", False)
+
+    @filter.on_llm_request()
+    async def sticker_capture_context(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
+        if not self._as_bool(self._cfg("sticker_enabled", False)):
+            return
+        try:
+            if str(event.get_message_str() or "").lstrip().startswith("/"):
+                return
+        except Exception:
+            pass
+        event.set_extra("sticker_context", self._sticker_context_text(req))
+        if self._as_bool(self._cfg("sticker_emotion_tool", True), True):
+            req.system_prompt = (req.system_prompt or "") + (
+                "\nWhen the user exchange has a clear emotional reaction, you may call "
+                "novelai_set_emotion once with a short Chinese emotion label and an optional "
+                "visual hint. This is internal metadata and must not be shown in your reply."
+            )
+
+    @filter.llm_tool(name="novelai_set_emotion")
+    async def novelai_set_emotion(
+        self,
+        event: AstrMessageEvent,
+        emotion: str = "",
+        visual_hint: str = "",
+    ) -> str:
+        """给表情包模式提供本次回复的情绪标签；只在情绪明确时调用。
+
+        Args:
+            emotion(string): 简短情绪标签，例如 开心、无奈、嘲笑、震惊、委屈、得意。
+            visual_hint(string): 可选的表情、动作或构图提示，不要重复角色卡。
+        """
+        if not self._as_bool(self._cfg("sticker_enabled", False)):
+            return "sticker metadata disabled"
+        label = str(emotion or "").strip()[:40]
+        hint = str(visual_hint or "").strip()[:400]
+        if label:
+            event.set_extra("sticker_emotion", label)
+        if hint:
+            event.set_extra("sticker_visual_hint", hint)
+        return "Emotion metadata recorded for the optional sticker decision. Continue the conversation normally."
+
+    @staticmethod
+    def _sticker_json(text: str) -> dict[str, Any] | None:
+        cleaned = re.sub(r"```(?:json)?", "", str(text or ""), flags=re.I).replace("```", "").strip()
+        match = re.search(r"\{.*\}", cleaned, flags=re.S)
+        if not match:
+            return None
+        try:
+            value = json.loads(match.group(0))
+        except (TypeError, ValueError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    async def _decide_sticker(self, event: AstrMessageEvent, reply_text: str) -> dict[str, Any] | None:
+        provider_id = str(self._cfg("sticker_llm_provider_id", "") or "").strip()
+        try:
+            if not provider_id:
+                provider_id = await self.context.get_current_chat_provider_id(event.unified_msg_origin)
+            card = self._sticker_card()
+            prompt = (
+                "你是表情包编排器。只返回 JSON，不要 Markdown，不要解释。\n"
+                "字段：send(boolean)、emotion(string)、prompt(string)、reason(string)。\n"
+                "send=false 表示这次回复不适合插入表情包。prompt 必须是适合文生图的英文视觉描述，"
+                "只描述情绪表情、动作、构图和场景，不要改写角色卡。\n"
+                f"决策偏好：{self._cfg('sticker_decision_prompt', '')}\n"
+                f"表情包角色卡：{card.get('positive_prompt', '')}\n"
+                f"用户和会话上下文：{event.get_extra('sticker_context', '')}\n"
+                f"本次回复：{reply_text[:5000]}\n"
+                f"LLM 提供的情绪标签：{event.get_extra('sticker_emotion', '')}\n"
+                f"LLM 提供的视觉提示：{event.get_extra('sticker_visual_hint', '')}\n"
+                '示例格式：{"send":true,"emotion":"无奈","prompt":"deadpan face, shrugging, speechless reaction","reason":"语气适合吐槽"}'
+            )
+            response = await asyncio.wait_for(
+                self.context.llm_generate(
+                    chat_provider_id=provider_id,
+                    prompt=prompt,
+                    system_prompt="你只负责判断是否需要表情包并生成简短视觉描述。严格输出 JSON。",
+                ),
+                timeout=max(5, min(180, int(self._cfg("sticker_llm_timeout", 45) or 45))),
+            )
+            decision = self._sticker_json(getattr(response, "completion_text", ""))
+            if not decision or not self._as_bool(decision.get("send", False)):
+                return None
+            decision["emotion"] = str(decision.get("emotion", "") or "").strip()[:60]
+            decision["prompt"] = str(decision.get("prompt", "") or "").strip()[:1600]
+            if not decision["prompt"]:
+                return None
+            return decision
+        except Exception as exc:
+            logger.debug(f"[{PLUGIN_NAME}] 表情包判断跳过: {exc}")
+            return None
+
+    async def _try_sticker(self, event: AstrMessageEvent, *, same_bubble: bool) -> None:
+        if not self._as_bool(self._cfg("sticker_enabled", False)):
+            return
+        if event.get_extra("sticker_consumed", False) or event.get_extra("sticker_busy", False):
+            return
+        reply_text = str(event.get_extra("sticker_final_text", "") or "").strip()
+        if not reply_text:
+            return
+        try:
+            if any(isinstance(comp, Image) for comp in (event.get_result().chain if event.get_result() else [])):
+                event.set_extra("sticker_consumed", True)
+                return
+        except Exception:
+            pass
+        event.set_extra("sticker_consumed", True)
+        probability = max(0.0, min(100.0, float(self._cfg("sticker_probability", 20) or 0)))
+        if random.random() * 100 >= probability:
+            return
+        origin = str(getattr(event, "unified_msg_origin", "") or "")
+        now = time.time()
+        last = getattr(self, "_sticker_last_by_origin", {}).get(origin, 0.0)
+        cooldown = max(0, int(self._cfg("sticker_cooldown_seconds", 60) or 60))
+        if cooldown and now - last < cooldown:
+            return
+        if not hasattr(self, "_sticker_last_by_origin"):
+            self._sticker_last_by_origin = {}
+        self._sticker_last_by_origin[origin] = now
+        event.set_extra("sticker_busy", True)
+        try:
+            decision = await self._decide_sticker(event, reply_text)
+            if not decision:
+                return
+            emotion = decision.get("emotion") or str(event.get_extra("sticker_emotion", "") or "")
+            visual = decision["prompt"]
+            if emotion:
+                visual = f"{emotion} emotion, {visual}"
+            base_prompt = str(self._cfg("sticker_prompt", "") or "").strip()
+            visual = ", ".join(part for part in (base_prompt, visual) if part)
+            card = self._sticker_card()
+            operation = "generate"
+            if self._as_bool(self._cfg("sticker_auto_reference", True), True) and card.get("reference_id"):
+                operation = "reference" if self._provider_name() == "novelai_official" else "img2img"
+            result = await self._run_job(
+                event,
+                visual,
+                operation,
+                reference_type=card.get("reference_type"),
+                preset_override=card,
+                size=(
+                    max(64, min(2048, int(self._cfg("sticker_width", 512) or 512))),
+                    max(64, min(2048, int(self._cfg("sticker_height", 512) or 512))),
+                ),
+                quiet=True,
+                job_kind="sticker",
+                emotion=emotion,
+            )
+            if not result.ok or not result.path:
+                return
+            if same_bubble:
+                current = event.get_result()
+                if current is None or not current.chain:
+                    return
+                await self._send_generated_image(event, result, current)
+                current.chain.clear()
+            else:
+                await self._send_generated_image(event, result)
+        finally:
+            event.set_extra("sticker_busy", False)
+
+    @filter.on_llm_response()
+    async def sticker_capture_reply(self, event: AstrMessageEvent, response: LLMResponse) -> None:
+        if not self._as_bool(self._cfg("sticker_enabled", False)):
+            return
+        if str(getattr(response, "role", "")) != "assistant" or getattr(response, "tools_call_name", None):
+            return
+        text = str(getattr(response, "completion_text", "") or "").strip()
+        if text:
+            event.set_extra("sticker_final_text", text)
+            event.set_extra("sticker_final_ready", True)
+
+    @filter.on_decorating_result()
+    async def sticker_decorate_reply(self, event: AstrMessageEvent) -> None:
+        if not event.get_extra("sticker_final_ready", False):
+            return
+        if str(self._cfg("sticker_send_mode", "after_reply")) == "same_bubble":
+            await self._try_sticker(event, same_bubble=True)
+
+    @filter.after_message_sent()
+    async def sticker_after_reply(self, event: AstrMessageEvent) -> None:
+        if event.get_extra("sticker_final_ready", False) and not event.get_extra("sticker_consumed", False):
+            await self._try_sticker(event, same_bubble=False)
 
     # --------------------------- AstrBot handlers ---------------------------
     @filter.llm_tool(name="novelai_generate_image")
@@ -1817,7 +2113,7 @@ class NovelAIPainterPlugin(Star):
                     fields[key] = int(fields[key])
                 except (TypeError, ValueError):
                     return self._page_error(f"{key} 必须是整数")
-        for key in ("scale", "retry_delay", "img2img_strength", "img2img_noise", "reference_strength", "reference_fidelity", "reference_information_extracted"):
+        for key in ("scale", "retry_delay", "img2img_strength", "img2img_noise", "reference_strength", "reference_fidelity", "reference_information_extracted", "sticker_probability"):
             if key in fields:
                 try:
                     fields[key] = float(fields[key])
@@ -1836,6 +2132,7 @@ class NovelAIPainterPlugin(Star):
             "admin_bypass", "legacy_command_enabled", "quality_toggle", "show_queue_notice",
             "notify_429", "show_retry_notice", "llm_auto_reference", "img2img_enabled",
             "reference_enabled", "img2img_color_correct",
+            "sticker_enabled", "sticker_auto_reference", "sticker_emotion_tool",
         ):
             if key in fields:
                 fields[key] = self._as_bool(fields[key])
@@ -1860,6 +2157,53 @@ class NovelAIPainterPlugin(Star):
             if default_id and not self._get_preset(default_id, include_disabled=True):
                 return self._page_error("默认角色卡不存在")
             fields["default_preset_id"] = default_id
+        if "sticker_role_card" in fields:
+            raw_card = fields["sticker_role_card"]
+            if not isinstance(raw_card, dict):
+                return self._page_error("表情包角色卡格式错误")
+            reference_id = str(raw_card.get("reference_id", "") or "").strip()
+            if reference_id and (Path(reference_id).name != reference_id or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", reference_id)):
+                return self._page_error("表情包参考图 ID 格式不正确")
+            fields["sticker_role_card"] = {
+                "name": str(raw_card.get("name", "表情包角色卡") or "表情包角色卡").strip()[:80],
+                "positive_prompt": str(raw_card.get("positive_prompt", "") or "").strip()[:8000],
+                "negative_prompt": str(raw_card.get("negative_prompt", "") or "").strip()[:4000],
+                "lock_positive": self._as_bool(raw_card.get("lock_positive", True), True),
+                "positive_strength": self._preset_strength(raw_card.get("positive_strength", 1.35), 1.35),
+                "quality_override": str(raw_card.get("quality_override", "off")) if raw_card.get("quality_override") in {"inherit", "on", "off"} else "off",
+                "reference_id": reference_id,
+                "reference_type": str(raw_card.get("reference_type", "character") or "character") if raw_card.get("reference_type") in {"character", "style", "both"} else "character",
+            }
+        for key in ("sticker_width", "sticker_height"):
+            if key in fields:
+                try:
+                    fields[key] = min(2048, max(64, int(fields[key])))
+                except (TypeError, ValueError):
+                    return self._page_error(f"{key} 必须是整数")
+        if "sticker_probability" in fields:
+            try:
+                fields["sticker_probability"] = min(100.0, max(0.0, float(fields["sticker_probability"])))
+            except (TypeError, ValueError):
+                return self._page_error("sticker_probability 必须是数字")
+        for key in ("sticker_cooldown_seconds", "sticker_context_messages"):
+            if key in fields:
+                try:
+                    value = int(fields[key])
+                    fields[key] = (
+                        min(86400, max(0, value))
+                        if key == "sticker_cooldown_seconds"
+                        else min(20, max(1, value))
+                    )
+                except (TypeError, ValueError):
+                    return self._page_error(f"{key} 必须是整数")
+        if "sticker_llm_timeout" in fields:
+            try:
+                fields["sticker_llm_timeout"] = min(180, max(5, int(fields["sticker_llm_timeout"])))
+            except (TypeError, ValueError):
+                return self._page_error("sticker_llm_timeout 必须是整数")
+        for key, limit in (("sticker_llm_provider_id", 200), ("sticker_prompt", 4000), ("sticker_decision_prompt", 4000)):
+            if key in fields:
+                fields[key] = str(fields[key] or "").strip()[:limit]
         allowed_enums = {
             "provider": {"novelai_official", "openai_compatible"},
             "invoke_mode": {"disabled", "command_only", "llm_tool_only", "both"},
@@ -1867,13 +2211,14 @@ class NovelAIPainterPlugin(Star):
             "group_access": {"all", "admin_only", "allowlist", "disabled"},
             "retry_mode": {"none", "rate_limit_once", "rate_limit_twice"},
             "error_notify_mode": {"silent", "final_only", "admin_only"},
+            "sticker_send_mode": {"after_reply", "same_bubble"},
         }
         for key, options in allowed_enums.items():
             if key in fields and fields[key] not in options:
                 return self._page_error(f"{key} 的值不受支持")
         previous_config = dict(self.config)
         self.config.update(fields)
-        self.config["config_version"] = 5
+        self.config["config_version"] = 6
         try:
             self._save_config()
         except Exception as exc:

@@ -10,6 +10,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from main import DEFAULT_NEGATIVE, GenerationResult, NovelAIPainterPlugin, ProviderError
+from astrbot.api.provider import LLMResponse
+from astrbot.core.message.message_event_result import MessageChain
 
 
 class FakeEvent:
@@ -19,6 +21,8 @@ class FakeEvent:
     def __init__(self, message="1girl, silver hair, blue eyes, night city"):
         self.sent = []
         self.message = message
+        self.result = None
+        self.extras = {}
     async def send(self, message): self.sent.append(message)
     def is_private_chat(self): return False
     def is_admin(self): return self.role == "admin"
@@ -26,6 +30,9 @@ class FakeEvent:
     def get_group_id(self): return "g-1"
     def get_platform_name(self): return "aiocqhttp"
     def get_message_str(self): return self.message
+    def get_result(self): return self.result
+    def set_extra(self, key, value): self.extras[key] = value
+    def get_extra(self, key, default=None): return self.extras.get(key, default)
     def plain_result(self, message): return message
 
 
@@ -99,6 +106,65 @@ class CoreTests(unittest.TestCase):
         out = io.BytesIO()
         with zipfile.ZipFile(out, "w") as zf: zf.writestr("image.png", b"png-data")
         self.assertEqual(NovelAIPainterPlugin._decode_zip(out.getvalue()), b"png-data")
+
+    def test_sticker_json_parser_accepts_fenced_json(self):
+        parsed = NovelAIPainterPlugin._sticker_json(
+            '```json\n{"send": true, "emotion": "无奈", "prompt": "deadpan face"}\n```'
+        )
+        self.assertEqual(parsed["emotion"], "无奈")
+        self.assertTrue(parsed["send"])
+
+    def test_sticker_same_bubble_sends_text_and_image_as_one_chain(self):
+        async def run():
+            p = self.make_plugin()
+            p.config.update({
+                "sticker_enabled": True,
+                "sticker_probability": 100,
+                "sticker_cooldown_seconds": 0,
+                "sticker_prompt": "reaction sticker",
+                "sticker_role_card": {"positive_prompt": "silver hair", "negative_prompt": "text"},
+                "auto_clean_delay": 0,
+            })
+            event = FakeEvent("hello")
+            event.result = MessageChain().message("hello")
+            event.set_extra("sticker_final_text", "hello")
+            image_path = p.temp_dir / "sticker.png"
+            image_path.write_bytes(b"png")
+            p._decide_sticker = AsyncMock(return_value={
+                "send": True, "emotion": "无奈", "prompt": "deadpan face, shrugging"
+            })
+            p._run_job = AsyncMock(return_value=GenerationResult(
+                True, "sticker-job", "novelai_official", path=str(image_path), message="sticker"
+            ))
+            with patch("main.random.random", return_value=0.0):
+                await p._try_sticker(event, same_bubble=True)
+            self.assertEqual(len(event.sent), 1)
+            self.assertEqual(event.sent[0].get_plain_text(), "hello")
+            self.assertEqual(len(event.sent[0].chain), 2)
+            self.assertEqual(event.result.chain, [])
+            self.assertEqual(p._run_job.await_args.kwargs["job_kind"], "sticker")
+        asyncio.run(run())
+
+    def test_sticker_emotion_tool_keeps_metadata_out_of_reply(self):
+        async def run():
+            p = self.make_plugin()
+            p.config["sticker_enabled"] = True
+            event = FakeEvent()
+            result = await p.novelai_set_emotion(event, "嘲笑", "side-eye")
+            self.assertIn("recorded", result)
+            self.assertEqual(event.get_extra("sticker_emotion"), "嘲笑")
+            self.assertEqual(event.get_extra("sticker_visual_hint"), "side-eye")
+        asyncio.run(run())
+
+    def test_sticker_final_reply_is_captured_from_llm_response(self):
+        async def run():
+            p = self.make_plugin()
+            p.config["sticker_enabled"] = True
+            event = FakeEvent()
+            await p.sticker_capture_reply(event, LLMResponse("assistant", completion_text="这就很无奈。"))
+            self.assertEqual(event.get_extra("sticker_final_text"), "这就很无奈。")
+            self.assertTrue(event.get_extra("sticker_final_ready"))
+        asyncio.run(run())
 
 
     def test_permission_denies_non_admin_group(self):

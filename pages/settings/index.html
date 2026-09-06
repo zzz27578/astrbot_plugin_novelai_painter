@@ -35,6 +35,7 @@
     <nav class="tabs" role="tablist">
       <button class="tab active" data-tab="provider" role="tab">连接与模型</button>
       <button class="tab" data-tab="access" role="tab">入口与权限</button>
+      <button class="tab" data-tab="sticker" role="tab">表情包模式</button>
       <button class="tab" data-tab="presets" role="tab">角色卡</button>
       <button class="tab" data-tab="reference" role="tab">参考图与图生图</button>
       <button class="tab" data-tab="jobs" role="tab">任务记录</button>
@@ -88,6 +89,36 @@
         <label class="field"><span>临时图片清理延迟（秒）</span><input data-config="auto_clean_delay" type="number" min="0" max="86400" /><small>设为 0 时会在发送后尽快清理。</small></label>
         <label class="field"><span>错误提示策略</span><select data-config="error_notify_mode"><option value="silent">静默，仅日志</option><option value="final_only">发送最终结果</option><option value="admin_only">仅管理员可见</option></select></label>
         <label class="switch-row"><input data-config="notify_429" type="checkbox" /><span><b>提示 429 频率限制</b><small>关闭后仍会记录日志，但不会向用户发送 429 提示。</small></span></label>
+      </div>
+    </section>
+    <section class="panel" data-panel="sticker">
+      <div class="section-head"><div><span class="kicker">03 / STICKER MODE</span><h2>表情包模式</h2><p>LLM 回复完成后，插件结合上下文、情绪标签和表情包角色卡判断是否生成当前情绪表情包。默认关闭，不影响普通聊天和普通生图。</p></div></div>
+      <div class="notice info"><span class="notice-icon">i</span><div><b>触发链路</b><p>先按概率抽样，再由判断模型选择是否发送。表情包生成失败会静默降级为原文字回复；“同一气泡”模式会自动使用非流式回复以保证文字和图片一起发送。</p></div></div>
+      <div class="grid two">
+        <label class="switch-row"><input data-config="sticker_enabled" type="checkbox" /><span><b>启用表情包模式</b><small>总开关。启用后每次 LLM 回复都会进入概率判断。</small></span></label>
+        <label class="field"><span>表情包概率（%）</span><input data-config="sticker_probability" type="number" min="0" max="100" step="1" /><small>0% 不生成，100% 每次都交给判断模型。</small></label>
+        <label class="field"><span>发送方式</span><select data-config="sticker_send_mode"><option value="after_reply">文字回复后发送</option><option value="same_bubble">与文字同一气泡</option></select></label>
+        <label class="field"><span>会话冷却（秒）</span><input data-config="sticker_cooldown_seconds" type="number" min="0" max="86400" /><small>同一会话连续触发表情包的最短间隔，0 为不限制。</small></label>
+        <label class="field"><span>判断上下文条数</span><input data-config="sticker_context_messages" type="number" min="1" max="20" /><small>发送给判断模型的最近对话条数。</small></label>
+        <label class="field"><span>判断模型 ID（可选）</span><input data-config="sticker_llm_provider_id" type="text" placeholder="留空跟随当前聊天模型" /><small>填写 AstrBot Provider ID 可让表情包判断使用独立模型。</small></label>
+        <label class="field"><span>判断超时（秒）</span><input data-config="sticker_llm_timeout" type="number" min="5" max="180" /></label>
+        <label class="switch-row"><input data-config="sticker_emotion_tool" type="checkbox" /><span><b>允许 LLM 提供情绪标签</b><small>LLM 可调用内部工具提供“嘲笑、无奈、震惊”等标签和视觉提示，不会显示在正文中。</small></span></label>
+        <label class="switch-row"><input data-config="sticker_auto_reference" type="checkbox" /><span><b>自动使用表情包参考图</b><small>绑定参考图时沿用现有 Precise Reference / 图生图逻辑。</small></span></label>
+        <label class="field"><span>表情包宽度</span><input data-config="sticker_width" type="number" min="64" max="2048" step="64" /></label>
+        <label class="field"><span>表情包高度</span><input data-config="sticker_height" type="number" min="64" max="2048" step="64" /></label>
+        <label class="field full"><span>表情包通用提示词</span><textarea data-config="sticker_prompt" rows="3" maxlength="4000"></textarea><small>每张表情包都会使用，例如 chibi、reaction sticker、simple background。</small></label>
+        <label class="field full"><span>判断规则</span><textarea data-config="sticker_decision_prompt" rows="4" maxlength="4000"></textarea><small>告诉判断模型哪些情绪适合发送，以及哪些场景应跳过。</small></label>
+      </div>
+      <div class="divider"></div>
+      <div class="section-head compact"><div><span class="kicker">专用角色卡</span><h3>表情包角色卡</h3><p>独立于普通角色卡，只用于表情包生成。建议填写固定人物主体、画风、服装和禁止项。</p></div></div>
+      <div class="grid two">
+        <label class="field"><span>角色卡名称</span><input data-sticker-card="name" type="text" maxlength="80" /></label>
+        <label class="field"><span>参考图</span><select id="sticker-reference"><option value="">不使用参考图</option></select></label>
+        <label class="field"><span>参考类型</span><select data-sticker-card="reference_type"><option value="character">人物参考</option><option value="style">画风参考</option><option value="both">人物 + 画风</option></select></label>
+        <label class="field"><span>角色卡锚定强度</span><input data-sticker-card="positive_strength" type="number" min="0.1" max="2" step="0.05" /></label>
+        <label class="switch-row"><input data-sticker-card="lock_positive" type="checkbox" /><span><b>保护未指定的人物与画风</b><small>保留专用角色卡固定特征，情绪和动作由判断模型补充。</small></span></label>
+        <label class="field full"><span>角色卡正向 Tag</span><textarea data-sticker-card="positive_prompt" rows="5" maxlength="8000" placeholder="1girl, silver hair, cat ears, green hoodie"></textarea></label>
+        <label class="field full"><span>角色卡负面 Tag</span><textarea data-sticker-card="negative_prompt" rows="3" maxlength="4000" placeholder="different character, realistic photo, text, watermark"></textarea></label>
       </div>
     </section>
     <section class="panel" data-panel="presets">

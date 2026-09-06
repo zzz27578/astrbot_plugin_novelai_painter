@@ -150,6 +150,16 @@ function getConfig() {
     }
   });
   config.default_preset_id = $("#default-preset")?.value || "";
+  config.sticker_role_card = {
+    name: $("[data-sticker-card='name']")?.value?.trim() || "表情包角色卡",
+    positive_prompt: $("[data-sticker-card='positive_prompt']")?.value?.trim() || "",
+    negative_prompt: $("[data-sticker-card='negative_prompt']")?.value?.trim() || "",
+    lock_positive: Boolean($("[data-sticker-card='lock_positive']")?.checked),
+    positive_strength: Number($("[data-sticker-card='positive_strength']")?.value || 1.35),
+    reference_id: $("#sticker-reference")?.value || "",
+    reference_type: $("[data-sticker-card='reference_type']")?.value || "character",
+    quality_override: "off",
+  };
   return config;
 }
 
@@ -203,9 +213,28 @@ function renderStatus() {
 
 function fillConfig() {
   Object.entries(state.config).forEach(([key, value]) => setConfigField(key, value));
+  renderStickerCard();
   renderStatus();
   renderPersonaOptions();
   renderPersonaMappings();
+}
+
+function renderStickerCard() {
+  const card = state.config.sticker_role_card && typeof state.config.sticker_role_card === "object"
+    ? state.config.sticker_role_card
+    : {};
+  $$('[data-sticker-card]').forEach((element) => {
+    const value = card[element.dataset.stickerCard];
+    if (element.type === "checkbox") element.checked = value !== false;
+    else if (value !== undefined && value !== null) element.value = value;
+  });
+  const select = $("#sticker-reference");
+  if (select) {
+    select.innerHTML = '<option value="">不使用参考图</option>' + state.references
+      .map((reference) => `<option value="${esc(reference.id)}">${esc(reference.name || reference.id)} · ${esc(reference.type || "character")}</option>`)
+      .join("");
+    select.value = card.reference_id || "";
+  }
 }
 
 function renderPersonaOptions() {
@@ -468,6 +497,7 @@ async function reloadState() {
   fillConfig();
   renderPresets();
   renderReferences();
+  renderStickerCard();
 }
 
 async function savePreset() {
@@ -676,6 +706,12 @@ $$('[data-config]').forEach((element) => {
     }
   });
 });
+
+$$('[data-sticker-card]').forEach((element) => {
+  element.addEventListener("input", markDirty);
+  element.addEventListener("change", markDirty);
+});
+$("#sticker-reference")?.addEventListener("change", markDirty);
 
 $("#default-preset").addEventListener("change", () => {
   state.config.default_preset_id = $("#default-preset").value;
