@@ -534,6 +534,7 @@ class CoreTests(unittest.TestCase):
         tool = next(item for item in llm_tools.func_list if item.name == "novelai_generate_image")
         prompt_schema = tool.parameters.get("properties", {}).get("prompt", {})
         self.assertEqual(prompt_schema.get("type"), "string")
+        self.assertEqual(tool.parameters["properties"]["subjects"]["type"], "string")
 
         async def run():
             p = self.make_plugin()
@@ -550,6 +551,7 @@ class CoreTests(unittest.TestCase):
                 "generate",
                 preset_id=None,
                 reference_type=None,
+                preset_override={},
             )
             p._finish_event.assert_awaited_once()
 
@@ -561,6 +563,213 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(p._resolve_llm_operation("generate", p.presets[0]), "reference")
         p.config["llm_auto_reference"] = False
         self.assertEqual(p._resolve_llm_operation("generate", p.presets[0]), "generate")
+
+    def test_other_characters_and_scenery_never_inherit_self_card_or_reference(self):
+        async def run(message, subjects=""):
+            p = self.make_plugin()
+            p.config["default_preset_id"] = "p1"
+            p._call_official = AsyncMock(return_value="image.png")
+            p._load_reference = AsyncMock(return_value=(None, None))
+            p._finish_event = AsyncMock(return_value="done")
+            await p.novelai_generate_image(FakeEvent(message), "hatsune miku, aqua hair, twintails", subjects=subjects)
+            args = p._call_official.await_args.args
+            self.assertEqual(args[1], "generate")
+            self.assertIn("hatsune miku, aqua hair, twintails", args[0])
+            self.assertNotIn("blonde hair", args[0])
+            self.assertNotIn("extra arms", args[5])
+            self.assertEqual(args[6], {})
+            p._load_reference.assert_awaited_once_with(None)
+            self.assertEqual(p.config["default_preset_id"], "p1")
+        for message in ("帮我画初音未来", "你帮我画初音未来", "你自己画初音未来", "不要画你自己，画初音", "画一片星空", "画你和初音合影"):
+            with self.subTest(message=message):
+                asyncio.run(run(message))
+        asyncio.run(run("画你现在的样子", subjects="[]"))
+
+    def test_explicit_card_selection_is_local_and_does_not_require_persona_binding(self):
+        async def run():
+            p = self.make_plugin()
+            p.config["default_preset_id"] = "p1"
+            other = {"id": "p2", "name": "Other", "positive_prompt": "red hair, green eyes", "negative_prompt": "blue eyes", "enabled": True}
+            p.presets.append(other)
+            p._call_official = AsyncMock(return_value="image.png")
+            p._load_reference = AsyncMock(return_value=(None, None))
+            p._finish_event = AsyncMock(return_value="done")
+            await p.novelai_generate_image(
+                FakeEvent("画 Other 在公园散步"), "park",
+                subjects=json.dumps([{"source": "card", "preset_id": "Other", "prompt": "walking"}]),
+            )
+            args = p._call_official.await_args.args
+            self.assertIn("red hair, green eyes", args[0])
+            self.assertIn("walking", args[0])
+            self.assertNotIn("blonde hair", args[0])
+            self.assertEqual(args[5], "blue eyes")
+            self.assertEqual(args[6], other)
+            self.assertEqual(p.config["default_preset_id"], "p1")
+            self.assertEqual(p.config["persona_preset_map"], {})
+        asyncio.run(run())
+
+    def test_custom_subject_needs_no_card_and_keeps_character_identity(self):
+        async def run():
+            p = self.make_plugin()
+            p.config["default_preset_id"] = "p1"
+            p._call_official = AsyncMock(return_value="image.png")
+            p._load_reference = AsyncMock(return_value=(None, None))
+            p._finish_event = AsyncMock(return_value="done")
+            await p.novelai_generate_image(
+                FakeEvent("画初音未来"), "stage, full body",
+                subjects='[{"source":"custom","prompt":"hatsune miku, aqua hair, twintails, singing"}]',
+            )
+            args = p._call_official.await_args.args
+            self.assertIn("hatsune miku, aqua hair, twintails, singing", args[0])
+            self.assertNotIn("blonde hair", args[0])
+            self.assertEqual(args[1], "generate")
+        asyncio.run(run())
+
+    def test_multi_subject_payload_keeps_cards_negatives_and_changes_separate(self):
+        async def run():
+            p = self.make_plugin()
+            p.config.update({"default_preset_id": "p1", "api_token": "test-token"})
+            p.presets[0]["negative_prompt"] = "green eyes, wedding dress"
+            p.presets.append({
+                "id": "p2", "name": "Other", "positive_prompt": "red hair, green eyes, black suit",
+                "negative_prompt": "blue eyes, wedding dress", "reference_id": "r2",
+            })
+            before = json.dumps(p.presets)
+            p._post_image_request = AsyncMock(return_value="image.png")
+            p._load_reference = AsyncMock(return_value=(None, None))
+            p._finish_event = AsyncMock(return_value="done")
+            subjects = [
+                {"source": "self", "prompt": "wedding dress, smiling"},
+                {"source": "card", "preset_id": "p2", "prompt": "standing"},
+                {"source": "custom", "prompt": "hatsune miku, aqua hair, twintails, singing"},
+            ]
+            await p.novelai_generate_image(
+                FakeEvent("你穿婚纱，和 Other、初音一起合影"), "3girls, park",
+                subjects=json.dumps(subjects),
+            )
+            payload = p._post_image_request.await_args.args[2]
+            params = payload["parameters"]
+            self.assertEqual(payload["input"], "3girls, park")
+            positive = params["v4_prompt"]["caption"]["char_captions"]
+            negative = params["v4_negative_prompt"]["caption"]["char_captions"]
+            self.assertEqual(len(positive), 3)
+            self.assertEqual(len(negative), 3)
+            self.assertIn("blonde hair", positive[0]["char_caption"])
+            self.assertIn("wedding dress", positive[0]["char_caption"])
+            self.assertNotIn("black bodysuit", positive[0]["char_caption"])
+            self.assertNotIn("wedding dress", negative[0]["char_caption"])
+            self.assertIn("red hair, green eyes, black suit", positive[1]["char_caption"])
+            self.assertNotIn("blonde hair", positive[1]["char_caption"])
+            self.assertIn("wedding dress", negative[1]["char_caption"])
+            self.assertEqual(positive[2]["char_caption"], "hatsune miku, aqua hair, twintails, singing")
+            self.assertEqual(negative[2]["char_caption"], "")
+            self.assertNotIn("green eyes", params["negative_prompt"])
+            self.assertNotIn("director_reference_images", params)
+            self.assertEqual(json.dumps(p.presets), before)
+            p._load_reference.assert_awaited_once_with(None)
+            p._post_image_request.assert_awaited_once()
+        asyncio.run(run())
+
+    def test_multi_subject_openai_and_v3_prompts_scope_negative_traits(self):
+        async def run(provider):
+            p = self.make_plugin()
+            p.config.update({"default_preset_id": "p1", "provider": provider, "model": "nai-diffusion-3"})
+            p._call_openai = AsyncMock(return_value="image.png")
+            p._call_official = AsyncMock(return_value="image.png")
+            p._load_reference = AsyncMock(return_value=(None, None))
+            p._finish_event = AsyncMock(return_value="done")
+            await p.novelai_generate_image(
+                FakeEvent("画你和初音合影"), "park",
+                subjects='[{"source":"self","prompt":"smiling"},{"source":"custom","prompt":"hatsune miku, aqua hair"}]',
+            )
+            call = p._call_openai if provider == "openai_compatible" else p._call_official
+            args = call.await_args.args
+            self.assertIn("Subject 1:", args[0])
+            self.assertIn("Subject 2:", args[0])
+            self.assertIn("Avoid for subject 1 only: extra arms", args[0])
+            self.assertEqual(args[1], "generate")
+            self.assertEqual(args[4 if provider == "openai_compatible" else 5], "")
+        for provider in ("openai_compatible", "novelai_official"):
+            asyncio.run(run(provider))
+
+    def test_invalid_subjects_do_not_generate_or_fall_back_to_default(self):
+        async def run(subjects, operation="generate"):
+            p = self.make_plugin()
+            p.config["default_preset_id"] = "p1"
+            p._run_job = AsyncMock()
+            p._notify = AsyncMock()
+            result = await p.novelai_generate_image(FakeEvent(), "portrait", operation=operation, subjects=subjects)
+            self.assertIn("No image request was sent", result)
+            p._run_job.assert_not_awaited()
+        for subjects in (
+            "invalid", "{}", "[1]", '[{"source":"unknown"}]', '[{"source":"custom"}]',
+            '[{"source":"card","preset_id":"missing"}]', '[{"source":"self","preset_id":"p1"}]',
+            json.dumps([{"source": "custom", "prompt": "person"}] * 7),
+        ):
+            with self.subTest(subjects=subjects):
+                asyncio.run(run(subjects))
+        asyncio.run(run('[{"source":"self"},{"source":"custom","prompt":"hatsune miku"}]', "reference"))
+
+    def test_drawing_identity_context_exposes_self_and_enabled_card_catalog(self):
+        async def run():
+            p = self.make_plugin()
+            p.config["default_preset_id"] = "p1"
+            p.presets.append({"id": "disabled", "name": "Hidden", "enabled": False})
+            req = SimpleNamespace(system_prompt="Original persona")
+            await p.drawing_identity_context(FakeEvent(), req)
+            self.assertTrue(req.system_prompt.startswith("Original persona"))
+            self.assertIn('"self_card": {"id": "p1", "name": "P1"}', req.system_prompt)
+            self.assertIn("source=custom", req.system_prompt)
+            self.assertNotIn("Hidden", req.system_prompt)
+            self.assertNotIn("blonde hair", req.system_prompt)
+            previous = req.system_prompt
+            await p.drawing_identity_context(FakeEvent(), req)
+            self.assertEqual(req.system_prompt, previous)
+            p.config["invoke_mode"] = "command_only"
+            req.system_prompt = "Original persona"
+            await p.drawing_identity_context(FakeEvent(), req)
+            self.assertEqual(req.system_prompt, "Original persona")
+        asyncio.run(run())
+
+    def test_explicit_self_selection_uses_resolved_card_without_keyword_guessing(self):
+        async def run():
+            p = self.make_plugin()
+            p._resolve_active_preset = AsyncMock(return_value=p.presets[0])
+            p._call_official = AsyncMock(return_value="image.png")
+            p._load_reference = AsyncMock(return_value=(b"reference", {"image_b64": "abc"}))
+            p._finish_event = AsyncMock(return_value="done")
+            await p.novelai_generate_image(
+                FakeEvent("来张自拍"), "portrait", subjects='[{"source":"self","prompt":"smiling"}]',
+            )
+            args = p._call_official.await_args.args
+            self.assertIn("blonde hair", args[0])
+            self.assertIn("smiling", args[0])
+            self.assertEqual(args[1], "reference")
+            p._resolve_active_preset.assert_awaited_once()
+        asyncio.run(run())
+
+    def test_multi_subject_shared_style_change_preserves_other_subject_features(self):
+        p = self.make_plugin()
+        characters = p._compose_character_prompts(
+            [{"preset": p.presets[0], "prompt": "wedding dress"}, {"preset": p.presets[0], "prompt": "standing"}],
+            FakeEvent("你换婚纱，另一人不换衣服，画风改为写实"), "realistic",
+        )
+        for character in characters:
+            self.assertNotIn("watercolor", character["prompt"])
+            self.assertIn("blonde hair", character["prompt"])
+        self.assertNotIn("black bodysuit", characters[0]["prompt"])
+        self.assertIn("black bodysuit", characters[1]["prompt"])
+
+    def test_disabled_card_is_rejected_instead_of_using_default_card(self):
+        async def run():
+            p = self.make_plugin()
+            p.presets[0]["enabled"] = False
+            p._run_job = AsyncMock()
+            p._notify = AsyncMock()
+            result = await p.novelai_generate_image(FakeEvent(), "portrait", subjects='[{"source":"card","preset_id":"p1"}]')
+            self.assertIn("已禁用", result)
+            p._run_job.assert_not_awaited()
+        asyncio.run(run())
 
     def test_llm_request_reaches_provider_with_anchors_and_bound_reference(self):
         async def run():
@@ -709,6 +918,27 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(p._run_job.await_args.args[5], "both")
             self.assertEqual(p.presets[0]["reference_type"], original_type)
         asyncio.run(run())
+
+    def test_draw_self_and_card_draw_commands_select_only_requested_card(self):
+        async def run(command, expects_card):
+            p = self.make_plugin()
+            p.config["default_preset_id"] = "p1"
+            p._call_official = AsyncMock(return_value="image.png")
+            p._load_reference = AsyncMock(return_value=(None, None))
+            p._finish_event = AsyncMock(return_value="done")
+            async for _ in p.cmd_draw(FakeEvent(command)):
+                pass
+            args = p._call_official.await_args.args
+            self.assertEqual("blonde hair" in args[0], expects_card)
+            self.assertEqual(p.config["default_preset_id"], "p1")
+        for command, expects_card in (
+            ("/nai draw hatsune miku, aqua hair", False),
+            ("/nai hatsune miku, aqua hair", False),
+            ("/nai self standing", True),
+            ("/nai card-draw p1 standing", True),
+        ):
+            with self.subTest(command=command):
+                asyncio.run(run(command, expects_card))
 
     def test_webui_uses_embedded_confirmation_and_wraps_long_text(self):
         script = Path("pages/settings/app.js").read_text(encoding="utf-8")

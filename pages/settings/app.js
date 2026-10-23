@@ -265,8 +265,8 @@ function renderActivePresets() {
   });
   items.push(...mapped);
   box.innerHTML = items.length
-    ? items.map((item) => `<article class="preset-card"><div class="preset-meta"><strong>${esc(item.label)}</strong><p>${item.active ? "当前生图会自动应用" : "映射已保留；重新启用角色卡后才会应用"}</p></div></article>`).join("")
-    : '<div class="empty">当前没有应用角色卡。</div>';
+    ? items.map((item) => `<article class="preset-card"><div class="preset-meta"><strong>${esc(item.label)}</strong><p>${item.active ? "画对应 AI 自身时使用；画其他角色不会套用" : "映射已保留；重新启用角色卡后才会应用"}</p></div></article>`).join("")
+    : '<div class="empty">当前没有自身角色卡映射；仍可按描述自由绘画。</div>';
 }
 
 function renderPresets() {

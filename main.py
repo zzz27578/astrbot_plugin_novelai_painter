@@ -37,7 +37,7 @@ from astrbot.core.message.components import Image
 from astrbot.core.message.message_event_result import MessageChain
 
 PLUGIN_NAME = "astrbot_plugin_novelai_painter"
-VERSION = "2.4.1"
+VERSION = "2.5.0"
 STICKER_EMOTION_TOOL_NAME = "novelai_set_emotion"
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 MAX_RESPONSE_BYTES = 48 * 1024 * 1024
@@ -669,11 +669,15 @@ class NovelAIPainterPlugin(Star):
     def _requested_change_categories(
         event: AstrMessageEvent | None,
         candidate_prompt: str = "",
+        *,
+        request_text: str | None = None,
     ) -> set[str]:
         try:
             raw_request = str(event.get_message_str() or "").lower().replace("_", " ") if event else ""
         except Exception:
             raw_request = ""
+        if request_text is not None:
+            raw_request = request_text.lower().replace("_", " ")
         patterns = {
             "identity": r"(性别|男生|女生|男孩|女孩|男人|女人|少年|少女|\b(?:1|2|multiple)?\s*(?:girls?|boys?)\b|\bmale\b|\bfemale\b|\bman\b|\bwoman\b)",
             "hair": r"(头发|发型|发色|马尾|辫子?|刘海|呆毛|[粉金银白黑红蓝绿紫棕]毛|\bhair\b|\bponytails?\b|\btwintails?\b|\bbraids?\b|\bbangs?\b)",
@@ -744,11 +748,13 @@ class NovelAIPainterPlugin(Star):
         event: AstrMessageEvent | None,
         locked: bool,
         candidate_prompt: str = "",
+        *,
+        request_text: str | None = None,
     ) -> str:
         """Apply request-local role-card overrides without mutating the card."""
         if not locked:
             return positive_prompt
-        requested_changes = self._requested_change_categories(event, candidate_prompt)
+        requested_changes = self._requested_change_categories(event, candidate_prompt, request_text=request_text)
         if not requested_changes:
             return positive_prompt
         patterns = self._card_tag_patterns()
@@ -770,9 +776,11 @@ class NovelAIPainterPlugin(Star):
         negative_prompt: str,
         event: AstrMessageEvent | None,
         candidate_prompt: str = "",
+        *,
+        request_text: str | None = None,
     ) -> str:
         """Let an explicit request override role-card negatives for that category."""
-        requested_changes = self._requested_change_categories(event, candidate_prompt)
+        requested_changes = self._requested_change_categories(event, candidate_prompt, request_text=request_text)
         if not requested_changes:
             return negative_prompt
         patterns = self._card_tag_patterns()
@@ -789,7 +797,7 @@ class NovelAIPainterPlugin(Star):
             kept.append(tag)
         return ", ".join(kept)
 
-    def _compose_prompt(self, prompt: str, event: AstrMessageEvent | None = None, preset_id: str | None = None, *, preset_override: dict[str, Any] | None = None) -> tuple[str, str, str]:
+    def _compose_prompt(self, prompt: str, event: AstrMessageEvent | None = None, preset_id: str | None = None, *, preset_override: dict[str, Any] | None = None, request_text: str | None = None) -> tuple[str, str, str]:
         preset = preset_override if preset_override is not None else self._resolve_preset(event, preset_id)
         user_prompt = str(prompt or "").strip()
         if not preset:
@@ -805,8 +813,9 @@ class NovelAIPainterPlugin(Star):
             event,
             lock_positive,
             user_prompt,
+            request_text=request_text,
         )
-        requested_changes = self._requested_change_categories(event, user_prompt)
+        requested_changes = self._requested_change_categories(event, user_prompt, request_text=request_text)
 
         if self._provider_name() == "novelai_official":
             model = self._active_model()
@@ -845,6 +854,7 @@ class NovelAIPainterPlugin(Star):
             str(preset.get("negative_prompt", "") or "").strip(),
             event,
             user_prompt,
+            request_text=request_text,
         )
         return composed[:12000], str(preset.get("id", "")), preset_negative
 
@@ -881,6 +891,107 @@ class NovelAIPainterPlugin(Star):
         if removed:
             logger.info(f"[{PLUGIN_NAME}] 已移除 {removed} 个与锁定角色卡冲突的 LLM 标签")
         return ", ".join(kept) if kept else "portrait, looking at viewer"
+
+    @staticmethod
+    def _explicit_self_portrait(event: AstrMessageEvent) -> bool:
+        """Compatibility for older tool calls; ambiguous subjects never inherit a card."""
+        text = str(event.get_message_str() or "").lower()
+        if re.search(r"合影|同框|一起|和|与|以及|还有|加上|不要|别|不是|\band\b|\bwith\b|\bdon't\b|\bdo not\b", text):
+            return False
+        return bool(re.search(
+            r"(?:画|绘制)(?:一张|一下|一个|给我看看)?(?:你自己|你现在的样子|你的(?:样子|照片|画像|自拍|全身像))|"
+            r"(?:画|绘制)(?:一张|一下|一个)?你(?:[，。！？!?,\s]|$)|"
+            r"\b(?:draw|paint)\s+yourself\b|\b(?:picture|portrait) of\s+you\b|\byour\s+(?:portrait|selfie)\b",
+            text,
+        ))
+
+    async def _resolve_drawing_subjects(self, event: AstrMessageEvent, subjects: str) -> list[dict[str, Any]]:
+        """Resolve drawing identities independently of the assistant's speaking persona."""
+        if not isinstance(subjects, str):
+            raise ValueError("subjects 必须是 JSON 数组字符串。")
+        if not subjects.strip():
+            if not self._explicit_self_portrait(event):
+                return []
+            return [{"preset": await self._resolve_active_preset(event) or {}, "prompt": ""}]
+        try:
+            items = json.loads(subjects)
+        except (ValueError, TypeError) as exc:
+            raise ValueError("subjects 必须是 JSON 数组字符串。") from exc
+        if not isinstance(items, list) or len(items) > 6:
+            raise ValueError("subjects 必须是数组，一张图最多指定 6 个独立角色。")
+        resolved = []
+        self_card = None
+        for item in items:
+            if not isinstance(item, dict):
+                raise ValueError("subjects 的每一项必须是角色对象。")
+            source = item.get("source")
+            detail = item.get("prompt", "")
+            selector = item.get("preset_id", "")
+            if not isinstance(detail, str) or len(detail) > 4000 or not isinstance(selector, str):
+                raise ValueError("角色 prompt 必须是不超过 4000 字符的字符串，preset_id 必须是字符串。")
+            if source != "card" and selector:
+                raise ValueError("只有 source=card 才能指定 preset_id。")
+            if source == "self":
+                if self_card is None:
+                    self_card = await self._resolve_active_preset(event) or {}
+                preset = self_card
+            elif source == "card":
+                preset = self._find_role_card(selector)
+                if not self._as_bool(preset.get("enabled", True), True):
+                    raise ValueError("所选角色卡已禁用，请启用或使用 source=custom 描述角色。")
+            elif source == "custom":
+                preset = {}
+                if not detail.strip():
+                    raise ValueError("source=custom 必须提供角色名和外貌描述 prompt，无需创建角色卡。")
+            else:
+                raise ValueError("角色 source 只能是 self、card 或 custom。")
+            resolved.append({"preset": preset, "prompt": detail.strip()})
+        return resolved
+
+    def _compose_character_prompts(self, subjects: list[dict[str, Any]], event: AstrMessageEvent, scene_prompt: str) -> list[dict[str, str]]:
+        characters = []
+        shared_style_change = "style" in self._requested_change_categories(event, scene_prompt)
+        for subject in subjects:
+            detail = subject["prompt"]
+            # Each subject contains only its own requested changes. A different
+            # subject's new hair/outfit must not release this card's anchors.
+            positive, preset_id, negative = self._compose_prompt(
+                detail, preset_override=subject["preset"],
+                request_text=detail + (", art style" if shared_style_change else ""),
+            )
+            characters.append({"prompt": positive, "negative_prompt": negative, "preset_id": preset_id})
+        return characters
+
+    def _supports_character_prompts(self) -> bool:
+        return self._active_model().startswith(("nai-diffusion-4", "nai-diffusion-5"))
+
+    @filter.on_llm_request()
+    async def drawing_identity_context(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
+        if not self._mode_allows("llm_tool") or not self._can_use(event)[0]:
+            return
+        marker = "[NovelAI drawing identities]"
+        if marker in (req.system_prompt or ""):
+            return
+        active = await self._resolve_active_preset(event)
+        catalog = [
+            {"id": p["id"], "name": p.get("name", ""), "description": p.get("description", "")}
+            for p in self.presets if self._as_bool(p.get("enabled", True), True)
+        ]
+        req.system_prompt = (req.system_prompt or "") + "\n" + marker + "\n" + (
+            "聊天身份由当前 AstrBot 人设决定。绘画对象与聊天身份分别处理，画其他角色不会改变你的身份。"
+            "调用 novelai_generate_image 时先判断用户画谁：仅画你自己用 subjects 中 source=self；"
+            "用户点名库中角色用 source=card 和其 preset_id；其他角色用 source=custom，"
+            "将角色名（已知作品角色优先用准确英文角色 Tag）、外貌与本次动作放入该角色的 prompt，无需提前建卡。"
+            "没有卡时根据你已知的人设或用户描述补充，不得借用其他卡。"
+            "多人同框每人一项，可以混用 self、card、custom；每项只写该角色自己的动作和明确修改，"
+            "不要把其他人的外貌写进该项；使用卡时不要重复未修改的固定外貌。"
+            "顶层 prompt 写共享场景、构图、人数和画风，人物身份词写各自 subjects.prompt。"
+            "画风格、风景、物品等不含你的请求用 subjects=[]，不能默认附加你的人设。"
+            "角色卡目录只是可选绘画素材，名称不等于当前聊天身份，不能全部合并。\n"
+        ) + json.dumps({
+            "self_card": {"id": active.get("id", ""), "name": active.get("name", "")} if active else None,
+            "available_cards": catalog,
+        }, ensure_ascii=False) + "\n[End NovelAI drawing identities]\n"
 
     # --------------------------- permissions and dedupe ---------------------------
     def _event_key(self, event: AstrMessageEvent, prompt: str, operation: str) -> str:
@@ -1069,8 +1180,7 @@ class NovelAIPainterPlugin(Star):
             return prompt
         return f"{prompt}. Avoid these negative prompt traits: {negative}"
 
-    def _official_parameters(self, prompt: str, operation: str, image_b64: str | None, reference: dict[str, Any] | None, negative_override: str = "", preset: dict[str, Any] | None = None, *, size: tuple[int, int] | None = None) -> dict[str, Any]:
-        model = self._active_model()
+    def _official_parameters(self, prompt: str, operation: str, image_b64: str | None, reference: dict[str, Any] | None, negative_override: str = "", preset: dict[str, Any] | None = None, *, size: tuple[int, int] | None = None, character_prompts: list[dict[str, str]] | None = None) -> dict[str, Any]:
         negative = self._merged_negative_prompt(negative_override)
         params: dict[str, Any] = {
             "params_version": 3,
@@ -1093,12 +1203,22 @@ class NovelAIPainterPlugin(Star):
                 "noise": max(0.0, min(1.0, float(self._cfg("img2img_noise", 0.1) or 0.1))),
                 "color_correct": self._as_bool(self._cfg("img2img_color_correct", True)),
             })
-        if "4" in model or "5" in model:
+        if self._supports_character_prompts():
             params.update({
                 "use_coords": False,
                 "v4_prompt": {"caption": {"base_caption": prompt, "char_captions": []}, "use_coords": False, "use_order": True},
                 "v4_negative_prompt": {"caption": {"base_caption": negative, "char_captions": []}, "legacy_uc": False},
             })
+            for character in character_prompts or []:
+                # Matching order/centers keep positive and negative traits local
+                # to the same subject. Let NovelAI place subjects automatically.
+                centers = [{"x": 0.5, "y": 0.5}]
+                params["v4_prompt"]["caption"]["char_captions"].append({
+                    "char_caption": character["prompt"], "centers": centers,
+                })
+                params["v4_negative_prompt"]["caption"]["char_captions"].append({
+                    "char_caption": character["negative_prompt"], "centers": centers,
+                })
         if reference and reference.get("image_b64"):
             ref_type = reference.get("reference_type", reference.get("type", "character"))
             caption_type = "character&style" if ref_type in {"both", "character&style"} else ("style" if ref_type == "style" else "character")
@@ -1111,14 +1231,14 @@ class NovelAIPainterPlugin(Star):
             })
         return params
 
-    async def _call_official(self, prompt: str, operation: str, job_id: str, image_b64: str | None, reference: dict[str, Any] | None, negative_override: str = "", preset: dict[str, Any] | None = None, *, size: tuple[int, int] | None = None) -> str:
+    async def _call_official(self, prompt: str, operation: str, job_id: str, image_b64: str | None, reference: dict[str, Any] | None, negative_override: str = "", preset: dict[str, Any] | None = None, *, size: tuple[int, int] | None = None, character_prompts: list[dict[str, str]] | None = None) -> str:
         base_url = str(self._cfg("base_url", "https://image.novelai.net") or "https://image.novelai.net").strip().rstrip("/")
         url = base_url if base_url.endswith("/ai/generate-image") else f"{base_url}/ai/generate-image"
         token = str(self._cfg("api_token", "") or "").strip()
         if not token:
             raise ProviderError("not_configured", "NovelAI 官方 Token 尚未配置")
         headers = {"Authorization": token if token.lower().startswith("bearer ") else f"Bearer {token}", "Content-Type": "application/json", "Accept": "application/zip, application/json"}
-        payload = {"input": prompt, "model": self._active_model(), "action": "generate", "parameters": self._official_parameters(prompt, operation, image_b64, reference, negative_override, preset, size=size)}
+        payload = {"input": prompt, "model": self._active_model(), "action": "generate", "parameters": self._official_parameters(prompt, operation, image_b64, reference, negative_override, preset, size=size, character_prompts=character_prompts)}
         return await self._post_image_request(url, headers, payload, job_id)
 
     async def _call_openai(
@@ -1241,6 +1361,7 @@ class NovelAIPainterPlugin(Star):
         quiet: bool = False,
         job_kind: str = "image",
         emotion: str = "",
+        character_prompts: list[dict[str, str]] | None = None,
     ) -> GenerationResult:
         allowed, reason = self._can_use(event)
         job_id = uuid.uuid4().hex[:12]
@@ -1276,10 +1397,20 @@ class NovelAIPainterPlugin(Star):
         resolved_preset_id = str(resolved_preset.get("id", "")) if resolved_preset else ""
         composed_prompt, active_preset_id, preset_negative = self._compose_prompt(
             prompt,
-            None if preset_override is not None else event,
+            None if job_kind == "sticker" else event,
             resolved_preset_id or None,
-            preset_override=preset_override,
+            # Snapshot the resolved selection, including an explicit empty
+            # selection. Never fall back to a default card during composition.
+            preset_override=resolved_preset or {},
         )
+        if character_prompts and (provider != "novelai_official" or not self._supports_character_prompts()):
+            sections = [composed_prompt, "Draw distinct subjects; keep each subject's traits separate."]
+            for index, character in enumerate(character_prompts, 1):
+                section = f"Subject {index}: {character['prompt']}"
+                if character["negative_prompt"]:
+                    section += f". Avoid for subject {index} only: {character['negative_prompt']}"
+                sections.append(section)
+            composed_prompt = "\n".join(sections)
         if active_preset_id:
             logger.info(
                 f"[{PLUGIN_NAME}] job={job_id} 已合并角色卡 {active_preset_id}: "
@@ -1318,7 +1449,7 @@ class NovelAIPainterPlugin(Star):
                 effective_reference_type = "character"
             image_bytes, reference = await self._load_reference(reference_id)
             if operation in {"img2img", "reference"} and not image_bytes:
-                result = GenerationResult(False, job_id, provider, error_code="missing_reference", message="请先在 WebUI 上传参考图并绑定到当前角色卡。", attempts=0)
+                result = GenerationResult(False, job_id, provider, error_code="missing_reference", message="该操作需要参考图，请在 WebUI 上传并绑定到本次选中的角色卡。", attempts=0)
                 self._recent_jobs[key] = (time.time(), result)
                 return result
             if reference:
@@ -1347,6 +1478,7 @@ class NovelAIPainterPlugin(Star):
                                 preset_negative,
                                 selected_preset,
                                 **({"size": size} if size is not None else {}),
+                                **({"character_prompts": character_prompts} if character_prompts else {}),
                             )
                         else:
                             path = await self._call_openai(
@@ -1376,7 +1508,7 @@ class NovelAIPainterPlugin(Star):
             self._recent_jobs[key] = (time.time(), result)
             job_record = asdict(result)
             job_record["has_image"] = bool(job_record.pop("path", None))
-            self._jobs.append({**job_record, "operation": operation, "preset_id": active_preset_id, "kind": job_kind, "emotion": emotion, "created_at": int(time.time())})
+            self._jobs.append({**job_record, "operation": operation, "preset_id": active_preset_id, "subject_preset_ids": [c["preset_id"] for c in character_prompts or []], "kind": job_kind, "emotion": emotion, "created_at": int(time.time())})
             self._jobs = self._jobs[-50:]
             return result
         finally:
@@ -1480,9 +1612,11 @@ class NovelAIPainterPlugin(Star):
         root = f"/{prefix}"
         return (
             "可执行命令：\n"
-            f"{root} draw <画面描述>\n"
+            f"{root} draw <画面描述>（自由绘画，不套角色卡）\n"
             f"{root} img2img <画面描述>\n"
             f"{root} reference <character|style|both> <画面描述>\n"
+            f"{root} self <画面描述>（使用当前人设角色卡）\n"
+            f"{root} card-draw <角色卡ID> <画面描述>（仅本次使用指定卡）\n"
             f"{root} card current（查看当前角色卡）\n"
             f"{root} card list（查看全部角色卡）\n"
             f"{root} card use <角色卡 ID 或名称>（更换角色卡）\n"
@@ -1906,13 +2040,15 @@ class NovelAIPainterPlugin(Star):
         prompt: str = "",
         operation: str = "generate",
         reference_type: str = "",
+        subjects: str = "",
     ):
-        """仅在用户明确要求生成、绘制或修改图片时调用；每条用户消息最多生成并发送一张图片。插件会强制应用当前 AstrBot 人设映射或默认角色卡正向/负向 Tag，并可自动使用角色卡绑定的参考图。图片发送后必须停止调用工具，并用当前人设向用户简短回复。
+        """仅在用户明确要求生成、绘制或修改图片时调用；每条用户消息最多生成并发送一张图片。先区分绘画对象与当前聊天人设；角色卡只用于选中的绘画角色，绝不默认合并到其他角色。已知角色无需提前建卡。图片发送后停止调用工具，用当前聊天人设简短回复。
 
         Args:
-            prompt(string): 必须传入根据用户本次要求整理出的动作、姿势、表情、构图、场景或明确修改项。优先整理为具体的英文 NovelAI / Danbooru Tag；不要重复角色卡的固定主体与画风，插件会在后端拼接角色卡正向 Tag 并加入负面 Tag。不得省略该参数。
-            operation(string): 生成方式，只能是 generate、img2img 或 reference。普通生图使用 generate；用户明确要求基于绑定图片修改时使用 img2img；NovelAI 精确参考使用 reference。省略时若开启自动参考且当前角色卡绑定了参考图，插件会自动选择合适方式。
-            reference_type(string): reference 模式的参考类型，只能是 character、style 或 both；省略时继承当前角色卡保存的参考类型，无角色卡时使用 character。
+            prompt(string): 共享场景、构图、人数、动作和明确修改，优先使用英文 NovelAI / Danbooru Tag。使用 subjects 时把各人的身份与专属外貌写入各自 prompt，不能混入其他人的 Tag。不使用 subjects 时须完整描述绘画对象，默认不套角色卡。
+            operation(string): generate、img2img 或 reference。普通生图用 generate；仅单个选中角色可自动使用其绑定参考图。多人图用 generate，避免参考图混合人物。
+            reference_type(string): reference 模式用 character、style 或 both；省略时继承本次选中卡的参考类型。
+            subjects(string): JSON 数组字符串，每人一项，最多 6 人。source=self 表示画 AI 自己，使用当前人设卡；source=card 配合 preset_id（卡 ID 或完整名称）表示画库中指定角色；source=custom 表示无需卡，prompt 写准确角色名及外貌。每项 prompt 仅含自己的动作、表情和明确修改；使用卡时不要重复固定外貌。例：[{"source":"self","prompt":"smiling"},{"source":"custom","prompt":"hatsune miku, aqua hair, twintails, singing"}]。风景或完整自由描述用 []。省略仅兼容明确的单人自画像，其余请求不套卡。
         """
         if not self._mode_allows("llm_tool"):
             await self._notify(event, "当前未启用自然语言生图入口。", "error")
@@ -1920,6 +2056,10 @@ class NovelAIPainterPlugin(Star):
                 "FINAL_IMAGE_TOOL_RESULT: Natural-language image generation is disabled. "
                 "Do not call any tool again for this message. Reply to the user briefly."
             )
+        allowed, reason = self._can_use(event)
+        if not allowed:
+            await self._notify(event, reason, "error")
+            return f"FINAL_IMAGE_TOOL_RESULT: {reason} Do not call any tool again for this message."
 
         if not self._claim_llm_tool_invocation(event):
             return (
@@ -1942,12 +2082,24 @@ class NovelAIPainterPlugin(Star):
                 "Do not call any tool again for this message. Explain this briefly to the user."
             )
 
-        active_preset = await self._resolve_active_preset(event)
-        normalized_prompt = self._filter_llm_prompt_conflicts(
-            normalized_prompt,
-            event,
-            active_preset,
-        )
+        try:
+            drawing_subjects = await self._resolve_drawing_subjects(event, subjects)
+            if len(drawing_subjects) > 1 and str(operation).lower().strip() in {"img2img", "reference"}:
+                raise ValueError("多人同框请使用 generate；人物参考图会影响全图，不能自动归属到单个角色。")
+        except ValueError as exc:
+            await self._notify(event, str(exc), "error")
+            return (
+                f"FINAL_IMAGE_TOOL_RESULT: {exc} No image request was sent. "
+                "Do not call any tool again for this message. Explain this briefly to the user."
+            )
+        active_preset = drawing_subjects[0]["preset"] if len(drawing_subjects) == 1 else {}
+        character_prompts = None
+        if len(drawing_subjects) > 1:
+            character_prompts = self._compose_character_prompts(drawing_subjects, event, normalized_prompt)
+        else:
+            if drawing_subjects and drawing_subjects[0]["prompt"]:
+                normalized_prompt += ", " + drawing_subjects[0]["prompt"]
+            normalized_prompt = self._filter_llm_prompt_conflicts(normalized_prompt, event, active_preset)
         resolved_operation = self._resolve_llm_operation(operation, active_preset)
         requested_reference_type = str(reference_type or "").strip().lower()
         normalized_reference_type = (
@@ -1961,6 +2113,8 @@ class NovelAIPainterPlugin(Star):
             resolved_operation,
             preset_id=str(active_preset.get("id", "")) if active_preset else None,
             reference_type=normalized_reference_type,
+            preset_override=active_preset,
+            **({"character_prompts": character_prompts} if character_prompts else {}),
         )
         user_visible_result = await self._finish_event(event, result)
         if result.ok:
@@ -1998,13 +2152,28 @@ class NovelAIPainterPlugin(Star):
         command = command.lower()
         operation = "generate"
         reference_type = None
+        selected_card = {}
         body = text
         if command in {"draw", "generate", "生图"}:
             body = remainder.strip() if separator else ""
+        elif command in {"self", "自己"}:
+            selected_card = None
+            body = remainder.strip() if separator else ""
+        elif command == "card-draw":
+            selector, _, body = remainder.strip().partition(" ")
+            try:
+                selected_card = self._find_role_card(selector)
+                if not self._as_bool(selected_card.get("enabled", True), True):
+                    raise ValueError("该角色卡已禁用，请先在 WebUI 启用。")
+            except ValueError as exc:
+                yield event.plain_result(str(exc))
+                return
         elif command in {"img2img", "i2i", "图生图"}:
+            selected_card = None
             operation = "img2img"
             body = remainder.strip() if separator else ""
         elif command in {"reference", "ref", "参考图"}:
+            selected_card = None
             operation = "reference"
             reference_type, separator, body = remainder.strip().partition(" ")
             reference_type = reference_type.lower() or "character"
@@ -2038,7 +2207,7 @@ class NovelAIPainterPlugin(Star):
             return
         preset_id = None
         reference_id = None
-        result = await self._run_job(event, body, operation, preset_id, reference_id, reference_type)
+        result = await self._run_job(event, body, operation, preset_id, reference_id, reference_type, preset_override=selected_card)
         await self._finish_event(event, result)
 
     # --------------------------- WebUI page APIs ---------------------------
