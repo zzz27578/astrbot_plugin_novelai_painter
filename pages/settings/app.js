@@ -290,7 +290,7 @@ function renderPresets() {
     const qualityMode = preset.quality_override || (cardLocked ? "off" : "inherit");
     const badges = [
       preset.enabled === false ? "已禁用" : "已启用",
-      cardLocked ? `角色卡 ${Number(preset.positive_strength || 1.35).toFixed(2)}×` : "角色卡未锁定",
+      (state.config.llm_card_mode || "context") === "context" ? "剧情锚点" : cardLocked ? `角色卡 ${Number(preset.positive_strength || 1.35).toFixed(2)}×` : "角色卡未锁定",
       qualityMode === "off" ? "质量标签关闭" : qualityMode === "on" ? "质量标签开启" : "质量标签跟随全局",
     ];
     return `

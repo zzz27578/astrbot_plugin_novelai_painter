@@ -337,11 +337,18 @@
     "default": {},
     "invisible": true
   },
+  "llm_card_mode": {
+    "description": "LLM 角色卡使用方式",
+    "type": "string",
+    "default": "context",
+    "options": ["context", "strict"],
+    "hint": "context：主模型结合剧情决定当前外观，角色卡仅作初始锚点；成功生图后按会话和当前对话保留外观，避免换装后回退。strict：保留旧版固定特征过滤与本轮覆盖规则。仅影响普通 LLM 生图。"
+  },
   "llm_auto_reference": {
     "description": "LLM 自动应用角色卡绑定参考图",
     "type": "bool",
     "default": true,
-    "hint": "仅单个明确选中的绘画角色可自动使用该卡参考图；画其他无卡角色或多人同框时不会带入自身参考图。NovelAI 官方使用 Precise Reference，兼容后端使用图生图。"
+    "hint": "仅单个明确选中的绘画角色可使用该卡参考图；剧情锚点模式需主模型确认符合当前外观并设置 use_reference=true，避免参考图还原旧衣服。无卡和多人图不自动套用。"
   },
   "img2img_enabled": {
     "description": "启用图生图",
