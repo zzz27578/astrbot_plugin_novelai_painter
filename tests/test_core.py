@@ -498,7 +498,7 @@ class CoreTests(unittest.TestCase):
         async def run():
             p = self.make_context_plugin()
             p.presets[0]["positive_prompt"] = "{{elf (isekai ojisan)}}, {forehead jewel}, 1.2::green eyes::, black bodysuit, {atelier pontdarc}"
-            await p.novelai_generate_image(FakeEvent(), "room", subjects=[{"source":"self", "outfit":"white dress"}], style="oil painting")
+            await p.novelai_generate_image(FakeEvent("画你穿白裙，画风改成油画"), "room", subjects=[{"source":"self", "outfit":"white dress"}], style="oil painting")
             prompt = p._call_official.await_args.args[0]
             for tag in ("{{elf (isekai ojisan)}}", "{forehead jewel}", "1.2::green eyes::", "white dress", "oil painting"):
                 self.assertIn(tag, prompt)
@@ -518,7 +518,7 @@ class CoreTests(unittest.TestCase):
     def test_multicharacter_style_override_is_shared_once_including_custom(self):
         async def run():
             p = self.make_context_plugin()
-            await p.novelai_generate_image(FakeEvent(), "2girls, park", style="oil painting", subjects=[
+            await p.novelai_generate_image(FakeEvent("画你和另一个人，使用油画风格"), "2girls, park", style="oil painting", subjects=[
                 {"source":"self"}, {"source":"custom", "prompt":"1girl, solo, red hair", "negative_prompt":"blue eyes"}])
             args = p._call_official.await_args
             chars = args.kwargs["character_prompts"]
@@ -612,6 +612,109 @@ flat cell shading, clean lineart, masterpiece, best quality"""
             self.assertEqual(snapshot["parameters"], payload["parameters"])
             self.assertNotIn("test-secret-token", json.dumps(snapshot))
             self.assertNotIn("image_b64", json.dumps(snapshot))
+        asyncio.run(run())
+
+    def test_explicit_builtin_card_request_repairs_empty_subjects_and_preserves_card_style(self):
+        """An empty selection plus a paraphrased style must not discard a card."""
+        async def run(subjects, scene):
+            p = self.make_context_plugin()
+            original = "{{elf (isekai ojisan)}}, 1girl, solo, slender body, cute proportions, pale blonde hair, orange hair tips, high side ponytail, red hair tie, horizontal pointed ears, emerald green eyes, light-colored eyelashes, {forehead jewel}, sleeveless black bodysuit, yellow split skirt, red boots, light novel cover style, visual novel cg, anime screencap, {atelier pontdarc}, vibrant colors, vivid lighting, soft lineart, subtle shadows, delicate highlights, glossy highlights, flat cell shading, clean lineart, masterpiece, best quality"
+            negative = "{text}, {watermark}, {bad anatomy}, {bad hands}, worst quality, low quality"
+            p.presets[0].update(positive_prompt=original, negative_prompt=negative)
+            p.config["api_token"] = "test-token"
+            del p._call_official
+            p._post_image_request = AsyncMock(return_value="image.png")
+            event = FakeEvent("你用我们内置的角色卡去画一张图")
+            result = await p.novelai_generate_image(event, scene, subjects=subjects,
+                style="light novel cover style, visual novel cg, anime screencap, clean lineart, best quality")
+            self.assertNotIn("ARGUMENT_ERROR", result)
+            p._post_image_request.assert_awaited_once()
+            payload = p._post_image_request.await_args.args[2]
+            for tag in drawing.tags(original):
+                self.assertIn(tag, payload["input"])
+            for tag in drawing.tags(negative):
+                self.assertIn(tag, payload["parameters"]["negative_prompt"])
+            self.assertEqual(payload["input"].count("light novel cover style"), 1 + scene.count("light novel cover style"))
+            self.assertEqual(payload["input"].count("yellow split skirt"), 1)
+            self.assertEqual(p._request_snapshots[event.unified_msg_origin]["subjects"][0]["preset_id"], "p1")
+        for subjects in ([], "[]", None):
+            for scene in (
+                "elf adventurer, pale blonde hair, standing gracefully, shy smile, soft indoor lighting",
+                "slender elf adventurer, 1girl solo, pale blonde hair in high side ponytail with orange hair tips, horizontal pointed ears, emerald green eyes with light-colored eyelashes, red gemstone on forehead, wearing red hair tie, sleeveless black bodysuit, yellow split skirt with high slits on thigh midline, red boots, standing gracefully, shy smile, soft indoor lighting, light novel cover style, visual novel cg, anime screencap, clean lineart, best quality",
+            ):
+                with self.subTest(subjects=subjects, scene=scene): asyncio.run(run(subjects, scene))
+
+    def test_empty_subjects_honor_explicit_self_and_named_card_but_not_other_characters(self):
+        async def run():
+            for message in ("画你现在的样子", "画一张你的全身像"):
+                p = self.make_context_plugin()
+                await p.novelai_generate_image(FakeEvent(message), "portrait", subjects=[])
+                self.assertIn("blonde hair", p._call_official.await_args.args[0])
+            for message in ("用内置角色卡画一张，不要自行发挥", "用内置角色卡画图，画风不要变"):
+                p = self.make_context_plugin()
+                await p.novelai_generate_image(FakeEvent(message), "portrait", subjects=[])
+                self.assertIn("blonde hair", p._call_official.await_args.args[0])
+            p = self.make_context_plugin()
+            p.presets.append({"id":"p2", "name":"Other", "positive_prompt":"red hair", "negative_prompt":"blue hair"})
+            await p.novelai_generate_image(FakeEvent("用 Other 角色卡画你"), "portrait", subjects=[])
+            self.assertIn("red hair", p._call_official.await_args.args[0])
+            self.assertNotIn("blonde hair", p._call_official.await_args.args[0])
+            for message in ("画初音未来", "画一片星空", "不要用角色卡，画初音", "画你现在的样子，不用角色卡", "用角色卡的画风画星空", "用内置角色卡画你和初音合影"):
+                p = self.make_context_plugin()
+                await p.novelai_generate_image(FakeEvent(message), "park", subjects=[])
+                self.assertNotIn("blonde hair", p._call_official.await_args.args[0])
+        asyncio.run(run())
+
+    def test_empty_builtin_selection_uses_only_available_card_and_never_guesses_among_many(self):
+        async def run():
+            p = self.make_context_plugin()
+            p.config["default_preset_id"] = ""
+            await p.novelai_generate_image(FakeEvent("用内置角色卡画一张"), "room", subjects=[])
+            self.assertIn("blonde hair", p._call_official.await_args.args[0])
+            p = self.make_context_plugin()
+            p.config["default_preset_id"] = ""
+            p.presets.append({"id":"p2", "name":"Other", "positive_prompt":"red hair"})
+            result = await p.novelai_generate_image(FakeEvent("用内置角色卡画一张"), "room", subjects=[])
+            self.assertIn("IMAGE_TOOL_ARGUMENT_ERROR", result)
+            p._call_official.assert_not_awaited()
+            p.presets[1]["enabled"] = False
+            await p.novelai_generate_image(FakeEvent("用内置角色卡画一张"), "room", subjects=[])
+            self.assertIn("blonde hair", p._call_official.await_args.args[0])
+        asyncio.run(run())
+
+    def test_unsolicited_style_cannot_erase_card_artist_in_single_or_multiple_subjects(self):
+        async def run():
+            for message in ("画你现在的样子", "按角色卡的画风画一张", "保持画风不变", "不要改画风", "keep the original art style", "do not change the art style"):
+                for count in (1, 2):
+                    p = self.make_context_plugin()
+                    p.presets[0]["positive_prompt"] = "{{elf (isekai ojisan)}}, green eyes, black bodysuit, {atelier pontdarc}"
+                    subjects = [{"source":"self"}]
+                    if count == 2: subjects.append({"source":"custom", "prompt":"red hair"})
+                    await p.novelai_generate_image(FakeEvent(message), "room", subjects=subjects, style="generic anime style")
+                    args = p._call_official.await_args
+                    composed = args.args[0] if count == 1 else args.kwargs["character_prompts"][0]["prompt"]
+                    self.assertIn("{atelier pontdarc}", composed)
+                    self.assertIn("{{elf (isekai ojisan)}}", composed)
+                    self.assertNotIn("generic anime style", args.args[0])
+        asyncio.run(run())
+
+    def test_unknown_or_disabled_named_card_does_not_fall_back_to_bound_card(self):
+        async def run():
+            for message, cards in (("用 Missing 角色卡画一张", []), ("用角色卡 Missing 画一张", []),
+                ("用 Hidden 角色卡画一张", [{"id":"p2", "name":"Hidden", "positive_prompt":"red hair", "enabled":False}])):
+                p = self.make_context_plugin()
+                p.presets.extend(cards)
+                result = await p.novelai_generate_image(FakeEvent(message), "room", subjects=[])
+                self.assertIn("IMAGE_TOOL_ARGUMENT_ERROR", result)
+                p._call_official.assert_not_awaited()
+        asyncio.run(run())
+
+    def test_custom_only_style_does_not_require_a_card_style_change(self):
+        async def run():
+            p = self.make_context_plugin()
+            await p.novelai_generate_image(FakeEvent("画一个路人"), "room", subjects=[{"source":"custom", "prompt":"red hair"}], style="oil painting")
+            self.assertIn("oil painting", p._call_official.await_args.args[0])
+            self.assertNotIn("blonde hair", p._call_official.await_args.args[0])
         asyncio.run(run())
 
     def test_layer_migration_is_lossless_backed_up_and_idempotent(self):
@@ -1156,7 +1259,7 @@ flat cell shading, clean lineart, masterpiece, best quality"""
         for message in ("帮我画初音未来", "你帮我画初音未来", "你自己画初音未来", "不要画你自己，画初音", "画一片星空", "画你和初音合影"):
             with self.subTest(message=message):
                 asyncio.run(run(message))
-        asyncio.run(run("画你现在的样子", subjects="[]"))
+        asyncio.run(run("画你现在的样子，不要使用角色卡", subjects="[]"))
 
     def test_explicit_card_selection_is_local_and_does_not_require_persona_binding(self):
         async def run():

@@ -243,9 +243,9 @@ TOOL_PARAMETERS = {
     "type": "object", "additionalProperties": False,
     "properties": {
         "prompt": {"type": "string", "description": "完整画面描述，或共享场景、人数、构图和光线。允许服饰和人物叙述；多人建议各自描述放 subjects，换装推荐 outfit。"},
-        "subjects": {"type": "array", "items": SUBJECT_SCHEMA, "maxItems": 6, "description": "原生 JSON 角色数组，绝不再编码成字符串。self/card/custom 分别指定人物，空数组画无卡场景。"},
+        "subjects": {"type": "array", "items": SUBJECT_SCHEMA, "maxItems": 6, "description": "原生 JSON 角色数组，绝不再编码成字符串。self 使用当前绑定卡，card 配 preset_id 选卡，custom 画无卡角色。用户要求用内置/绑定卡时应选卡，不能传空数组重写卡词；空数组用于无卡场景。"},
         "operation": {"type": "string", "enum": ["generate", "img2img", "reference"]},
         "reference_type": {"type": "string", "enum": ["character", "style", "both"]},
-        "style": {"type": "string", "description": "本图完整画风；提供时替换卡画风，省略保留原卡精确画师名与权重。"},
+        "style": {"type": "string", "description": "仅用户明确改画风时填写，整体替换卡画风。常规用卡画图省略，保留原卡精确画师名与权重，不要抄写默认画风。无卡画图可自由使用。"},
     }, "required": ["prompt", "subjects"],
 }
