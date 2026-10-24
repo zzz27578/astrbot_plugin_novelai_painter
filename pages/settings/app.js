@@ -290,6 +290,7 @@ function renderPresets() {
     const qualityMode = preset.quality_override || (cardLocked ? "off" : "inherit");
     const badges = [
       preset.enabled === false ? "已禁用" : "已启用",
+      ...(preset.layers_need_review ? ["待检查分层"] : []),
       (state.config.llm_card_mode || "context") === "context" ? "剧情锚点" : cardLocked ? `角色卡 ${Number(preset.positive_strength || 1.35).toFixed(2)}×` : "角色卡未锁定",
       qualityMode === "off" ? "质量标签关闭" : qualityMode === "on" ? "质量标签开启" : "质量标签跟随全局",
     ];
@@ -382,7 +383,12 @@ function renderReferences() {
 
 async function renderJobs({ reportErrors = true } = {}) {
   try {
-    const data = ensureOk(await withTimeout(bridge.apiGet("jobs"), 15000, "读取任务记录超时"));
+    const [data, snapshots] = await Promise.all([
+      withTimeout(bridge.apiGet("jobs"), 15000, "读取任务记录超时").then(ensureOk),
+      withTimeout(bridge.apiGet("last-request"), 15000, "读取请求快照超时").then(ensureOk),
+    ]);
+    $("#last-request").textContent = snapshots.requests?.length
+      ? JSON.stringify(snapshots.requests, null, 2) : "暂无请求。";
     const jobs = Array.isArray(data.jobs) ? data.jobs : [];
     const box = $("#job-list");
     const clearButton = $("#clear-jobs");
@@ -478,7 +484,13 @@ function openPreset(id = "") {
   $("#preset-positive-strength").value = preset.positive_strength || 1.35;
   $("#preset-quality-override").value = preset.quality_override || "off";
   $("#preset-description").value = preset.description || "";
-  $("#preset-positive").value = preset.positive_prompt || "";
+  $("#preset-identity").value = preset.identity_prompt || "";
+  $("#preset-outfit").value = preset.default_outfit_prompt || "";
+  $("#preset-style").value = preset.style_prompt || "";
+  $("#preset-positive").value = preset.migration_original_prompt || preset.positive_prompt || "";
+  $("#preset-migration").textContent = preset.layers_need_review
+    ? "旧卡已自动分组，请检查服饰是否全部移到服饰栏，以及画师标签是否在画风栏。保存后确认分层。" + (preset.migration_notes || []).join(" ")
+    : "三层合计最多 8000 字符；保存后用于剧情模式，严格模式和命令使用三层合并文本。";
   $("#preset-negative").value = preset.negative_prompt || "";
   $("#preset-name").focus();
 }
@@ -511,7 +523,10 @@ async function savePreset() {
     positive_strength: Number($("#preset-positive-strength").value || 1.35),
     quality_override: $("#preset-quality-override").value,
     description: $("#preset-description").value.trim(),
-    positive_prompt: $("#preset-positive").value.trim(),
+    layers_version: 1,
+    identity_prompt: $("#preset-identity").value.trim(),
+    default_outfit_prompt: $("#preset-outfit").value.trim(),
+    style_prompt: $("#preset-style").value.trim(),
     negative_prompt: $("#preset-negative").value.trim(),
     enabled: $("#preset-enabled").checked,
   };

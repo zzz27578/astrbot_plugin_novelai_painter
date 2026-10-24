@@ -9,6 +9,8 @@ from unittest.mock import AsyncMock, Mock, patch
 from pathlib import Path
 from types import SimpleNamespace
 
+import drawing
+
 from main import DEFAULT_NEGATIVE, GenerationResult, NovelAIPainterPlugin, ProviderError
 from astrbot.api.provider import LLMResponse
 from astrbot.core.message.message_event_result import MessageChain
@@ -68,6 +70,7 @@ class CoreTests(unittest.TestCase):
         p.config.update({"llm_card_mode": "context", "default_preset_id": "p1"})
         p.context = SimpleNamespace(conversation_manager=SimpleNamespace(
             get_curr_conversation_id=AsyncMock(return_value="conversation-1"),
+            get_conversation=AsyncMock(return_value=SimpleNamespace(history="[]")),
         ))
         p._call_official = AsyncMock(return_value="image.png")
         p._load_reference = AsyncMock(return_value=(None, None))
@@ -79,187 +82,380 @@ class CoreTests(unittest.TestCase):
         event.message_obj = SimpleNamespace(message_id=message_id)
         return event
 
-    def test_contextual_outfit_continues_across_turns_and_can_restore_anchor(self):
+    def persist_turn(self, p, event):
+        conversation = p.context.conversation_manager.get_conversation.return_value
+        history = json.loads(conversation.history)
+        history.append({"role": "user", "content": event.message})
+        history.append({"role": "assistant", "content": "ok"})
+        conversation.history = json.dumps(history)
+
+    def test_native_and_legacy_subject_arrays_produce_equivalent_prompts(self):
+        async def run():
+            prompts = []
+            for subjects in ([{"source": "self"}], '[{"source":"self"}]'):
+                p = self.make_context_plugin()
+                await p.novelai_generate_image(FakeEvent(), "room", subjects=subjects)
+                prompts.append(p._call_official.await_args.args[0])
+            self.assertEqual(*prompts)
+        asyncio.run(run())
+
+    def test_complete_outfit_replaces_default_and_image_only_does_not_change_story(self):
         async def run():
             p = self.make_context_plugin()
-            p.presets[0]["negative_prompt"] = "white dress, extra arms"
+            p.presets[0]["negative_prompt"] = "{white dress}, extra arms"
             before = json.dumps(p.presets)
-            appearance = "watercolor, blue eyes, blonde hair, side ponytail, white dress"
-            await p.novelai_generate_image(
-                self.drawing_event("换上白裙画一张", "change-outfit"), "bedroom",
-                subjects=json.dumps([{"source": "self", "appearance_patch": {"remove": ["black bodysuit"], "add": ["white dress"], "negative_remove": ["white dress"]}, "prompt": "smiling"}]),
-            )
-            first = p._call_official.await_args.args
-            self.assertIn(appearance, first[0])
-            self.assertNotIn("black bodysuit", first[0])
-            self.assertNotIn("same outfit", first[0])
-            self.assertNotIn("white dress", first[5])
-            self.assertEqual(first[1], "generate")
-            await p.novelai_generate_image(
-                self.drawing_event("继续，走到窗边再画一张", "continue-scene"), "window, sunlight",
-                subjects='[{"source":"self","prompt":"standing"}]',
-            )
-            continued = p._call_official.await_args.args
-            self.assertIn(appearance, continued[0])
-            self.assertNotIn("black bodysuit", continued[0])
-            self.assertNotIn("white dress", continued[5])
-            self.assertNotIn("smiling", continued[0])
-            await p.novelai_generate_image(
-                self.drawing_event("换回默认衣服", "restore-outfit"), "bedroom",
-                subjects=json.dumps([{"source": "self", "appearance_patch": {"remove": ["white dress"], "add": ["black bodysuit"], "negative_add": ["white dress"]}, "prompt": "standing"}]),
-            )
-            restored = p._call_official.await_args.args
-            self.assertIn("black bodysuit", restored[0])
-            self.assertNotIn("white dress", restored[0])
+            event = self.drawing_event("只在这张图穿白裙", "one-image")
+            await p.novelai_generate_image(event, "room", subjects=[{"source":"self", "outfit":"white dress"}])
+            args = p._call_official.await_args.args
+            self.assertIn("white dress", args[0]); self.assertNotIn("black bodysuit", args[0])
+            self.assertNotIn("white dress", args[5]); self.assertIn("extra arms", args[5])
+            self.persist_turn(p, event)
+            await p.novelai_generate_image(self.drawing_event("画现在的你", "next"), "room", subjects=[{"source":"self"}])
+            self.assertIn("black bodysuit", p._call_official.await_args.args[0])
+            self.assertFalse(p._ledger().states)
             self.assertEqual(json.dumps(p.presets), before)
         asyncio.run(run())
 
-    def test_contextual_states_are_isolated_by_session_dialogue_and_card(self):
+    def test_story_outfit_continues_and_can_return_to_default(self):
         async def run():
             p = self.make_context_plugin()
-            await p.novelai_generate_image(
-                self.drawing_event("换装", "first"), "room",
-                subjects='[{"source":"self","appearance_patch":{"remove":["black bodysuit"],"add":["white dress"]}}]',
-            )
-            for scope_change in ("session", "dialogue", "edited-card"):
-                event = self.drawing_event("继续画", scope_change)
-                p.context.conversation_manager.get_curr_conversation_id.return_value = "conversation-1"
-                if scope_change == "session":
-                    event.unified_msg_origin = "test:group:2"
-                elif scope_change == "dialogue":
-                    p.context.conversation_manager.get_curr_conversation_id.return_value = "conversation-2"
-                else:
-                    p.presets[0]["positive_prompt"] = "green eyes, black suit"
-                await p.novelai_generate_image(event, "room", subjects='[{"source":"self","prompt":"standing"}]')
-                self.assertNotIn("white dress", p._call_official.await_args.args[0])
-            p.presets.append({"id": "p2", "name": "Second", "positive_prompt": "red hair, green eyes, kimono"})
-            await p.novelai_generate_image(
-                self.drawing_event("画另一个角色", "other-card"), "room",
-                subjects='[{"source":"card","preset_id":"p2","prompt":"sitting"}]',
-            )
-            self.assertIn("kimono", p._call_official.await_args.args[0])
+            e = self.drawing_event("我帮你换上白裙", "story")
+            await p.novelai_generate_image(e, "room", subjects=[{"source":"self", "outfit":"white dress", "state_scope":"story"}])
+            self.persist_turn(p, e)
+            await p.novelai_generate_image(self.drawing_event("继续走到窗前", "next"), "window", subjects=[{"source":"self"}])
+            prompt = p._call_official.await_args.args[0]
+            self.assertIn("white dress", prompt); self.assertNotIn("black bodysuit", prompt)
+            e = self.drawing_event("换回原装", "restore")
+            await p.novelai_generate_image(e, "room", subjects=[{"source":"self", "outfit":"black bodysuit", "state_scope":"story"}])
+            self.persist_turn(p, e)
+            await p.novelai_generate_image(self.drawing_event("继续", "next2"), "room", subjects=[{"source":"self"}])
+            self.assertIn("black bodysuit", p._call_official.await_args.args[0])
             self.assertNotIn("white dress", p._call_official.await_args.args[0])
         asyncio.run(run())
 
-    def test_failed_or_duplicate_generation_does_not_commit_new_appearance(self):
+    def test_explicit_empty_outfit_replaces_all_default_clothes(self):
+        async def run():
+            p = self.make_context_plugin()
+            await p.novelai_generate_image(FakeEvent(), "room", subjects=[{"source":"self", "outfit":""}])
+            self.assertNotIn("black bodysuit", p._call_official.await_args.args[0])
+            self.assertIn("blonde hair", p._call_official.await_args.args[0])
+        asyncio.run(run())
+
+    def test_failed_image_does_not_undo_actual_story_change(self):
         async def run():
             p = self.make_context_plugin()
             p._call_official.side_effect = ProviderError("network", "test failure")
-            subjects = '[{"source":"self","appearance_patch":{"remove":["black bodysuit"],"add":["white dress"]}}]'
-            await p.novelai_generate_image(self.drawing_event("换装", "failed"), "room", subjects=subjects)
-            self.assertFalse(getattr(p, "_appearance_states", {}))
+            e = self.drawing_event("已经换好白裙了", "failed")
+            await p.novelai_generate_image(e, "room", subjects=[{"source":"self", "outfit":"white dress", "state_scope":"story"}])
+            self.persist_turn(p, e)
             p._call_official.side_effect = None
-            event = self.drawing_event("画默认衣服", "successful")
-            await p.novelai_generate_image(event, "room", subjects='[{"source":"self"}]')
-            state = dict(p._current_appearance((event.unified_msg_origin, "conversation-1"), p.presets[0]))
-            await p.novelai_generate_image(event, "room", subjects=subjects)
-            self.assertEqual(p._current_appearance((event.unified_msg_origin, "conversation-1"), p.presets[0]), state)
-            self.assertIn("black bodysuit", state["positive_prompt"])
+            await p.novelai_generate_image(self.drawing_event("再画", "retry-new-message"), "room", subjects=[{"source":"self"}])
+            self.assertIn("white dress", p._call_official.await_args.args[0])
         asyncio.run(run())
 
-    def test_dialogue_change_during_generation_does_not_store_appearance(self):
+    def test_reset_same_cid_new_cid_history_edit_and_card_edit_invalidate_story(self):
+        async def run(change):
+            p = self.make_context_plugin()
+            e = self.drawing_event("换上白裙", "story")
+            await p.novelai_generate_image(e, "room", subjects=[{"source":"self", "outfit":"white dress", "state_scope":"story"}])
+            self.persist_turn(p, e)
+            # Observe the persisted turn as it would be at the next LLM request.
+            await p.drawing_identity_context(self.drawing_event("继续", "observe"), SimpleNamespace(system_prompt=""))
+            e2 = self.drawing_event("新请求", "after-change")
+            manager = p.context.conversation_manager
+            if change == "reset":
+                manager.get_conversation.return_value.history = "[]"
+                reset = FakeEvent("/renamed-reset")
+                reset.set_extra("_clean_group_context_session", True)
+                await p.drawing_context_lifecycle(reset)
+            elif change == "new":
+                manager.get_curr_conversation_id.return_value = "conversation-2"
+                manager.get_conversation.return_value.history = "[]"
+            elif change == "history":
+                manager.get_conversation.return_value.history = "[]"
+            elif change == "card":
+                p.presets[0]["positive_prompt"] = "green eyes, black suit"
+            else:
+                e2.unified_msg_origin = "test:group:other"
+            await p.novelai_generate_image(e2, "room", subjects=[{"source":"self"}])
+            self.assertNotIn("white dress", p._call_official.await_args.args[0])
+        for change in ("reset", "new", "history", "card", "origin"):
+            with self.subTest(change=change): asyncio.run(run(change))
+
+    def test_plain_reset_text_does_not_clear_state_until_core_confirms_success(self):
         async def run():
             p = self.make_context_plugin()
-            async def switch_dialogue(*args, **kwargs):
-                p.context.conversation_manager.get_curr_conversation_id.return_value = "conversation-2"
+            view = await p._story_view(FakeEvent())
+            card = drawing.card_layers(p.presets[0])
+            p._ledger().remember(view, card, "white dress")
+            await p.drawing_context_lifecycle(FakeEvent("/reset"))
+            self.assertTrue(p._ledger().states)
+            e = FakeEvent(); e.set_extra("_clean_group_context_session", True)
+            await p.drawing_context_lifecycle(e)
+            self.assertFalse(p._ledger().states)
+        asyncio.run(run())
+
+    def test_missing_or_unreadable_history_never_uses_shared_outfit_cache(self):
+        async def run():
+            p = self.make_context_plugin()
+            view = await p._story_view(FakeEvent())
+            p._ledger().remember(view, drawing.card_layers(p.presets[0]), "white dress")
+            p.context.conversation_manager.get_conversation.return_value.history = "unreadable"
+            await p.novelai_generate_image(self.drawing_event("继续", "no-history"), "room", subjects=[{"source":"self"}])
+            self.assertNotIn("white dress", p._call_official.await_args.args[0])
+        asyncio.run(run())
+
+    def test_stale_request_after_reset_is_rejected_before_generation(self):
+        async def run():
+            p = self.make_context_plugin()
+            e = FakeEvent()
+            await p.drawing_identity_context(e, SimpleNamespace(system_prompt=""))
+            reset = FakeEvent(); reset.set_extra("_clean_group_context_session", True)
+            await p.drawing_context_lifecycle(reset)
+            result = await p.novelai_generate_image(e, "room", subjects=[{"source":"self"}])
+            self.assertIn("No image request was sent", result)
+            p._call_official.assert_not_awaited()
+        asyncio.run(run())
+
+    def test_request_built_before_context_switch_is_not_rebound_to_new_chat(self):
+        async def run(cid, history):
+            p = self.make_context_plugin(); e = FakeEvent()
+            req = SimpleNamespace(system_prompt="", prompt=e.message,
+                conversation=SimpleNamespace(cid=cid, history=history))
+            await p.drawing_identity_context(e, req)
+            result = await p.novelai_generate_image(e, "room", subjects=[{"source":"self", "outfit":"white dress", "state_scope":"story"}])
+            self.assertIn("No image request was sent", result)
+            self.assertFalse(p._ledger().states)
+            p._call_official.assert_not_awaited()
+        for cid, history in (("old-cid", "[]"), ("conversation-1", '[{"role":"user","content":"old story"}]')):
+            with self.subTest(cid=cid): asyncio.run(run(cid, history))
+
+    def test_reset_cancels_queued_request_and_does_not_recreate_story(self):
+        async def run():
+            p = self.make_context_plugin()
+            p.config["show_queue_notice"] = False
+            await p.lock.acquire()
+            task = asyncio.create_task(p.novelai_generate_image(FakeEvent(), "room", subjects=[{"source":"self", "outfit":"white dress", "state_scope":"story"}]))
+            for _ in range(10):
+                await asyncio.sleep(0)
+                if p._ledger().states: break
+            self.assertTrue(p._ledger().states)
+            reset = FakeEvent(); reset.set_extra("_clean_group_context_session", True)
+            await p.drawing_context_lifecycle(reset)
+            p.lock.release()
+            await task
+            p._call_official.assert_not_awaited()
+            self.assertFalse(p._ledger().states)
+            self.assertEqual(p._jobs[-1]["error_code"], "stale_context")
+        asyncio.run(run())
+
+    def test_reset_during_provider_call_does_not_send_old_image(self):
+        async def run():
+            p = self.make_context_plugin()
+            async def reset_during_call(*args, **kwargs):
+                reset = FakeEvent(); reset.set_extra("_clean_group_context_session", True)
+                await p.drawing_context_lifecycle(reset)
                 return "image.png"
-            p._call_official.side_effect = switch_dialogue
-            await p.novelai_generate_image(
-                self.drawing_event("换装", "switch-during-generation"), "room",
-                subjects='[{"source":"self","appearance_patch":{"remove":["black bodysuit"],"add":["white dress"]}}]',
-            )
-            self.assertFalse(getattr(p, "_appearance_states", {}))
+            p._call_official.side_effect = reset_during_call
+            await p.novelai_generate_image(FakeEvent(), "room", subjects=[{"source":"self", "outfit":"white dress", "state_scope":"story"}])
+            result = p._finish_event.await_args.args[1]
+            self.assertFalse(result.ok); self.assertIsNone(result.path)
+            self.assertFalse(p._ledger().states)
         asyncio.run(run())
 
-    def test_contextual_reference_requires_explicit_model_opt_in(self):
+    def test_main_model_catalog_refreshes_in_reused_prompt(self):
         async def run():
             p = self.make_context_plugin()
-            p._load_reference.return_value = (b"reference", {"image_b64": "abc"})
-            await p.novelai_generate_image(
-                self.drawing_event("画你穿白裙", "no-reference"), "room",
-                subjects='[{"source":"self","appearance_patch":{"remove":["black bodysuit"],"add":["white dress"]}}]',
-            )
+            e = self.drawing_event("换白裙", "story")
+            await p.novelai_generate_image(e, "room", subjects=[{"source":"self", "outfit":"white dress", "state_scope":"story"}])
+            self.persist_turn(p, e)
+            req = SimpleNamespace(system_prompt="Original persona")
+            await p.drawing_identity_context(self.drawing_event("继续", "next"), req)
+            self.assertIn('"current_story_outfit": "white dress"', req.system_prompt)
+            p.context.conversation_manager.get_conversation.return_value.history = "[]"
+            await p.drawing_identity_context(self.drawing_event("新对话", "new"), req)
+            self.assertNotIn('"current_story_outfit": "white dress"', req.system_prompt)
+            self.assertEqual(req.system_prompt.count("[NovelAI drawing identities]"), 1)
+            self.assertTrue(req.system_prompt.startswith("Original persona"))
+        asyncio.run(run())
+
+    def test_contextual_reference_requires_explicit_opt_in(self):
+        async def run():
+            p = self.make_context_plugin()
+            p._load_reference.return_value = (b"reference", {"image_b64":"abc"})
+            await p.novelai_generate_image(FakeEvent(), "room", subjects=[{"source":"self", "outfit":"white dress"}])
             self.assertEqual(p._call_official.await_args.args[1], "generate")
             self.assertIsNone(p._call_official.await_args.args[4])
-            await p.novelai_generate_image(
-                self.drawing_event("以参考图外观画你", "with-reference"), "room",
-                subjects='[{"source":"self","use_reference":true}]',
-            )
+            await p.novelai_generate_image(self.drawing_event("照参考图画", "ref"), "room", subjects=[{"source":"self", "use_reference":True}])
             self.assertEqual(p._call_official.await_args.args[1], "reference")
-            self.assertIsNotNone(p._call_official.await_args.args[4])
         asyncio.run(run())
 
-    def test_contextual_multicharacter_prompt_preserves_each_resolved_outfit(self):
+    def test_multicharacter_outfits_negatives_and_count_slots_are_separate(self):
         async def run():
             p = self.make_context_plugin()
-            p.presets.append({"id": "p2", "name": "Other", "positive_prompt": "red hair, uniform", "negative_prompt": "kimono"})
-            subjects = [
-                {"source": "self", "appearance_patch": {"remove": ["black bodysuit"], "add": ["white dress"]}, "prompt": "smiling"},
-                {"source": "card", "preset_id": "p2", "appearance_patch": {"remove": ["uniform"], "add": ["kimono"], "negative_remove": ["kimono"]}, "prompt": "waving"},
-            ]
-            await p.novelai_generate_image(self.drawing_event("画两人一起散步", "multi"), "2girls, park", subjects=json.dumps(subjects))
-            characters = p._call_official.await_args.kwargs["character_prompts"]
-            self.assertEqual(characters[0]["prompt"], "watercolor, blue eyes, blonde hair, side ponytail, white dress, smiling")
-            self.assertEqual(characters[1]["prompt"], "red hair, kimono, waving")
-            self.assertEqual(characters[1]["negative_prompt"], "")
-            await p.novelai_generate_image(
-                self.drawing_event("继续走", "multi-next"), "2girls, street",
-                subjects='[{"source":"self","prompt":"walking"},{"source":"card","preset_id":"p2","prompt":"walking"}]',
-            )
-            characters = p._call_official.await_args.kwargs["character_prompts"]
-            self.assertIn("white dress", characters[0]["prompt"])
-            self.assertIn("kimono", characters[1]["prompt"])
-            self.assertNotIn("uniform", characters[1]["prompt"])
+            p.presets[0]["positive_prompt"] += ", 1girl, solo"
+            p.presets.append({"id":"p2", "name":"Other", "positive_prompt":"1girl, solo, red hair, uniform", "negative_prompt":"kimono, blue eyes"})
+            await p.novelai_generate_image(FakeEvent(), "2girls, park", subjects=[
+                {"source":"self", "outfit":"white dress", "prompt":"smiling"},
+                {"source":"card", "preset_id":"p2", "outfit":"kimono", "prompt":"waving"}])
+            args = p._call_official.await_args
+            chars = args.kwargs["character_prompts"]
+            self.assertNotIn("white dress", args.args[0])
+            self.assertIn("white dress", chars[0]["prompt"]); self.assertNotIn("kimono", chars[0]["prompt"])
+            self.assertIn("kimono", chars[1]["prompt"]); self.assertNotIn("uniform", chars[1]["prompt"])
+            self.assertEqual(chars[1]["negative_prompt"], "blue eyes")
+            for char in chars:
+                self.assertNotIn("1girl", char["prompt"]); self.assertNotIn("solo", char["prompt"])
+                self.assertIn("girl", char["prompt"])
         asyncio.run(run())
 
-    def test_main_model_receives_initial_anchors_and_last_successful_appearance(self):
+    def test_openai_context_has_no_fixed_outfit_instruction(self):
         async def run():
-            p = self.make_context_plugin()
-            await p.novelai_generate_image(
-                self.drawing_event("换装", "context-first"), "room",
-                subjects='[{"source":"self","appearance_patch":{"remove":["black bodysuit"],"add":["white dress"]}}]',
-            )
-            request = SimpleNamespace(system_prompt="Original persona")
-            await p.drawing_identity_context(FakeEvent(), request)
-            self.assertTrue(request.system_prompt.startswith("Original persona"))
-            self.assertIn("black bodysuit", request.system_prompt)
-            self.assertIn('"current_appearance": {"positive_prompt": "watercolor, blue eyes, blonde hair, side ponytail, white dress"', request.system_prompt)
-            self.assertIn("不是必须还原的每轮制服", request.system_prompt)
-            self.assertIn("appearance_patch", request.system_prompt)
-            self.assertIn("不得重写完整外观", request.system_prompt)
-            self.assertNotIn("anchor_signature", request.system_prompt)
-        asyncio.run(run())
-
-    def test_contextual_openai_does_not_apply_fixed_or_unchanged_outfit_instructions(self):
-        async def run():
-            p = self.make_context_plugin()
-            p.config["provider"] = "openai_compatible"
+            p = self.make_context_plugin(); p.config["provider"] = "openai_compatible"
             p._call_openai = AsyncMock(return_value="image.png")
-            await p.novelai_generate_image(
-                self.drawing_event("继续剧情画你现在的样子", "openai-context"), "room",
-                subjects='[{"source":"self","appearance_patch":{"remove":["black bodysuit"],"add":["white dress"]}}]',
-            )
+            await p.novelai_generate_image(FakeEvent(), "room", subjects=[{"source":"self", "outfit":"white dress"}])
             prompt = p._call_openai.await_args.args[0]
-            self.assertIn("Current character appearance: watercolor, blue eyes, blonde hair, side ponytail, white dress", prompt)
+            self.assertIn("white dress", prompt); self.assertNotIn("black bodysuit", prompt)
             self.assertNotIn("FIXED", prompt)
-            self.assertNotIn("black bodysuit", prompt)
         asyncio.run(run())
 
-    def test_contextual_self_without_bound_card_uses_model_resolved_appearance(self):
+    def test_custom_and_unbound_self_do_not_inherit_default(self):
+        async def run():
+            for source in ("self", "custom"):
+                p = self.make_context_plugin(); p.config["default_preset_id"] = ""
+                await p.novelai_generate_image(FakeEvent(), "room", subjects=[{"source":source, "appearance_prompt":"silver hair, green eyes, white dress", "prompt":"smiling"}])
+                self.assertIn("silver hair", p._call_official.await_args.args[0])
+                self.assertNotIn("black bodysuit", p._call_official.await_args.args[0])
+                self.assertFalse(p._ledger().states)
+        asyncio.run(run())
+
+    def test_one_argument_correction_allowed_but_paid_task_cannot_repeat(self):
+        async def run():
+            p = self.make_context_plugin(); e = FakeEvent()
+            first = await p.novelai_generate_image(e, "room", subjects={"source":"self"})
+            self.assertIn("IMAGE_TOOL_ARGUMENT_ERROR", first)
+            p._call_official.assert_not_awaited()
+            second = await p.novelai_generate_image(e, "room", subjects=[{"source":"self"}])
+            self.assertIn("FINAL_IMAGE_TOOL_RESULT", second)
+            third = await p.novelai_generate_image(e, "room", subjects=[{"source":"self", "outfit":"white dress"}])
+            self.assertIn("ENTRY_GATE_BLOCKED_DUPLICATE", third)
+            p._call_official.assert_awaited_once()
+        asyncio.run(run())
+
+    def test_second_invalid_attempt_stops_correction_loop(self):
+        async def run():
+            p = self.make_context_plugin(); e = FakeEvent()
+            await p.novelai_generate_image(e, "room", subjects={})
+            result = await p.novelai_generate_image(e, "room", subjects={})
+            self.assertIn("FINAL_IMAGE_TOOL_RESULT", result)
+            await p.novelai_generate_image(e, "room", subjects=[])
+            p._call_official.assert_not_awaited()
+        asyncio.run(run())
+
+    def test_legacy_patch_and_misplaced_clothes_rejected_without_state_change(self):
+        async def run(subject, scene):
+            p = self.make_context_plugin()
+            result = await p.novelai_generate_image(FakeEvent(), scene, subjects=[subject])
+            self.assertIn("No image request was sent", result)
+            p._call_official.assert_not_awaited(); self.assertFalse(p._ledger().states)
+        for subject, scene in (({"source":"self", "appearance_patch":{"add":["white dress"]}}, "room"),
+                               ({"source":"self", "prompt":"white dress"}, "room"),
+                               ({"source":"self"}, "white dress, room"),
+                               ({"source":"self", "outfit":"{{white dress"}, "room")):
+            with self.subTest(subject=subject): asyncio.run(run(subject,scene))
+
+    def test_style_override_replaces_only_style_and_keeps_native_weights(self):
         async def run():
             p = self.make_context_plugin()
-            p.config["default_preset_id"] = ""
-            await p.novelai_generate_image(
-                self.drawing_event("按现在的剧情画你", "self-without-card"), "room",
-                subjects='[{"source":"self","appearance_prompt":"silver hair, green eyes, white dress","prompt":"smiling"}]',
-            )
+            p.presets[0]["positive_prompt"] = "{{elf (isekai ojisan)}}, {forehead jewel}, 1.2::green eyes::, black bodysuit, {atelier pontdarc}"
+            await p.novelai_generate_image(FakeEvent(), "room", subjects=[{"source":"self", "outfit":"white dress"}], style="oil painting")
             prompt = p._call_official.await_args.args[0]
-            self.assertIn("silver hair, green eyes, white dress", prompt)
-            self.assertNotIn("black bodysuit", prompt)
-            self.assertFalse(getattr(p, "_appearance_states", {}))
+            for tag in ("{{elf (isekai ojisan)}}", "{forehead jewel}", "1.2::green eyes::", "white dress", "oil painting"):
+                self.assertIn(tag, prompt)
+            self.assertNotIn("atelier pontdarc", prompt); self.assertNotIn("black bodysuit", prompt)
         asyncio.run(run())
 
-    def test_elf_card_and_logged_rewrite_retain_exact_anchors_in_official_payload(self):
+    def test_clothing_actions_are_allowed_without_reintroducing_default_outfit(self):
+        async def run():
+            p = self.make_context_plugin()
+            await p.novelai_generate_image(FakeEvent(), "room", subjects=[
+                {"source":"self", "outfit":"white dress", "prompt":"adjusting dress, smiling"}])
+            prompt = p._call_official.await_args.args[0]
+            self.assertIn("adjusting dress", prompt)
+            self.assertNotIn("black bodysuit", prompt)
+        asyncio.run(run())
+
+    def test_multicharacter_style_override_is_shared_once_including_custom(self):
+        async def run():
+            p = self.make_context_plugin()
+            await p.novelai_generate_image(FakeEvent(), "2girls, park", style="oil painting", subjects=[
+                {"source":"self"}, {"source":"custom", "prompt":"1girl, solo, red hair", "negative_prompt":"blue eyes"}])
+            args = p._call_official.await_args
+            chars = args.kwargs["character_prompts"]
+            self.assertEqual(args.args[0].count("oil painting"), 1)
+            self.assertNotIn("watercolor", str(chars))
+            self.assertNotIn("oil painting", str(chars))
+            self.assertNotIn("1girl", chars[1]["prompt"])
+            self.assertNotIn("solo", chars[1]["prompt"])
+            self.assertEqual(chars[1]["negative_prompt"], "blue eyes")
+        asyncio.run(run())
+
+    def test_oversized_composition_is_rejected_before_anchor_truncation(self):
+        async def run():
+            p = self.make_context_plugin()
+            p.presets[0]["positive_prompt"] = "green eyes, " * 600
+            result = await p.novelai_generate_image(FakeEvent(), "scene " * 1000,
+                subjects=[{"source":"self", "prompt":"smile " * 600}])
+            self.assertIn("No image request was sent", result)
+            p._call_official.assert_not_awaited()
+            self.assertFalse(p._ledger().states)
+        asyncio.run(run())
+
+    def test_story_source_matches_decorated_multimodal_history(self):
+        async def run():
+            p = self.make_context_plugin()
+            event = self.drawing_event("已经换好白裙", "wrapped")
+            request = SimpleNamespace(system_prompt="", prompt="[prefix] 已经换好白裙")
+            await p.drawing_identity_context(event, request)
+            await p.novelai_generate_image(event, "room", subjects=[{"source":"self", "outfit":"white dress", "state_scope":"story"}])
+            p.context.conversation_manager.get_conversation.return_value.history = json.dumps([
+                {"role":"user", "content":[{"type":"text","text":request.prompt},
+                    {"type":"image_url","image_url":{"url":"not-read"}},
+                    {"type":"text","text":"<system_reminder>time</system_reminder>"}]},
+                {"role":"assistant","content":"ok"}])
+            await p.novelai_generate_image(self.drawing_event("继续", "continue-wrapped"), "room", subjects=[{"source":"self"}])
+            self.assertIn("white dress", p._call_official.await_args.args[0])
+        asyncio.run(run())
+
+    def test_concurrent_validation_still_accepts_one_generation(self):
+        async def run():
+            p = self.make_context_plugin()
+            resolver = p._resolve_active_preset
+            async def slow_resolver(*args, **kwargs):
+                await asyncio.sleep(0)
+                return await resolver(*args, **kwargs)
+            p._resolve_active_preset = slow_resolver
+            event = FakeEvent()
+            results = await asyncio.gather(*[p.novelai_generate_image(event,"room",subjects=[{"source":"self"}]) for _ in range(2)])
+            self.assertTrue(any("ENTRY_GATE_BLOCKED_DUPLICATE" in value for value in results))
+            p._call_official.assert_awaited_once()
+        asyncio.run(run())
+
+    def test_reference_snapshot_omits_image_bytes_and_keeps_reference_settings(self):
+        async def run():
+            p = self.make_context_plugin()
+            p._load_reference.return_value = (b"secret image bytes", {"image_b64":"secret-base64"})
+            await p.novelai_generate_image(FakeEvent(), "room", subjects=[{"source":"self", "use_reference":True}])
+            snapshot = p._request_snapshots[FakeEvent.unified_msg_origin]
+            self.assertTrue(snapshot["uses_reference"])
+            self.assertIn("director_reference_strength_values", snapshot["parameters"])
+            self.assertNotIn("secret-base64", json.dumps(snapshot))
+            reset = FakeEvent(); reset.set_extra("_clean_group_context_session", True)
+            await p.drawing_context_lifecycle(reset)
+            self.assertFalse(p._request_snapshots)
+        asyncio.run(run())
+
+    def test_elf_user_card_and_legacy_rewrite_serialize_exact_anchors(self):
         anchor = """{{elf (isekai ojisan)}}, 1girl, solo, slender body, cute proportions,
 pale blonde hair, orange hair tips, high side ponytail, red hair tie,
 horizontal pointed ears, emerald green eyes, light-colored eyelashes, {forehead jewel},
@@ -268,149 +464,44 @@ sleeveless black bodysuit, yellow split skirt, red boots,
 light novel cover style, visual novel cg, anime screencap, {atelier pontdarc},
 vibrant colors, vivid lighting, soft lineart, subtle shadows, delicate highlights, glossy highlights,
 flat cell shading, clean lineart, masterpiece, best quality"""
-        negative = (
-            "{text}, {subtitles}, {watermark}, {logo}, {signature}, {username}, artist name, "
-            "scanlines, banding, chromatic aberration, artifacts, pixelated, moire, JPEG artifacts, "
-            "barcode, monochrome, greyscale, blurry, {bad anatomy}, {bad hands}, error, worst quality, low quality"
-        )
-        logged_rewrite = (
-            "1girl, solo, slender body, cute proportions, pale blonde hair with orange hair tips, "
-            "high side ponytail, red hair tie, horizontal pointed ears, emerald green eyes, light-colored eyelashes, "
-            "red gem on forehead, sleeveless black bodysuit, light yellow short skirt, red boots, red gem on forehead, "
-            "light novel cover style, visual novel cg, anime screencap, atelier style, vibrant colors, vivid lighting, "
-            "soft lineart, subtle shadows, delicate highlights, glossy highlights, flat cell shading, clean lineart, masterpiece, best quality"
-        )
-        async def run(legacy):
-            p = self.make_context_plugin()
-            p.presets[0].update(positive_prompt=anchor, negative_prompt=negative)
-            p.config["api_token"] = "test-token"
-            # Exercise the actual provider serializer, intercepting only HTTP.
+        negative = "{text}, {subtitles}, {watermark}, {logo}, {signature}, {username}, artist name, scanlines, banding, chromatic aberration, artifacts, pixelated, moire, JPEG artifacts, barcode, monochrome, greyscale, blurry, {bad anatomy}, {bad hands}, error, worst quality, low quality"
+        async def run():
+            p = self.make_context_plugin(); p.presets[0].update(positive_prompt=anchor,negative_prompt=negative)
+            p.config["api_token"] = "test-secret-token"
             del p._call_official
             p._post_image_request = AsyncMock(return_value="image.png")
-            subject = {"source": "self", "prompt": "cute expression, standing gracefully", "use_reference": False}
-            if legacy:
-                subject.update(appearance_prompt=logged_rewrite, negative_prompt="")
-            scene = "cute full body portrait, standing elegantly, slight smile"
-            await p.novelai_generate_image(
-                self.drawing_event("宝宝，画一张你现在的样子", "elf-first"), scene, subjects=json.dumps([subject]),
-            )
+            await p.novelai_generate_image(FakeEvent(), "full body, room", subjects=[{"source":"self", "appearance_prompt":"light yellow short skirt, atelier style", "negative_prompt":"", "prompt":"smiling"}])
             payload = p._post_image_request.await_args.args[2]
-            expected = anchor + ", " + scene + ", " + subject["prompt"]
-            self.assertEqual(payload["input"], expected)
-            self.assertEqual(payload["parameters"]["v4_prompt"]["caption"]["base_caption"], expected)
-            for tag in p._appearance_tags(negative):
-                self.assertIn(tag, payload["parameters"]["negative_prompt"])
-            self.assertNotIn("light yellow short skirt", expected)
-            state = p._current_appearance((FakeEvent.unified_msg_origin, "conversation-1"), p.presets[0])
-            self.assertEqual(state["positive_prompt"], anchor)
-            self.assertEqual(state["negative_prompt"], negative)
-        for legacy in (False, True):
-            with self.subTest(legacy_full_rewrite=legacy):
-                asyncio.run(run(legacy))
-
-    def test_weighted_identity_style_and_negative_groups_survive_targeted_edits(self):
-        async def run():
-            p = self.make_context_plugin()
-            identity = "{{elf (isekai ojisan)}}"
-            retained = identity + ", {atelier pontdarc}, 1.2::pale blonde hair, orange hair tips::"
-            p.presets[0].update(
-                positive_prompt=retained + ", {forehead jewel}, {{yellow split skirt, red boots}}",
-                negative_prompt="{text, watermark}, {bad anatomy}, [white dress]",
-            )
-            await p.novelai_generate_image(
-                self.drawing_event("换成白裙，摘掉额头饰品", "weighted-edit"), "room",
-                subjects=json.dumps([{"source": "self", "appearance_patch": {
-                    "remove": ["{{yellow split skirt, red boots}}", "{forehead jewel}"],
-                    "add": ["white dress", "white dress"],
-                    "negative_remove": ["[white dress]"], "negative_add": ["forehead jewel"],
-                }}]),
-            )
-            args = p._call_official.await_args.args
-            self.assertEqual(args[0], retained + ", white dress, room")
-            self.assertEqual(args[5], "{text, watermark}, {bad anatomy}, forehead jewel")
-            self.assertEqual(args[0].count("white dress"), 1)
+            for tag in ("{{elf (isekai ojisan)}}", "{atelier pontdarc}", "yellow split skirt", "{forehead jewel}"):
+                self.assertIn(tag, payload["input"])
+            self.assertNotIn("light yellow short skirt", payload["input"])
+            self.assertNotIn("在此填入", payload["input"])
+            for tag in drawing.tags(negative): self.assertIn(tag, payload["parameters"]["negative_prompt"])
+            snapshot = p._request_snapshots[FakeEvent.unified_msg_origin]
+            self.assertEqual(snapshot["prompt"], payload["input"])
+            self.assertEqual(snapshot["parameters"], payload["parameters"])
+            self.assertNotIn("test-secret-token", json.dumps(snapshot))
+            self.assertNotIn("image_b64", json.dumps(snapshot))
         asyncio.run(run())
 
-    def test_legacy_full_rewrite_cannot_reset_cached_outfit_or_clear_card_negatives(self):
-        async def run():
-            p = self.make_context_plugin()
-            await p.novelai_generate_image(
-                self.drawing_event("换白裙", "patch-before-legacy"), "room",
-                subjects='[{"source":"self","appearance_patch":{"remove":["black bodysuit"],"add":["white dress"]}}]',
-            )
-            await p.novelai_generate_image(
-                self.drawing_event("继续画你", "legacy-after-patch"), "window",
-                subjects=json.dumps([{"source": "self", "appearance_prompt": p.presets[0]["positive_prompt"], "negative_prompt": ""}]),
-            )
-            args = p._call_official.await_args.args
-            self.assertIn("white dress", args[0])
-            self.assertNotIn("black bodysuit", args[0])
-            self.assertEqual(args[5], "extra arms")
-        asyncio.run(run())
-
-    def test_targeted_changes_and_full_reset_use_current_state_without_mutating_card(self):
-        async def run():
-            p = self.make_context_plugin()
-            original = json.dumps(p.presets)
-            for message_id, changes in (
-                ("outfit-eyes", {"remove": ["black bodysuit", "blue eyes"], "add": ["white dress", "red eyes"]}),
-                ("only-restore-outfit", {"remove": ["white dress"], "add": ["black bodysuit"]}),
-                ("full-reset", {"reset": True}),
-            ):
-                await p.novelai_generate_image(
-                    self.drawing_event(message_id, message_id), "room",
-                    subjects=json.dumps([{"source": "self", "appearance_patch": changes}]),
-                )
-                prompt = p._call_official.await_args.args[0]
-                if message_id != "full-reset":
-                    self.assertIn("red eyes", prompt)
-                    self.assertNotIn("blue eyes", prompt)
-                else:
-                    self.assertIn(p.presets[0]["positive_prompt"], prompt)
-                    self.assertNotIn("red eyes", prompt)
-            self.assertEqual(json.dumps(p.presets), original)
-        asyncio.run(run())
-
-    def test_invalid_appearance_patches_never_send_or_update_state(self):
-        async def run(patch_value, bound=True, contextual=True):
-            p = self.make_context_plugin()
-            if not bound:
-                p.config["default_preset_id"] = ""
-            if not contextual:
-                p.config["llm_card_mode"] = "strict"
-            p._notify = AsyncMock()
-            result = await p.novelai_generate_image(
-                self.drawing_event("画一张", "invalid-patch"), "room",
-                subjects=json.dumps([{"source": "self", "appearance_patch": patch_value}]),
-            )
-            self.assertIn("No image request was sent", result)
-            p._call_official.assert_not_awaited()
-            self.assertFalse(getattr(p, "_appearance_states", {}))
-        for value in (
-            None, [], {"replace": "dress"}, {"reset": "true"}, {"add": "white dress"},
-            {"add": [None]}, {"remove": [""]}, {"remove": ["bodysuit"]},
-            {"remove": ["{black bodysuit}"]}, {"add": ["white dress, red eyes"]},
-            {"add": ["{{white dress}"]}, {"add": ["1.2::white dress"]},
-            {"negative_remove": ["white dress"]}, {"add": ["x"] * 257}, {"negative_add": ["x" * 4001]},
-        ):
-            with self.subTest(patch_value=value):
-                asyncio.run(run(value))
-        asyncio.run(run({}, bound=False))
-        asyncio.run(run({}, contextual=False))
-
-    def test_appearance_patch_cannot_overflow_prompt_and_truncate_anchor_tags(self):
-        async def run():
-            p = self.make_context_plugin()
-            p.presets[0]["positive_prompt"] = "{{elf (isekai ojisan)}}, " + "x" * 7900
-            p._notify = AsyncMock()
-            result = await p.novelai_generate_image(
-                self.drawing_event("画一张", "overflow-patch"), "room",
-                subjects=json.dumps([{"source": "self", "appearance_patch": {"add": ["y" * 200]}}]),
-            )
-            self.assertIn("No image request was sent", result)
-            p._call_official.assert_not_awaited()
-            self.assertFalse(getattr(p, "_appearance_states", {}))
-        asyncio.run(run())
+    def test_layer_migration_is_lossless_backed_up_and_idempotent(self):
+        p = self.make_plugin(); p.presets_path = p.temp_dir / "presets.json"
+        original = [{"id":"p1", "name":"Elf", "positive_prompt":"{{elf (isekai ojisan)}}, {yellow split skirt, red boots}, 1.2::green eyes, white dress::, {atelier pontdarc}", "negative_prompt":"{bad hands}"}]
+        p.presets_path.write_text(json.dumps(original),encoding="utf-8")
+        p.presets = p._load_presets(); p._save_presets()
+        migrated = p.presets[0]
+        self.assertEqual(migrated["migration_original_prompt"], original[0]["positive_prompt"])
+        self.assertEqual(migrated["default_outfit_prompt"], "{yellow split skirt, red boots}")
+        self.assertIn("1.2::green eyes, white dress::", migrated["identity_prompt"])
+        self.assertTrue(migrated["layers_need_review"]); self.assertTrue(migrated["migration_notes"])
+        self.assertEqual(json.loads((p.temp_dir/"presets.before-layers.json").read_text()), original)
+        p._preset_schema_migrated = False
+        self.assertEqual(p._load_presets(), p.presets)
+        self.assertFalse(p._preset_schema_migrated)
+        edited = p._normalize_preset_fields({"layers_version":1,"identity_prompt":"{{elf (isekai ojisan)}}, green eyes", "default_outfit_prompt":"white dress", "style_prompt":"{atelier pontdarc}"}, migrated)
+        self.assertFalse(edited["layers_need_review"])
+        self.assertEqual(edited["migration_original_prompt"], migrated["migration_original_prompt"])
+        self.assertEqual(edited["positive_prompt"], "{{elf (isekai ojisan)}}, green eyes, white dress, {atelier pontdarc}")
 
     def test_official_reference_payload(self):
         p = self.make_plugin(); p.config["default_preset_id"] = "p1"
@@ -610,7 +701,7 @@ flat cell shading, clean lineart, masterpiece, best quality"""
         self.assertEqual(migrated["negative_prompt"], "pink hair")
         self.assertTrue(migrated["lock_positive"])
         self.assertEqual(migrated["positive_strength"], 1.35)
-        self.assertNotIn("style_prompt", migrated)
+        self.assertEqual(migrated["style_prompt"], "watercolor")
         self.assertNotIn("character_prompt", migrated)
         self.assertTrue(p._preset_schema_migrated)
 
@@ -885,7 +976,8 @@ flat cell shading, clean lineart, masterpiece, best quality"""
         tool = next(item for item in llm_tools.func_list if item.name == "novelai_generate_image")
         prompt_schema = tool.parameters.get("properties", {}).get("prompt", {})
         self.assertEqual(prompt_schema.get("type"), "string")
-        self.assertEqual(tool.parameters["properties"]["subjects"]["type"], "string")
+        self.assertEqual(tool.parameters["properties"]["subjects"]["type"], "array")
+        self.assertEqual(tool.parameters["properties"]["subjects"]["items"]["properties"]["state_scope"]["enum"], ["image", "story"])
 
         async def run():
             p = self.make_plugin()
@@ -1057,6 +1149,8 @@ flat cell shading, clean lineart, masterpiece, best quality"""
             '[{"source":"card","preset_id":"missing"}]', '[{"source":"self","preset_id":"p1"}]',
             '[{"source":"self","appearance_prompt":""}]', '[{"source":"self","appearance_prompt":null}]',
             '[{"source":"self","negative_prompt":false}]', '[{"source":"self","use_reference":"false"}]',
+            '[{"source":"self","state_scope":[]}]', '[{"source":"self","reset":true}]',
+            '[{"source":"self","outfit_prompt":"white dress"}]',
             json.dumps([{"source": "custom", "prompt": "person"}] * 7),
         ):
             with self.subTest(subjects=subjects):

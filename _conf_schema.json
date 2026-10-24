@@ -1,7 +1,7 @@
 {
   "config_version": {
     "type": "int",
-    "default": 6,
+    "default": 7,
     "invisible": true
   },
   "provider": {
@@ -342,7 +342,7 @@
     "type": "string",
     "default": "context",
     "options": ["context", "strict"],
-    "hint": "context：原样保留角色卡标签与权重，由主模型用增删补丁调整剧情变化；未改变的角色名、画师、服饰和负面词不被重写。成功生图后按会话和当前对话延续外观，避免换装回退。strict：保留旧版固定特征过滤与本轮覆盖规则。仅影响普通 LLM 生图。"
+    "hint": "context：身份、默认完整服饰、画风分层保存。主模型用 outfit 整体替换服饰，默认仅本图；剧情实际换装才 state_scope=story。剧情服饰须由当前聊天历史验证，清空或切换对话后失效。strict：保留旧版过滤和本轮覆盖，仅在 prompt 描述修改。只影响普通 LLM 生图。"
   },
   "llm_auto_reference": {
     "description": "LLM 自动应用角色卡绑定参考图",
