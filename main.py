@@ -41,7 +41,7 @@ else:  # Standalone test discovery.
     import drawing
 
 PLUGIN_NAME = "astrbot_plugin_novelai_painter"
-VERSION = "2.7.0"
+VERSION = "2.7.1"
 STICKER_EMOTION_TOOL_NAME = "novelai_set_emotion"
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 MAX_RESPONSE_BYTES = 48 * 1024 * 1024
@@ -1005,15 +1005,13 @@ class NovelAIPainterPlugin(Star):
                         raise ValueError(f"{field} 必须是不超过 {limit} 字符的字符串。")
                     subject[field] = item[field].strip()
             if "appearance_prompt" in subject and not subject["appearance_prompt"]:
-                raise ValueError("appearance_prompt 不能是空字符串；有卡时请省略它。")
+                subject.pop("appearance_prompt")
             if "use_reference" in item and not isinstance(item["use_reference"], bool):
                 raise ValueError("use_reference 必须为布尔值。")
             subject["use_reference"] = item.get("use_reference", False)
             subject["state_scope"] = item.get("state_scope", "image")
             if not isinstance(subject["state_scope"], str) or subject["state_scope"] not in {"image", "story"}:
                 raise ValueError("state_scope 只能为 image（仅本图）或 story（剧情已换装）。")
-            if source == "custom" and not subject["prompt"]:
-                raise ValueError("source=custom 需用 prompt 提供角色名和外貌。")
             if "outfit" in subject:
                 drawing.tags(subject["outfit"], validate=True)
             resolved.append(subject)
@@ -1061,17 +1059,8 @@ class NovelAIPainterPlugin(Star):
         current = await self._story_view(event)
         return bool(current and current.scope == expected.scope and current.epoch == expected.epoch)
 
-    @staticmethod
-    def _validate_scene_field(prompt: str, field: str) -> None:
-        # A protocol guard, not a wardrobe resolver: do not silently append an
-        # obvious garment/style description through an action/scene field.
-        for tag in drawing.tags(prompt):
-            if re.search(r"\b(holding|carrying|shop|store|wardrobe|lift|lifting|pull|pulling|adjusting|tugging|unbuttoning|unzipping)\b", tag, re.I):
-                continue
-            if drawing.OUTFIT_TAG.search(tag.replace("_", " ")):
-                raise ValueError(f"{field} 含服饰标签，请移到对应角色的 outfit 完整服饰字段；动作和场景不能重复拼接衣服。")
-
-    def _apply_story_layers(self, subjects: list[dict], view: drawing.StoryView | None, operation: str, style: str | None) -> None:
+    def _apply_story_layers(self, subjects: list[dict], view: drawing.StoryView | None, operation: str, style: str | None, scene_prompt: str = "") -> None:
+        scene_outfit = drawing.inline_outfit_tags(scene_prompt)
         for subject in subjects:
             original = subject["preset"]
             if not original:
@@ -1084,15 +1073,26 @@ class NovelAIPainterPlugin(Star):
                 continue
             card = drawing.card_layers(original)
             current = self._ledger().current(view, card)
-            outfit = subject.get("outfit", current.get("outfit", card["default_outfit_prompt"]))
-            outfit_source = "request" if "outfit" in subject else "story" if current else "default"
-            self._validate_scene_field(subject["prompt"], "subjects[].prompt")
+            inline_outfit = drawing.inline_outfit_tags(subject["prompt"])
+            if "outfit" in subject:
+                outfit = resolved_outfit = subject["outfit"]
+                outfit_source = "request"
+            elif inline_outfit or scene_outfit:
+                # The caption is already authoritative for this image. Leave
+                # it intact; do not also append the card/cached wardrobe. A
+                # shared caption is never copied into every character slot.
+                outfit = ""
+                resolved_outfit = drawing.join(*(inline_outfit or scene_outfit))
+                outfit_source = "subject_prompt" if inline_outfit else "shared_prompt"
+            else:
+                outfit = resolved_outfit = current.get("outfit", card["default_outfit_prompt"])
+                outfit_source = "story" if current else "default"
             positive = drawing.join(card["identity_prompt"], outfit, card["style_prompt"] if style is None else "")
             if len(positive) > 8000:
                 raise ValueError("角色各层合成超过 8000 字符。")
             # Remove only exact outfit prohibitions; keep every unrelated card
             # negative. Identity/style is never rewritten by the main model.
-            outfit_tags = {tag.strip("{}[] ").casefold() for tag in drawing.tags(outfit)}
+            outfit_tags = {tag.strip("{}[] ").casefold() for tag in drawing.tags(resolved_outfit)}
             negative = drawing.join(*(tag for tag in drawing.tags(card.get("negative_prompt", ""))
                 if tag.strip("{}[] ").casefold() not in outfit_tags))
             effective = {**card, "positive_prompt": positive, "negative_prompt": negative, "_contextual_appearance": True}
@@ -1101,7 +1101,7 @@ class NovelAIPainterPlugin(Star):
                 effective["reference_id"] = ""
             subject["preset"] = effective
             subject["story_card"] = card
-            subject["resolved_outfit"] = outfit
+            subject["resolved_outfit"] = resolved_outfit
             subject["outfit_source"] = outfit_source
             subject["ignored_legacy_fields"] = [key for key in ("appearance_prompt", "negative_prompt") if key in subject]
 
@@ -1110,6 +1110,10 @@ class NovelAIPainterPlugin(Star):
         shared_style_change = "style" in self._requested_change_categories(event, scene_prompt)
         for subject in subjects:
             detail = subject["prompt"]
+            if not detail and not subject["preset"].get("positive_prompt") and not subject["preset"].get("negative_prompt"):
+                # Empty custom entries can accompany a complete shared
+                # caption. Do not invent people or emit empty character slots.
+                continue
             positive, preset_id, negative = self._compose_prompt(detail, preset_override=subject["preset"],
                 request_text=detail + (", art style" if shared_style_change else ""))
             if self._contextual_cards_enabled():
@@ -1153,10 +1157,10 @@ class NovelAIPainterPlugin(Star):
                 "has_reference": bool(card.get("reference_id"))})
         rules = (
             "聊天人设与绘画对象分开。subjects 是原生数组，不是 JSON 字符串。画自己 source=self，画指定卡 source=card 配 preset_id，"
-            "其他角色 source=custom 用自己的 prompt 写准确角色名与外貌，无需建卡；多人每人一项，绝不合并所有卡。无卡场景用 []。"
-            "默认剧情模式：身份锚点与精确角色名、画师名、权重由插件保留，不要重写。prompt 写共享场景/人数/构图/光线，"
-            "绑定卡的 subjects[].prompt 仅写动作表情，服饰只能写 outfit。outfit 是完整当前服饰（含鞋和配饰），整体替换，绝不增量追加。"
-            "根据最新明确要求和当前可见剧情判断衣服；省略 outfit 时沿用经当前历史验证的剧情服饰，否则用默认服饰。"
+            "其他角色 source=custom，可用自己的 prompt 或 appearance_prompt 写角色名与外貌，无需建卡。完整描述已在顶层时不必重复。多人建议每人一项，绝不合并所有卡；无卡场景用 []。"
+            "默认剧情模式：身份锚点与精确角色名、画师名、权重由插件保留，不要重写。顶层 prompt 可写完整画面，也可只写共享场景/人数/构图/光线。"
+            "subjects[].prompt 可写该人物的动作、表情和服饰。换装推荐 outfit 写完整当前服饰（含鞋和配饰），整体替换。普通 prompt 提到服饰不会报错，也不会再补另一套默认服饰。"
+            "根据最新明确要求和当前可见剧情判断衣服；未提供服饰描述时才沿用经当前历史验证的剧情服饰或默认服饰。多人服饰尽量写在各自项，避免共享描述归属不清。"
             "state_scope=image 默认只改本图，画图设想不等于剧情已换装；只有剧情实际换装才用 story，保存的也只有服饰而非整张图片提示词。"
             "剧情早已换装但未绘图/插件重载时，可按当前聊天提交完整 outfit 并设 story，不要恢复默认衣服。"
             "新对话或清空历史不继承旧剧情。明确没有衣服用 outfit 空串。更改画风用顶层 style 完整替换，省略保留精确原画风。"
@@ -2265,10 +2269,10 @@ class NovelAIPainterPlugin(Star):
         """仅在用户明确要求生成、绘制或修改图片时调用；每条用户消息最多生成并发送一张图片。先区分绘画对象与当前聊天人设；角色卡只用于选中的绘画角色，绝不默认合并到其他角色。已知角色无需提前建卡。图片发送后停止调用工具，用当前聊天人设简短回复。
 
         Args:
-            prompt(string): 共享场景、构图、人数和光线，优先使用英文 NovelAI / Danbooru Tag。绑定卡的服饰写在各自 outfit，动作表情写在各自 prompt。已知无卡角色用 custom，风景用 subjects=[]。
+            prompt(string): 完整画面描述，或共享场景、构图、人数和光线；允许包含人物与服饰，优先使用英文 NovelAI / Danbooru Tag。换装推荐各自 outfit。无卡角色用 custom，风景用 subjects=[]。
             operation(string): generate、img2img 或 reference。普通生图用 generate；剧情锚点模式仅在 use_reference=true 时自动使用选中卡参考图。用户明确要求基于参考图修改时可用 img2img/reference；多人图用 generate。
             reference_type(string): reference 模式用 character、style 或 both；省略时继承本次选中卡的参考类型。
-            subjects(list[object]): 原生角色数组，每人一项，最多 6 人。source=self 画 AI 自己；card 配 preset_id 选择卡；custom 用 prompt 写角色名外貌。绑定卡身份和画风由插件保留；outfit 是完整服饰，整体替换，空串明确无服饰。state_scope 默认 image 仅本图，剧情实际换装才用 story。省略 outfit 沿用当前剧情服饰或默认服饰。use_reference 默认 false。不要使用 appearance_patch 或重写绑定卡的 appearance_prompt。
+            subjects(list[object]): 原生角色数组，每人一项，最多 6 人。source=self 画 AI 自己；card 配 preset_id 选择卡；custom 可用 prompt 或 appearance_prompt 写角色名外貌，完整描述已在顶层时可省略。人物 prompt 可含服饰。绑定卡身份和画风由插件保留；outfit 是完整服饰，整体替换，空串明确无服饰。state_scope 默认 image 仅本图，剧情实际换装才用 story。省略 outfit 时尊重本次普通描述中的服饰；未描述服饰才沿用当前剧情服饰或默认服饰。use_reference 默认 false。不要使用 appearance_patch 或重写绑定卡的 appearance_prompt。
             style(string): 可选，本图完整画风，替换原卡画风；省略保留原始画师名及权重。
         """
         if not self._mode_allows("llm_tool"):
@@ -2329,9 +2333,7 @@ class NovelAIPainterPlugin(Star):
                 requested_view = event.get_extra("nai_story_view")
                 if requested_view and (not view or requested_view.scope != view.scope or requested_view.epoch != view.epoch):
                     raise ValueError("绘图期间对话已切换或清空，请在当前对话重新请求。")
-                if any(s["preset"] for s in drawing_subjects):
-                    self._validate_scene_field(normalized_prompt, "prompt")
-                self._apply_story_layers(drawing_subjects, view, operation, style)
+                self._apply_story_layers(drawing_subjects, view, operation, style, normalized_prompt)
             for subject in drawing_subjects:
                 combined = drawing.join(subject["preset"].get("positive_prompt", ""), subject["prompt"],
                     normalized_prompt if len(drawing_subjects) == 1 else "",

@@ -77,6 +77,25 @@ def character_slot(prompt: str) -> str:
     return join(*result)
 
 
+def inline_outfit_tags(prompt: str) -> list[str]:
+    """A soft fallback for ordinary captions, never a validation requirement.
+
+    Keep the original caption in place. Detecting clothing only prevents us
+    from adding a second, fallback wardrobe; it cannot establish story state
+    or assign an unscoped garment to a particular character.
+    """
+    result = []
+    for tag in tags(prompt):
+        words = tag.replace("_", " ")
+        if not OUTFIT_TAG.search(words):
+            continue
+        worn = re.search(r"\b(wearing|dressed|clad)\b", words, re.I)
+        if not worn and re.search(r"\b(holding|carrying|shop|store|wardrobe|lift|lifting|pulling|adjusting|tugging|unbuttoning|unzipping)\b", words, re.I):
+            continue
+        result.append(tag)
+    return result
+
+
 def card_layers(card: dict) -> dict:
     """Migrate once, preserve original input and flag all legacy splits for review.
 
@@ -211,7 +230,7 @@ SUBJECT_SCHEMA = {
     "properties": {
         "source": {"type": "string", "enum": ["self", "card", "custom"]},
         "preset_id": {"type": "string", "description": "source=card 的角色卡 ID 或完整名称。"},
-        "prompt": {"type": "string", "description": "绑定卡仅写动作表情；custom 写角色名和完整外貌。"},
+        "prompt": {"type": "string", "description": "该人物的描述，可含动作、表情、服饰。custom 可写角色名或外貌；完整描述已在 appearance_prompt 或顶层 prompt 时可省略。"},
         "outfit": {"type": "string", "description": "完整当前服饰（含鞋、配饰），整体替换；空串明确无服饰。省略沿用当前剧情服饰或默认值。"},
         "state_scope": {"type": "string", "enum": ["image", "story"], "description": "默认 image 只影响本图；剧情实际换装才用 story。"},
         "use_reference": {"type": "boolean", "description": "仅参考图符合当前服饰时为 true，默认 false。"},
@@ -223,7 +242,7 @@ SUBJECT_SCHEMA = {
 TOOL_PARAMETERS = {
     "type": "object", "additionalProperties": False,
     "properties": {
-        "prompt": {"type": "string", "description": "共享场景、人数、构图和光线；绑定卡的服饰仅放 subjects[].outfit。"},
+        "prompt": {"type": "string", "description": "完整画面描述，或共享场景、人数、构图和光线。允许服饰和人物叙述；多人建议各自描述放 subjects，换装推荐 outfit。"},
         "subjects": {"type": "array", "items": SUBJECT_SCHEMA, "maxItems": 6, "description": "原生 JSON 角色数组，绝不再编码成字符串。self/card/custom 分别指定人物，空数组画无卡场景。"},
         "operation": {"type": "string", "enum": ["generate", "img2img", "reference"]},
         "reference_type": {"type": "string", "enum": ["character", "style", "both"]},
