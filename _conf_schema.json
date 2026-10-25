@@ -22,7 +22,25 @@
     "description": "独立绘图 LLM Provider ID（留空关闭）",
     "type": "string",
     "default": "",
-    "hint": "填写已在 AstrBot 配置的聊天模型 Provider ID。主模型只需提交绘图意图，回复发送后由此模型理解用户原文、当前回复与上下文并写 Tag；/n 也会调用它。"
+    "hint": "填写已在 AstrBot 配置的聊天模型 Provider ID。暗号触发时不依赖主模型转交意图，正常回复后由此模型理解用户原文、回复与同一会话上下文；/n 只由此模型出图。主模型仍可通过工具委托绘图。"
+  },
+  "drawing_trigger": {
+    "description": "图文双线暗号（留空关闭）", "type": "string", "default": "n",
+    "hint": "放在消息首尾或单独发送，触发主模型正常回复和独立绘图，不依赖主模型传 Tag。可与中文相连，英文单词中的 n 不触发；最多 16 字符。"
+  },
+  "drawing_llm_output_mode": {
+    "description": "绘图 LLM 输出协议", "type": "string", "default": "auto",
+    "options": ["auto", "tool", "json"],
+    "labels": {"auto": "自动（OpenAI 兼容优先参数工具）", "tool": "内部参数提交工具", "json": "JSON 文本"},
+    "hint": "内部 submit_drawing_plan 只收参数，由插件校验后生图，不执行其他工具。兼容接口不支持工具时可选 JSON 文本。"
+  },
+  "drawing_llm_format_retry": {
+    "description": "格式或字段错误时纠正一次", "type": "bool", "default": true,
+    "hint": "把错误和前一次输出反馈给绘图 LLM，最多再调用一次；验证通过前不请求图片服务。拒绝、超时和网络失败不自动重试。"
+  },
+  "drawing_llm_debug": {
+    "description": "记录绘图 LLM 回包预览", "type": "bool", "default": false,
+    "hint": "排查时开启，在日志与请求快照显示最多 2000 字符的返回内容，可能包含画面描述。默认只记录协议、次数、长度和错误类型。"
   },
   "drawing_llm_context_messages": {
     "description": "绘图 LLM 读取的最近对话消息数",
@@ -34,7 +52,7 @@
     "description": "绘图 LLM 超时（秒）",
     "type": "int",
     "default": 60,
-    "hint": "5-180 秒。每张图仅请求一次，不自动切回主模型或重试规划。"
+    "hint": "5-180 秒，每次规划调用的超时。启用格式纠正时最多两次；不自动切回主模型。"
   },
   "drawing_llm_use_images": {
     "description": "允许绘图 LLM 读取本轮附图与上一张成图",
@@ -139,7 +157,7 @@
     "description": "固定命令名",
     "type": "string",
     "default": "nai",
-    "hint": "只填写管理命令名，不含斜杠，默认 /nai。/n 固定用于直接出图；旧配置若为 n，管理命令使用 /nai。"
+    "hint": "只填写管理命令名，不含斜杠，默认 /nai。/n 固定由独立绘图 LLM 理解自然语言；/nai <Tag> 直接出图。旧配置若为 n，管理命令使用 /nai。"
   },
   "invoke_mode": {
     "description": "入口模式",
@@ -214,7 +232,7 @@
     "default": true
   },
   "legacy_command_enabled": {
-    "description": "兼容 /nai <描述>",
+    "description": "启用 /nai <Tag> 直接入口",
     "type": "bool",
     "default": true
   },

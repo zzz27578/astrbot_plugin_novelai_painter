@@ -54,13 +54,17 @@
       </div>
       <div class="capability" id="capability"></div>
       <div class="divider"></div>
-      <div class="section-head compact"><div><span class="kicker">DRAWING LLM</span><h3>独立绘图 LLM</h3><p>主模型正常聊天，收到绘图工具请求后，在本轮回复发送完成时由独立模型编写画面。留空则保持原有流程。</p></div></div>
+      <div class="section-head compact"><div><span class="kicker">DRAWING LLM</span><h3>独立绘图 LLM</h3><p>暗号触发图文双线，/n 只出图；均直接读取当前会话。主模型也可通过工具转交绘图意图。Provider 留空时仅保留直接 Tag 与主模型工具入口。</p></div></div>
       <div class="grid two">
         <label class="field"><span>绘图 LLM Provider ID</span><input data-config="drawing_llm_provider_id" type="text" list="drawing-provider-options" maxlength="200" placeholder="留空关闭；选择 AstrBot 中已配置的模型" /><datalist id="drawing-provider-options"></datalist><small>使用 AstrBot 的聊天模型 Provider ID；这里不是 NovelAI 图片模型 ID。</small></label>
+        <label class="field"><span>图文双线暗号</span><input data-config="drawing_trigger" type="text" maxlength="16" placeholder="n；留空关闭" /><small>单独发送或放在消息首尾，如 n画窗前的你。主模型正常回复，随后绘图 LLM 独立出图；不依赖主模型写 Tag。</small></label>
+        <label class="field"><span>绘图输出协议</span><select data-config="drawing_llm_output_mode"><option value="auto">自动（兼容接口优先参数工具）</option><option value="tool">内部参数提交工具</option><option value="json">JSON 文本</option></select><small>适配 OpenAI 兼容 /v1 服务。工具只提交方案，插件校验后统一生图；不支持工具时选择 JSON 文本。</small></label>
         <label class="field"><span>最近对话消息数</span><input data-config="drawing_llm_context_messages" type="number" min="0" max="30" /><small>默认 12 条，每条最多 2000 字符。用户本轮原文和主模型完整回复另行提供，避免转述丢失改图需求。</small></label>
-        <label class="field"><span>绘图规划超时（秒）</span><input data-config="drawing_llm_timeout" type="number" min="5" max="180" /><small>每张图规划一次；失败时给出提示，不自动切回主模型。</small></label>
+        <label class="field"><span>每次规划超时（秒）</span><input data-config="drawing_llm_timeout" type="number" min="5" max="180" /><small>格式纠正最多追加一次 LLM 调用；图片服务在参数通过前不会收到请求。</small></label>
+        <label class="switch-row"><input data-config="drawing_llm_format_retry" type="checkbox" /><span><b>格式错误纠正一次</b><small>清理包装后仍无效，将具体错误反馈给绘图 LLM。拒绝、超时和网络错误停止，不自动重试。</small></span></label>
+        <label class="switch-row"><input data-config="drawing_llm_debug" type="checkbox" /><span><b>记录绘图回包预览</b><small>排查时开启，日志和任务快照显示最多 2000 字符的返回内容，可能包含画面描述。默认仅记录错误类型、长度与次数。</small></span></label>
         <label class="switch-row"><input data-config="drawing_llm_use_images" type="checkbox" /><span><b>读取附图和最近成图</b><small>需要视觉模型。最多发送两张本轮附图和一张有效的上一张成图；旧图只补连续性，不覆盖新要求。成图参考最多保留 30 分钟。</small></span></label>
-        <label class="field full"><span>绘图偏好（可选）</span><textarea data-config="drawing_llm_prompt" rows="3" maxlength="4000" placeholder="例如：保持当前场景连续，优先人物互动与清楚的构图"></textarea><small>内置专用绘图技能自动加载。/n 也会直接将用户原文交给此模型，只返回图片；普通聊天不会自行触发生图。</small></label>
+        <label class="field full"><span>绘图偏好（可选）</span><textarea data-config="drawing_llm_prompt" rows="3" maxlength="4000" placeholder="例如：保持当前场景连续，优先人物互动与清楚的构图"></textarea><small>内置绘图技能自动加载。/n [自然语言要求] 只唤醒绘图 LLM；/nai &lt;Tag&gt; 直接提交图片服务。两种 LLM 读取同一当前会话，绘图不会另建聊天。</small></label>
       </div>
       <div class="divider"></div>
       <div class="section-head compact"><div><span class="kicker">基础参数</span><h3>生成默认值</h3></div></div>
@@ -80,7 +84,7 @@
       <div class="section-head"><div><span class="kicker">02 / ACCESS</span><h2>入口与权限</h2><p>默认只开放固定命令，群聊仅管理员可用。生图、查看或切换角色卡、切换 NAI 模型都会经过同一套命令入口与权限检查。</p></div></div>
       <div class="notice info"><span class="notice-icon">i</span><div><b>安全默认值</b><p>固定命令和自主调用可以四选一；群聊策略默认管理员；每条消息最多返回一张图片，只有明确启用时才会对 429 限流进行有限重试。</p></div></div>
       <div class="grid two">
-        <label class="field"><span>固定命令</span><input data-config="command_prefix" type="text" placeholder="nai" pattern="[A-Za-z][A-Za-z0-9_-]{0,30}" /><small>管理命令默认 /nai，只填写名称；/n 固定用于绑定卡直接出图，不触发聊天回复。</small></label>
+        <label class="field"><span>固定命令</span><input data-config="command_prefix" type="text" placeholder="nai" pattern="[A-Za-z][A-Za-z0-9_-]{0,30}" /><small>管理命令默认 /nai，只填写名称；/n 由独立绘图 LLM 理解自然语言，只发图片；/nai &lt;Tag&gt; 使用绑定卡直接出图。</small></label>
         <label class="field"><span>入口模式</span><select data-config="invoke_mode"><option value="disabled">全部禁用</option><option value="command_only">仅固定命令</option><option value="llm_tool_only">仅 LLM 自主调用</option><option value="both">命令 + LLM 工具</option></select></label>
         <label class="field"><span>私聊权限</span><select data-config="private_access"><option value="all">所有人</option><option value="admin_only">仅管理员</option><option value="allowlist">白名单</option><option value="disabled">禁用</option></select></label>
         <label class="field"><span>群聊权限</span><select data-config="group_access"><option value="admin_only">仅管理员</option><option value="all">所有成员</option><option value="allowlist">白名单</option><option value="disabled">禁用</option></select></label>
@@ -90,7 +94,7 @@
       </div>
       <div class="divider"></div>
       <div class="grid two">
-        <label class="switch-row"><input data-config="img2img_enabled" type="checkbox" /><span><b>启用图生图</b><small>关闭后 /nai img2img 将被拒绝。</small></span></label><label class="switch-row"><input data-config="reference_enabled" type="checkbox" /><span><b>启用参考图 / Precise Reference</b><small>关闭后参考图操作将被拒绝。</small></span></label><label class="switch-row"><input data-config="llm_auto_reference" type="checkbox" /><span><b>LLM 自动应用绑定参考图</b><small>仅单个选中角色可使用参考图；剧情锚点模式还需主模型确认参考图适合当前外观，避免旧服饰回流。</small></span></label><label class="switch-row"><input data-config="legacy_command_enabled" type="checkbox" /><span><b>兼容 /nai &lt;描述&gt;</b><small>关闭后要求使用 /nai draw、/nai img2img、/nai reference。</small></span></label>
+        <label class="switch-row"><input data-config="img2img_enabled" type="checkbox" /><span><b>启用图生图</b><small>关闭后 /nai img2img 将被拒绝。</small></span></label><label class="switch-row"><input data-config="reference_enabled" type="checkbox" /><span><b>启用参考图 / Precise Reference</b><small>关闭后参考图操作将被拒绝。</small></span></label><label class="switch-row"><input data-config="llm_auto_reference" type="checkbox" /><span><b>LLM 自动应用绑定参考图</b><small>仅单个选中角色可使用参考图；剧情锚点模式还需主模型确认参考图适合当前外观，避免旧服饰回流。</small></span></label><label class="switch-row"><input data-config="legacy_command_enabled" type="checkbox" /><span><b>启用 /nai &lt;Tag&gt; 直接入口</b><small>使用当前绑定/默认卡直接请求图片服务。关闭后可用 /nai draw、/nai img2img、/nai reference。</small></span></label>
         <label class="switch-row"><input data-config="show_queue_notice" type="checkbox" /><span><b>发送排队提示</b><small>任务等待锁时发送一条提示。</small></span></label>
         <label class="field"><span>队列超时（秒）</span><input data-config="queue_timeout" type="number" min="1" max="600" /></label>
         <label class="field"><span>重复事件去重窗口（秒）</span><input data-config="dedupe_window_seconds" type="number" min="1" max="300" /></label>

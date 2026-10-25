@@ -44,7 +44,7 @@ else:  # Standalone test discovery.
     import planner
 
 PLUGIN_NAME = "astrbot_plugin_novelai_painter"
-VERSION = "2.9.0"
+VERSION = "2.10.0"
 STICKER_EMOTION_TOOL_NAME = "novelai_set_emotion"
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 MAX_RESPONSE_BYTES = 48 * 1024 * 1024
@@ -140,6 +140,15 @@ class ProviderError(RuntimeError):
         self.retry_after = retry_after
 
 
+class DrawingMarkerFilter(filter.CustomFilter):
+    plugin = None
+
+    def filter(self, event, cfg):
+        plugin = self.plugin
+        return bool(plugin and plugin._drawing_llm_id() and plugin._mode_allows("command")
+            and planner.marker_request(event.get_message_str(), str(plugin._cfg("drawing_trigger", "n"))) is not None)
+
+
 @register(PLUGIN_NAME, "AstrBot 社区", "NovelAI 生图与参考图工具", VERSION)
 class NovelAIPainterPlugin(Star):
     def __init__(self, context: Context, config: dict | None = None):
@@ -166,6 +175,7 @@ class NovelAIPainterPlugin(Star):
         self._cleanup_expired()
         self._sync_sticker_emotion_tool()
         self._sync_drawing_tool_schema()
+        self._sync_marker_filter()
         if self._preset_schema_migrated:
             try:
                 self._save_presets()
@@ -177,6 +187,7 @@ class NovelAIPainterPlugin(Star):
     async def terminate(self):
         for key in list(getattr(self, "_drawing_memory", {})):
             self._drop_drawing_memory(key)
+        self._sync_marker_filter(unbind=True)
 
     # --------------------------- configuration ---------------------------
     def _ensure_defaults(self) -> None:
@@ -302,7 +313,14 @@ class NovelAIPainterPlugin(Star):
 
     def _mode_allows(self, entry: str) -> bool:
         mode = str(self._cfg("invoke_mode", "command_only") or "command_only")
-        return mode in {entry, "both"}
+        return mode in {entry, entry + "_only", "both"}
+
+    def _sync_marker_filter(self, unbind=False):
+        from astrbot.core.star.star_handler import star_handlers_registry
+        handler = star_handlers_registry.get_handler_by_full_name(type(self).__module__ + "_drawing_marker_event")
+        for item in handler.event_filters if handler else ():
+            if isinstance(item, DrawingMarkerFilter) and (not unbind or item.plugin is self):
+                item.plugin = None if unbind else self
 
     # --------------------------- storage and presets ---------------------------
     def _load_presets(self) -> list[dict[str, Any]]:
@@ -1113,6 +1131,7 @@ class NovelAIPainterPlugin(Star):
         # renamed commands. Never guess lifecycle from user message keywords.
         if event.get_extra("_clean_group_context_session", False):
             self._ledger().clear(str(event.unified_msg_origin))
+            getattr(self, "_planner_diagnostics", {}).pop(str(event.unified_msg_origin), None)
             for key in list(getattr(self, "_drawing_memory", {})):
                 if key[0] == str(event.unified_msg_origin):
                     self._drop_drawing_memory(key)
@@ -1201,15 +1220,25 @@ class NovelAIPainterPlugin(Star):
             "", req.system_prompt or "", flags=re.S)
         req.extra_user_content_parts = [part for part in (getattr(req, "extra_user_content_parts", None) or [])
             if not str(part.get("text", "") if isinstance(part, dict) else getattr(part, "text", "")).startswith(marker)]
-        if not self._mode_allows("llm_tool") or not self._can_use(event)[0]:
+        if not self._can_use(event)[0] or not (self._mode_allows("llm_tool") or self._mode_allows("command")):
             return
+        if not self._mode_allows("llm_tool") and not self._drawing_llm_id():
+            return
+        if event.get_extra("nai_marker_dual"):
+            raw = str(event.get_message_str() or "")
+            body = event.get_extra("nai_marker_body", "") or "请回应当前对话。"
+            if raw and raw in (req.prompt or ""):
+                before, after = req.prompt.rsplit(raw, 1)
+                req.prompt = before + body + after
         self._sync_drawing_tool_schema()
         # AstrBot may decorate prompt with a configured prefix; history stores
         # that prompt plus reminder/multimodal text, not just message_str.
         event.set_extra("nai_story_source", getattr(req, "prompt", "") or event.get_message_str())
         active = await self._resolve_active_preset(event)
-        view = await self._story_view(event) if self._contextual_cards_enabled() else None
+        view = await self._story_view(event) if self._contextual_cards_enabled() or self._drawing_llm_id() else None
         event.set_extra("nai_story_view", view)
+        if event.get_extra("nai_marker_dual") and event.get_extra("nai_planner_view") is None:
+            event.set_extra("nai_planner_view", view)
         if self._drawing_llm_id():
             count = max(0, min(30, int(self._cfg("drawing_llm_context_messages", 12))))
             records = drawing.history_records(getattr(req, "contexts", None))
@@ -1246,14 +1275,49 @@ class NovelAIPainterPlugin(Star):
                 "subjects 可指定 self/card/custom；拿不准可省略，由绘图 LLM 结合本轮对话选择。图片在你正常回复完成后生成。"
                 "不要预先声称图片已发送，不要将绘图设想当作剧情事实。以下只是可选绘画角色目录，不改变聊天人设。")
             catalog = [{key: card[key] for key in ("id", "name", "description")} for card in catalog]
+        if event.get_extra("nai_marker_dual"):
+            rules = ("用户使用绘图暗号，本条绘图已由插件独立排队，无需你写 Tag、描述绘图意图或调用绘图工具。"
+                "请按当前人设正常回应用户与剧情。插件在你的回复后独立读取同一会话生成图片，不要提前声称图片已发送。")
+        elif not self._mode_allows("llm_tool"):
+            rules = "当前未开放主模型绘图工具，仅将最近绘图记录用于理解对话；正常聊天，不调用绘图工具。绘图设想不表示剧情已经改变。"
+        previous = self._previous_drawing(view) if self._drawing_llm_id() else {}
         context = marker + "\n" + rules + "\n" + json.dumps({
             "self_card": {"id": active.get("id", ""), "name": active.get("name", "")} if active else None,
-            "available_cards": catalog}, ensure_ascii=False) + "\n" + end
+            "available_cards": catalog,
+            "recent_drawing": {"user_request": previous.get("user_request", ""), "delivered": True,
+                "note": "这是已完成的绘图记录，不是本轮绘图请求，不能据此再次调用工具；图中设想不代表剧情事实。"} if previous else None}, ensure_ascii=False) + "\n" + end
         # AstrBot >= 4.27.3 preserves this flag through provider assembly and
         # strips the part when saving history, including checkpoint histories.
         req.extra_user_content_parts.append(TextPart(text=context).mark_as_temp())
 
     # --------------------------- permissions and dedupe ---------------------------
+    @filter.custom_filter(DrawingMarkerFilter, priority=100)
+    async def drawing_marker_event(self, event: AstrMessageEvent) -> None:
+        body = planner.marker_request(str(event.get_message_str() or ""), str(self._cfg("drawing_trigger", "n")))
+        if body is None or not self._drawing_llm_id() or not self._mode_allows("command"):
+            return
+        allowed, reason = self._can_use(event)
+        if not allowed:
+            await self._notify(event, reason, "error")
+            event.stop_event()
+            return
+        if len(body) > 8000:
+            await self._notify(event, "画面描述不能超过 8000 字符。", "error")
+            event.stop_event()
+            return
+        if not self._claim_llm_tool_invocation(event):
+            return
+        event.set_extra("nai_marker_dual", True)
+        event.set_extra("nai_marker_body", body)
+        event.set_extra("nai_planner_provider", self._drawing_llm_id())
+        event.set_extra("nai_planner_entry", "command")
+        event.set_extra("nai_planner_view", await self._story_view(event))
+        event.set_extra("nai_planner_pending", {"prompt": body or "根据当前对话绘制当前场景", "entry": "marker"})
+        event.set_extra("sticker_consumed", True)
+        # A matching marker also wakes normal chat in groups without requiring
+        # the main model to call a tool. Do not mark the LLM as already handled.
+        event.is_at_or_wake_command = True
+
     def _drawing_llm_id(self) -> str:
         return str(self._cfg("drawing_llm_provider_id", "") or "").strip()
 
@@ -1276,7 +1340,7 @@ class NovelAIPainterPlugin(Star):
             return {}
         index = row["position"]
         actual = view.history[index][1] if index < len(view.history) and view.history[index][0] == "user" else ""
-        valid_source = row["turn"] == view.turn or bool(row["message"] and (actual == row["message"] or actual.startswith(row["message"] + "\n")))
+        valid_source = row.get("direct", False) or row["turn"] == view.turn or bool(row["message"] and (actual == row["message"] or actual.startswith(row["message"] + "\n")))
         cards_current = all(self._get_preset(card_id) and drawing.StoryLedger.signature(drawing.card_layers(self._get_preset(card_id))) == signature
             for card_id, signature in row["cards"].items())
         if row["epoch"] != view.epoch or not self._ledger().valid(view) or not valid_source or not cards_current:
@@ -1295,7 +1359,8 @@ class NovelAIPainterPlugin(Star):
         position = next((i for i in range(len(view.history) - 1, -1, -1)
             if view.history[i][0] == "user" and (view.history[i][1] == view.message or view.history[i][1].startswith(view.message + "\n"))), len(view.history))
         row = {"plan": plan, "epoch": view.epoch, "turn": view.turn, "position": position,
-            "message": view.message, "created_at": time.time(), "image": "", "cards": {}}
+            "message": view.message, "user_request": str(event.get_message_str() or ""), "direct": bool(event.get_extra("nai_direct_command")),
+            "created_at": time.time(), "image": "", "cards": {}}
         for detail in event.get_extra("nai_drawing_details", []):
             card = self._get_preset(detail.get("preset_id", ""))
             if card:
@@ -1313,6 +1378,60 @@ class NovelAIPainterPlugin(Star):
         self._drawing_memory[view.scope] = row
         while len(self._drawing_memory) > 8:
             self._drop_drawing_memory(next(iter(self._drawing_memory)))
+
+    def _planner_protocol(self, provider_id):
+        mode = self._cfg("drawing_llm_output_mode", "auto")
+        if mode != "auto":
+            return mode
+        try:
+            provider = self.context.get_provider_by_id(provider_id)
+            kind = str(provider.provider_config.get("type", "")).lower()
+            return "tool" if "openai" in kind else "json"
+        except Exception:
+            return "json"
+
+    def _planner_log(self, event, provider_id, mode, attempt, response, error=None):
+        text = str(getattr(response, "completion_text", "") or "")
+        names = getattr(response, "tools_call_name", []) or []
+        def redact(value, limit):
+            for key in ("api_token", "api_key"):
+                secret = str(self._cfg(key, "") or "")
+                if secret:
+                    value = value.replace(secret, "[redacted]")
+            return re.sub(r"(?i)(bearer\s+|sk-)[A-Za-z0-9_.-]+", "[redacted]", value)[:limit]
+        detail = {"provider": provider_id, "protocol": mode, "attempt": attempt,
+            "text_length": len(text), "tool_calls": names,
+            "status": "ok" if error is None else getattr(error, "code", "validation"),
+            "error": redact(str(error), 300) if error else ""}
+        if self._as_bool(self._cfg("drawing_llm_debug", False)):
+            preview = planner.response_output(response)
+            detail["response_preview"] = redact(preview, 2000)
+        if not hasattr(self, "_planner_diagnostics"):
+            self._planner_diagnostics = {}
+        self._planner_diagnostics[str(event.unified_msg_origin)] = detail
+        while len(self._planner_diagnostics) > 20:
+            self._planner_diagnostics.pop(next(iter(self._planner_diagnostics)))
+        logger.info(f"[{PLUGIN_NAME}] 绘图规划: {json.dumps(detail, ensure_ascii=False)}")
+
+    async def _validate_planned_drawing(self, event, plan):
+        subjects = await self._resolve_drawing_subjects(event, plan["subjects"])
+        if not self._contextual_cards_enabled() and ("style" in plan or any("outfit" in subject for subject in subjects)):
+            raise ValueError("严格模式请将本图修改放入人物 prompt，省略 outfit/style。")
+        drawing.tags(plan["prompt"], validate=True)
+        style = plan.get("style")
+        if "style" in plan:
+            drawing.tags(style, validate=True)
+            if len(drawing.join(plan["prompt"], style)) > 11500:
+                raise ValueError("场景与画风合成过长，请缩短本次描述。")
+        if self._contextual_cards_enabled():
+            if style is not None and any(subject["preset"] for subject in subjects) and not self._drawing_style_override_requested(event):
+                style = None
+            self._apply_story_layers(subjects, await self._story_view(event), "generate", style, plan["prompt"])
+        for subject in subjects:
+            drawing.tags(subject["prompt"], validate=True)
+            if len(drawing.join(subject["preset"].get("positive_prompt", ""), subject["prompt"],
+                    plan["prompt"] if len(subjects) == 1 else "", (style or "") if len(subjects) == 1 else "")) > 11500:
+                raise ValueError("角色、服饰和场景合成过长，请缩短本次描述；身份锚点不能被截断。")
 
     async def _plan_drawing(self, event, seed: dict) -> dict:
         if not self._can_use(event)[0]:
@@ -1351,24 +1470,55 @@ class NovelAIPainterPlugin(Star):
             if previous.get("image") and Path(previous["image"]).is_file():
                 images.append(previous["image"])
         payload = {"user_request": event.get_message_str(), "drawing_intent": seed,
+            "drawing_request": event.get_extra("nai_marker_body", seed.get("prompt", "")) or "根据当前对话绘制当前场景",
             "recent_dialogue": dialogue, "current_reply": event.get_extra("nai_planner_reply", ""),
             "self_card_id": active.get("id") if active else None, "available_cards": catalog,
             "card_mode": self._cfg("llm_card_mode", "context"), "previous_drawing": previous.get("plan"),
+            "previous_user_request": previous.get("user_request"),
             "images": {"current_user_images": len(images) - int(bool(previous.get("image") and previous["image"] in images)),
                 "previous_drawing_attached": bool(previous.get("image") and previous["image"] in images)},
             "preferences": self._cfg("drawing_llm_prompt", "")}
         skill = (Path(__file__).parent / "skills" / "novelai-painter" / "references" / "drawing-planner.md").read_text(encoding="utf-8")
-        try:
-            response = await asyncio.wait_for(self.context.llm_generate(
-                chat_provider_id=provider_id, prompt=json.dumps(payload, ensure_ascii=False),
-                system_prompt=skill, image_urls=images or None),
-                timeout=max(5, min(180, int(self._cfg("drawing_llm_timeout", 60)))))
-        except asyncio.TimeoutError as exc:
-            raise ValueError("独立绘图 LLM 超时，本次未请求图片服务。") from exc
-        except Exception as exc:
-            logger.warning(f"[{PLUGIN_NAME}] 独立绘图 LLM 调用失败: {type(exc).__name__}")
-            raise ValueError("独立绘图 LLM 调用失败，请检查所配置的 Provider 和图片理解能力。") from exc
-        plan = planner.parse_plan(getattr(response, "completion_text", ""))
+        mode = self._planner_protocol(provider_id)
+        payload["output_mode"] = mode
+        kwargs = {"tools": planner.plan_tools(), "tool_choice": "auto"} if mode == "tool" else {}
+        attempts = 2 if self._as_bool(self._cfg("drawing_llm_format_retry", True), True) else 1
+        for attempt in range(1, attempts + 1):
+            current = await self._story_view(event)
+            if self._drawing_llm_id() != provider_id or (view and (not current or current.scope != view.scope or current.epoch != view.epoch)):
+                raise ValueError("绘图规划期间配置或对话已改变，旧任务已取消。")
+            try:
+                response = await asyncio.wait_for(self.context.llm_generate(
+                    chat_provider_id=provider_id, prompt=json.dumps(payload, ensure_ascii=False),
+                    system_prompt=skill, image_urls=images or None, **kwargs),
+                    timeout=max(5, min(180, int(self._cfg("drawing_llm_timeout", 60)))))
+            except asyncio.TimeoutError as exc:
+                self._planner_log(event, provider_id, mode, attempt, None, planner.PlanError("超时", "timeout", False))
+                raise ValueError("独立绘图 LLM 超时，本次未请求图片服务。") from exc
+            except Exception as exc:
+                if re.search(r"content_filter|内容安全|被拒绝", str(exc), re.I):
+                    error = planner.PlanError("绘图 LLM 服务拒绝了该请求，本次未请求图片服务。", "refusal", False)
+                    self._planner_log(event, provider_id, mode, attempt, None, error)
+                    raise error from exc
+                self._planner_log(event, provider_id, mode, attempt, None,
+                    planner.PlanError(f"{type(exc).__name__}: {exc}", "provider", False))
+                raise ValueError("独立绘图 LLM 调用失败，请检查 Provider；工具不兼容时可将输出协议切换为 JSON 文本。") from exc
+            try:
+                plan = planner.response_plan(response)
+                if not self._contextual_cards_enabled():
+                    for subject in plan["subjects"]:
+                        subject.pop("state_scope", None)
+                await self._validate_planned_drawing(event, plan)
+            except ValueError as exc:
+                self._planner_log(event, provider_id, mode, attempt, response, exc)
+                if not getattr(exc, "retryable", True) or attempt == attempts:
+                    raise
+                payload["format_correction"] = {"error": str(exc)[:500],
+                    "previous_output": planner.response_output(response)[:16000],
+                    "instruction": "只修正格式或字段，保留用户原意，提交一份完整方案；不要调用图片服务。"}
+                continue
+            self._planner_log(event, provider_id, mode, attempt, response)
+            break
         if self._drawing_llm_id() != provider_id:
             raise ValueError("绘图规划期间 Provider 已更改，旧任务已取消。")
         if not self._contextual_cards_enabled():
@@ -1405,11 +1555,12 @@ class NovelAIPainterPlugin(Star):
         event.set_extra("nai_planner_consumed", True)
         event.set_extra("sticker_consumed", True)
         try:
-            if not self._drawing_llm_id() or not self._mode_allows("llm_tool"):
+            entry = event.get_extra("nai_planner_entry", "llm_tool")
+            if not self._drawing_llm_id() or not self._mode_allows(entry):
                 raise ValueError("独立绘图 LLM 已关闭，本轮排队请求已取消。")
             plan = await self._plan_drawing(event, pending)
             await self._image_tool_entry(event, **plan, operation=pending.get("operation", "generate"),
-                reference_type=pending.get("reference_type", ""), accepted=True)
+                reference_type=pending.get("reference_type", ""), accepted=True, entry=entry)
         except ValueError as exc:
             await self._notify(event, str(exc), "error")
 
@@ -2083,7 +2234,9 @@ class NovelAIPainterPlugin(Star):
         root = f"/{prefix}"
         return (
             "可执行命令：\n"
-            "/n <画面描述>（当前绑定卡直接出图，不触发 AI 回复）\n"
+            "/n [自然语言要求]（独立绘图 LLM 读当前上下文，只发图片）\n"
+            "/nai <Tag>（当前绑定卡直接提交图片服务）\n"
+            f"{self._cfg('drawing_trigger', 'n')} 放在消息首尾或单独发送（主模型回复 + 独立绘图）\n"
             f"{root} draw <画面描述>（自由绘画，不套角色卡）\n"
             f"{root} img2img <画面描述>\n"
             f"{root} reference <character|style|both> <画面描述>\n"
@@ -2528,6 +2681,8 @@ class NovelAIPainterPlugin(Star):
 
     async def _image_tool_entry(self, event, prompt="", operation="generate", reference_type="", subjects=None,
                                 style=None, *, accepted=False, entry="llm_tool", quiet=False):
+        if not accepted and event.get_extra("nai_planner_pending"):
+            return "DRAWING_REQUEST_QUEUED: ENTRY_GATE_BLOCKED_DUPLICATE. 本条绘图已排队，回复后由插件独立执行；无需再写 Tag 或调用绘图工具，继续正常回复即可。"
         if not self._mode_allows(entry):
             await self._notify(event, "当前未启用自然语言生图入口。", "error")
             return (
@@ -2586,7 +2741,7 @@ class NovelAIPainterPlugin(Star):
                 "Do not call any tool again for this message. Explain this briefly to the user."
             )
 
-        view = None
+        view = event.get_extra("nai_story_view") if accepted else None
         try:
             if event.get_extra("nai_story_request_stale", False):
                 raise ValueError("主模型使用的对话已切换或清空，请在当前对话重新请求。")
@@ -2697,7 +2852,31 @@ class NovelAIPainterPlugin(Star):
         }, ensure_ascii=False)
 
     async def _quick_draw(self, event: AstrMessageEvent, prompt: str) -> None:
-        """A direct image command; never enters the conversational tool loop."""
+        """Only the drawing LLM handles /n; no main-model conversation turn."""
+        event.should_call_llm(False)
+        event.set_extra("nai_direct_command", True)
+        event.stop_event()
+        if not self._mode_allows("command") or not self._can_use(event)[0]:
+            await self._notify(event, self._can_use(event)[1] or "当前未启用固定命令入口。", "error")
+            return
+        if not self._drawing_llm_id():
+            await self._notify(event, "请先在 WebUI 配置独立绘图 LLM；/n 由它理解自然语言，/nai <Tag> 才是直接提交提示词。", "error")
+            return
+        if len(prompt) > 8000:
+            await self._notify(event, "画面描述不能超过 8000 字符。", "error")
+            return
+        if not self._claim_llm_tool_invocation(event):
+            return
+        try:
+            event.set_extra("nai_planner_view", await self._story_view(event))
+            event.set_extra("nai_planner_provider", self._drawing_llm_id())
+            plan = await self._plan_drawing(event, {"prompt": prompt or "根据当前对话绘制当前场景", "entry": "/n"})
+            await self._image_tool_entry(event, **plan, accepted=True, entry="command", quiet=True)
+        except ValueError as exc:
+            await self._notify(event, str(exc), "error")
+
+    async def _raw_draw(self, event: AstrMessageEvent, prompt: str) -> None:
+        """The former /n direct-tag path, now available through /nai <Tag>."""
         event.should_call_llm(False)
         event.set_extra("nai_direct_command", True)
         event.stop_event()
@@ -2709,21 +2888,12 @@ class NovelAIPainterPlugin(Star):
             await self._notify(event, reason, "error")
             return
         if not prompt:
-            await self._notify(event, "用法：/n <画面描述>。使用当前绑定角色卡直接出图；NAI 建议使用英文 Tag。", "help")
+            await self._notify(event, "用法：/nai <Tag>。自然语言理解请用 /n。", "help")
             return
         if len(prompt) > 8000:
             await self._notify(event, "画面描述不能超过 8000 字符。", "error")
             return
         if not self._claim_llm_tool_invocation(event):
-            return
-        if self._drawing_llm_id():
-            try:
-                event.set_extra("nai_planner_view", await self._story_view(event))
-                event.set_extra("nai_planner_provider", self._drawing_llm_id())
-                plan = await self._plan_drawing(event, {"prompt": prompt, "subjects": [{"source": "self"}], "entry": "/n"})
-                await self._image_tool_entry(event, **plan, accepted=True, entry="command", quiet=True)
-            except ValueError as exc:
-                await self._notify(event, str(exc), "error")
             return
         try:
             subjects = await self._resolve_drawing_subjects(event, [{"source": "self"}])
@@ -2758,7 +2928,15 @@ class NovelAIPainterPlugin(Star):
             await self._quick_draw(event, (match.group("body") or "").strip())
             return
         prefix = str(self._cfg("command_prefix", "nai") or "nai").strip().lstrip("/").lower()
-        if name != ("nai" if prefix == "n" else prefix):
+        if name not in {"nai", "nai" if prefix == "n" else prefix}:
+            return
+        text = (match.group("body") or "").strip()
+        known = {"help", "?", "菜单", "draw", "generate", "生图", "self", "自己", "card-draw",
+            "img2img", "i2i", "图生图", "reference", "ref", "参考图", "card", "role", "preset", "角色卡",
+            "cards", "roles", "角色卡列表", "use-card", "切换角色卡", "更换角色卡", "model", "模型",
+            "models", "模型列表", "use-model", "切换模型", "更换模型"}
+        if text and text.partition(" ")[0].lower() not in known and self._as_bool(self._cfg("legacy_command_enabled", True)):
+            await self._raw_draw(event, text)
             return
         if not self._mode_allows("command"):
             yield event.plain_result("当前未启用固定命令入口。")
@@ -2767,7 +2945,6 @@ class NovelAIPainterPlugin(Star):
         if not allowed:
             yield event.plain_result(reason)
             return
-        text = (match.group("body") or "").strip()
         if not text or text.lower() in {"help", "?", "菜单"}:
             yield event.plain_result(self._command_help())
             return
@@ -2824,6 +3001,9 @@ class NovelAIPainterPlugin(Star):
             return
         elif not self._as_bool(self._cfg("legacy_command_enabled", True)):
             yield event.plain_result("请使用 /nai draw、/nai img2img 或 /nai reference 命令。")
+            return
+        else:
+            await self._raw_draw(event, text)
             return
         if not body.strip():
             yield event.plain_result("请补充画面描述。")
@@ -2951,6 +3131,7 @@ class NovelAIPainterPlugin(Star):
             "reference_enabled", "img2img_color_correct",
             "sticker_enabled", "sticker_auto_reference", "sticker_emotion_tool",
             "drawing_llm_use_images",
+            "drawing_llm_format_retry", "drawing_llm_debug",
         ):
             if key in fields:
                 fields[key] = self._as_bool(fields[key])
@@ -3033,6 +3214,11 @@ class NovelAIPainterPlugin(Star):
                 if not isinstance(fields[key], str) or len(fields[key]) > limit:
                     return self._page_error(f"{key} 必须是不超过 {limit} 字符的字符串")
                 fields[key] = fields[key].strip()
+        if "drawing_trigger" in fields:
+            marker = fields["drawing_trigger"]
+            if not isinstance(marker, str) or len(marker.strip()) > 16 or re.search(r"[\s/]", marker.strip()):
+                return self._page_error("绘图暗号应为不含空白或 / 的 1–16 个字符；留空关闭")
+            fields["drawing_trigger"] = marker.strip()
         allowed_enums = {
             "provider": {"novelai_official", "openai_compatible"},
             "invoke_mode": {"disabled", "command_only", "llm_tool_only", "both"},
@@ -3042,6 +3228,7 @@ class NovelAIPainterPlugin(Star):
             "error_notify_mode": {"silent", "final_only", "admin_only"},
             "sticker_send_mode": {"after_reply", "same_bubble"},
             "llm_card_mode": {"context", "strict"},
+            "drawing_llm_output_mode": {"auto", "tool", "json"},
         }
         for key, options in allowed_enums.items():
             if key in fields and fields[key] not in options:
@@ -3057,6 +3244,7 @@ class NovelAIPainterPlugin(Star):
             logger.exception(f"[{PLUGIN_NAME}] WebUI 保存配置失败: {exc}")
             return self._page_error("配置写入失败，已撤销本次修改，请检查 AstrBot 日志")
         self._sync_sticker_emotion_tool()
+        self._sync_marker_filter()
         return json_response({"saved": True, "message": "配置已保存", "config": self._public_config()})
 
     async def page_test_provider(self):
@@ -3250,7 +3438,8 @@ class NovelAIPainterPlugin(Star):
         return json_response({"jobs": self._jobs[-50:]})
 
     async def page_last_request(self):
-        return json_response({"requests": list(reversed(list(getattr(self, "_request_snapshots", {}).values())))})
+        return json_response({"requests": list(reversed(list(getattr(self, "_request_snapshots", {}).values()))),
+            "planner": list(getattr(self, "_planner_diagnostics", {}).values())})
 
     async def page_manage_jobs(self):
         payload = await request.json(default={})

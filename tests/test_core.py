@@ -1633,14 +1633,14 @@ flat cell shading, clean lineart, masterpiece, best quality"""
 
         asyncio.run(run())
 
-    def test_n_command_sends_only_an_image_with_bound_card_and_no_chat_model(self):
+    def test_nai_raw_command_sends_only_an_image_with_bound_card_and_no_chat_model(self):
         async def run():
             p = self.make_context_plugin()
             del p._finish_event
             p.config.update({"auto_clean_delay":0, "command_prefix":"paint", "show_queue_notice":True})
             p.context.llm_generate = AsyncMock()
             p.context.get_current_chat_provider_id = AsyncMock()
-            event = FakeEvent("/n@Painter white dress, smiling, window\nsoft lighting")
+            event = FakeEvent("/nai@Painter white dress, smiling, window\nsoft lighting")
             replies = [value async for value in p.cmd_draw(event)]
             self.assertEqual(replies, [])
             self.assertFalse(event.call_llm)
@@ -1658,27 +1658,27 @@ flat cell shading, clean lineart, masterpiece, best quality"""
             self.assertFalse(p._ledger().states)
         asyncio.run(run())
 
-    def test_n_command_respects_story_outfit_without_saving_image_only_changes(self):
+    def test_nai_raw_command_respects_story_outfit_without_saving_image_only_changes(self):
         async def run():
             p = self.make_context_plugin()
             event = self.drawing_event("剧情中已换上和服", "story")
             await p.novelai_generate_image(event, "room", subjects=[{"source":"self", "outfit":"kimono", "state_scope":"story"}])
             self.persist_turn(p, event)
-            async for _ in p.cmd_draw(self.drawing_event("/n white dress, garden", "n-1")): pass
+            async for _ in p.cmd_draw(self.drawing_event("/nai white dress, garden", "n-1")): pass
             self.assertIn("white dress", p._call_official.await_args.args[0])
             self.assertNotIn("kimono", p._call_official.await_args.args[0])
-            async for _ in p.cmd_draw(self.drawing_event("/n window, smiling", "n-2")): pass
+            async for _ in p.cmd_draw(self.drawing_event("/nai window, smiling", "n-2")): pass
             self.assertIn("kimono", p._call_official.await_args.args[0])
             self.assertNotIn("white dress", p._call_official.await_args.args[0])
         asyncio.run(run())
 
-    def test_n_command_without_card_uses_raw_prompt_and_failure_does_not_start_chat(self):
+    def test_nai_raw_command_without_card_uses_raw_prompt_and_failure_does_not_start_chat(self):
         async def run():
             p = self.make_context_plugin()
             p.config["default_preset_id"] = ""
             del p._finish_event
             p._call_official.side_effect = ProviderError("network", "test service unavailable")
-            event = FakeEvent("/n starry sky, mountains")
+            event = FakeEvent("/nai starry sky, mountains")
             async for _ in p.cmd_draw(event): pass
             self.assertFalse(event.call_llm)
             self.assertTrue(event.stopped)
@@ -1687,21 +1687,21 @@ flat cell shading, clean lineart, masterpiece, best quality"""
             self.assertFalse(any(isinstance(component, Image) for component in event.sent[0].chain))
         asyncio.run(run())
 
-    def test_n_command_explicit_style_replaces_card_style_for_this_image(self):
+    def test_nai_raw_command_explicit_style_replaces_card_style_for_this_image(self):
         async def run():
             p = self.make_context_plugin()
-            async for _ in p.cmd_draw(self.drawing_event("/n oil painting, smiling", "oil")): pass
+            async for _ in p.cmd_draw(self.drawing_event("/nai oil painting, smiling", "oil")): pass
             self.assertIn("oil painting", p._call_official.await_args.args[0])
             self.assertIn("blonde hair", p._call_official.await_args.args[0])
             self.assertNotIn("watercolor", p._call_official.await_args.args[0])
-            async for _ in p.cmd_draw(self.drawing_event("/n window, smiling", "default")): pass
+            async for _ in p.cmd_draw(self.drawing_event("/nai window, smiling", "default")): pass
             self.assertIn("watercolor", p._call_official.await_args.args[0])
         asyncio.run(run())
 
-    def test_n_command_blocks_llm_for_help_permission_and_disabled_entry(self):
+    def test_nai_raw_command_blocks_llm_for_help_permission_and_disabled_entry(self):
         async def run():
-            for command, mode, role in (("/n", "both", "admin"), ("/n window", "both", "member"),
-                ("/n window", "llm_tool_only", "admin"), ("/n " + "x" * 8001, "both", "admin")):
+            for command, mode, role in (("/n", "both", "admin"), ("/nai window", "both", "member"),
+                ("/nai window", "llm_tool_only", "admin"), ("/nai " + "x" * 8001, "both", "admin")):
                 p = self.make_context_plugin()
                 p.config["invoke_mode"] = mode
                 p._run_job = AsyncMock()
@@ -1714,15 +1714,15 @@ flat cell shading, clean lineart, masterpiece, best quality"""
                 p._notify.assert_awaited_once()
         asyncio.run(run())
 
-    def test_n_command_is_fixed_and_does_not_consume_other_command_names(self):
+    def test_nai_raw_command_is_fixed_and_does_not_consume_other_command_names(self):
         async def run():
             p = self.make_context_plugin()
             p.config["command_prefix"] = "n"
             p._run_job = AsyncMock(return_value=GenerationResult(True, "job", "novelai_official", send_image=False))
-            async for _ in p.cmd_draw(FakeEvent("/n card list")): pass
-            self.assertEqual(p._run_job.await_args.args[1], "card list")
+            async for _ in p.cmd_draw(FakeEvent("/nai window")): pass
+            self.assertEqual(p._run_job.await_args.args[1], "window")
             help_replies = [value async for value in p.cmd_draw(FakeEvent("/nai"))]
-            self.assertIn("/n <画面描述>", help_replies[0])
+            self.assertIn("/n [自然语言要求]", help_replies[0])
             self.assertIn("/nai card list", help_replies[0])
             event = FakeEvent("/novel other command")
             async for _ in p.cmd_draw(event): pass
@@ -1773,11 +1773,11 @@ flat cell shading, clean lineart, masterpiece, best quality"""
             async for _ in p.cmd_draw(FakeEvent(command)):
                 pass
             args = p._call_official.await_args.args
-            self.assertEqual("blonde hair" in args[0], expects_card)
+            self.assertEqual("extra arms" in args[5], expects_card)
             self.assertEqual(p.config["default_preset_id"], "p1")
         for command, expects_card in (
             ("/nai draw hatsune miku, aqua hair", False),
-            ("/nai hatsune miku, aqua hair", False),
+            ("/nai hatsune miku, aqua hair", True),
             ("/nai self standing", True),
             ("/nai card-draw p1 standing", True),
         ):

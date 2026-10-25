@@ -392,8 +392,8 @@ async function renderJobs({ reportErrors = true } = {}) {
       withTimeout(bridge.apiGet("jobs"), 15000, "读取任务记录超时").then(ensureOk),
       withTimeout(bridge.apiGet("last-request"), 15000, "读取请求快照超时").then(ensureOk),
     ]);
-    $("#last-request").textContent = snapshots.requests?.length
-      ? JSON.stringify(snapshots.requests, null, 2) : "暂无请求。";
+    $("#last-request").textContent = snapshots.requests?.length || snapshots.planner?.length
+      ? JSON.stringify({requests: snapshots.requests || [], planner: snapshots.planner || []}, null, 2) : "暂无请求。";
     const jobs = Array.isArray(data.jobs) ? data.jobs : [];
     const box = $("#job-list");
     const clearButton = $("#clear-jobs");

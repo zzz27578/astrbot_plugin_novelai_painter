@@ -72,7 +72,7 @@ class PlannerTests(unittest.TestCase):
             p = self.make_planner()
             event = core.FakeEvent("画一张你")
             results = await asyncio.gather(p.novelai_generate_image(event,"画你"), p.novelai_generate_image(event,"再画你"))
-            self.assertEqual(sum("DRAWING_REQUEST_QUEUED" in result for result in results), 1)
+            self.assertEqual(sum("DRAWING_REQUEST_QUEUED" in result and "DUPLICATE" not in result for result in results), 1)
             self.assertEqual(sum("DUPLICATE" in result for result in results), 1)
             await p.drawing_capture_reply(event, LLMResponse("assistant", completion_text="好。"))
             await asyncio.gather(p.drawing_after_reply(event), p.drawing_after_reply(event))
@@ -111,11 +111,12 @@ class PlannerTests(unittest.TestCase):
             event = core.FakeEvent()
             await p.novelai_generate_image(event,"primary tags, portrait")
             await self.complete_reply(p,event)
-            p.context.llm_generate.assert_awaited_once()
+            expected_calls = 2 if response.startswith("{") else 1
+            self.assertEqual(p.context.llm_generate.await_count, expected_calls)
             p._call_official.assert_not_awaited()
             p._notify.assert_awaited_once()
             await p.drawing_after_reply(event)
-            p.context.llm_generate.assert_awaited_once()
+            self.assertEqual(p.context.llm_generate.await_count, expected_calls)
         for response,error in (("I cannot process this request",None), ('{"prompt":"room","subjects":"[]"}',None),
             ('{"prompt":"room","subjects":[{"source":"card","preset_id":"missing"}]}',None),
             ("",asyncio.TimeoutError()), ("",RuntimeError("service failure"))):
@@ -341,13 +342,25 @@ class PlannerTests(unittest.TestCase):
             p = self.make_planner()
             p._save_config = Mock(); p._sync_sticker_emotion_tool = Mock()
             fields = {"drawing_llm_provider_id":"visual-provider", "drawing_llm_timeout":999,
-                "drawing_llm_context_messages":999, "drawing_llm_use_images":True, "drawing_llm_prompt":"保留构图"}
+                "drawing_llm_context_messages":999, "drawing_llm_use_images":True, "drawing_llm_prompt":"保留构图",
+                "drawing_trigger":"出图", "drawing_llm_output_mode":"tool", "drawing_llm_format_retry":"false", "drawing_llm_debug":"true"}
             with patch("main.request", SimpleNamespace(json=AsyncMock(return_value=fields))), patch("main.json_response", side_effect=lambda value:value):
                 result = await p.page_save_config()
             self.assertTrue(result["saved"])
             self.assertEqual(p.config["drawing_llm_timeout"],180)
             self.assertEqual(p.config["drawing_llm_context_messages"],30)
             self.assertTrue(p.config["drawing_llm_use_images"])
+            self.assertEqual(p.config["drawing_trigger"], "出图")
+            self.assertEqual(p.config["drawing_llm_output_mode"], "tool")
+            self.assertFalse(p.config["drawing_llm_format_retry"])
+            self.assertTrue(p.config["drawing_llm_debug"])
+            p._page_error = Mock(side_effect=lambda value: {"error":value})
+            for invalid in ({"drawing_trigger":"/n"}, {"drawing_trigger":"n tag"}, {"drawing_trigger":"x"*17},
+                    {"drawing_llm_output_mode":"unknown"}):
+                p._save_config.reset_mock()
+                with patch("main.request", SimpleNamespace(json=AsyncMock(return_value=invalid))):
+                    self.assertIn("error", await p.page_save_config())
+                p._save_config.assert_not_called()
             p.context.get_all_providers = Mock(return_value=[SimpleNamespace(meta=lambda:SimpleNamespace(id="visual-provider"),
                 get_model=lambda:"vision-model", provider_config={"api_key":"secret"})])
             p._reference_list = Mock(return_value=[])
