@@ -128,6 +128,94 @@ class DrawingRoutesTests(unittest.TestCase):
             self.assertFalse(event.call_llm)
         asyncio.run(run())
 
+    def test_primary_tool_draws_directly_even_with_independent_provider_configured(self):
+        async def run():
+            p = self.make_planner()
+            event = core.FakeEvent("画一张窗前的你，换白裙")
+            req = ProviderRequest(prompt=event.message)
+            await p.drawing_identity_context(event,req)
+            context = self.drawing_context(req)
+            self.assertIn("default_outfit",context)
+            self.assertNotIn("简短绘图意图",context)
+            result = await p.novelai_generate_image(event,"window, sunset",subjects=[{"source":"self","outfit":"white dress"}])
+            self.assertIn("FINAL_IMAGE_TOOL_RESULT",result)
+            self.assertIsNone(event.get_extra("nai_planner_pending"))
+            self.assertIn("white dress",p._call_official.await_args.args[0])
+            self.assertIn("window, sunset",p._call_official.await_args.args[0])
+            p._call_official.assert_awaited_once()
+            await self.complete_reply(p,event)
+            p.context.llm_generate.assert_not_awaited()
+        asyncio.run(run())
+
+    def test_primary_tool_still_corrects_its_own_parameters_without_drawing_llm(self):
+        async def run():
+            p = self.make_planner(); event = core.FakeEvent("画窗边的你")
+            result = await p.novelai_generate_image(event,"window",subjects=[{"source":"card","preset_id":"missing"}])
+            self.assertIn("IMAGE_TOOL_ARGUMENT_ERROR",result)
+            p._call_official.assert_not_awaited()
+            result = await p.novelai_generate_image(event,"window",subjects=[{"source":"self"}])
+            self.assertIn("FINAL_IMAGE_TOOL_RESULT",result)
+            p._call_official.assert_awaited_once()
+            p.context.llm_generate.assert_not_awaited()
+        asyncio.run(run())
+
+    def test_primary_drawing_can_be_used_by_later_independent_edit_without_delegation(self):
+        async def run():
+            p = self.make_planner(); del p._finish_event
+            image=p.temp_dir/"image.png"; image.write_bytes(b"image")
+            p._call_official.return_value=str(image)
+            event=self.drawing_event("画你穿白裙坐窗前","primary")
+            await p.novelai_generate_image(event,"window",subjects=[{"source":"self","outfit":"white dress","prompt":"sitting"}])
+            p.context.llm_generate.assert_not_awaited()
+            self.persist_turn(p,event)
+            await p._quick_draw(self.drawing_event("/n 改上一张的视角，其他不变","edit"),"改上一张的视角，其他不变")
+            payload=json.loads(p.context.llm_generate.await_args.kwargs["prompt"])
+            self.assertEqual(payload["previous_drawing"]["subjects"][0]["outfit"],"white dress")
+            self.assertEqual(payload["previous_user_request"],event.message)
+        asyncio.run(run())
+
+    def test_text_tool_wrappers_and_redundant_defaults_are_normalized_without_retry(self):
+        async def run(value):
+            p = self.make_planner(); p.context.llm_generate.return_value = LLMResponse("assistant",completion_text=json.dumps(value))
+            await p._quick_draw(core.FakeEvent("/n 换白裙"),"换白裙")
+            p.context.llm_generate.assert_awaited_once(); p._call_official.assert_awaited_once()
+        plan={"prompt":"window", "subjects":'[{"source":"self","outfit":"white dress"}]',
+            "operation":"generate","reference_type":""}
+        for value in (plan,{"name":"submit_drawing_plan","arguments":plan},
+                {"type":"function","function":{"name":"submit_drawing_plan","arguments":json.dumps(plan)}}):
+            asyncio.run(run(value))
+        for bad in ({**plan,"operation":"img2img"},{**plan,"extra":"unknown"},
+                {"name":"other_tool","arguments":plan}, {"name":[],"arguments":plan}):
+            with self.assertRaises(ValueError): planner.parse_plan(json.dumps(bad))
+
+    def test_format_retry_uses_remaining_budget_and_logs_request_start_before_provider_call(self):
+        async def run(first_seconds, expected):
+            p = self.make_planner(); p._notify = AsyncMock()
+            good = p.context.llm_generate.return_value
+            clock = [0]
+            timeouts=[]
+            real_wait_for=asyncio.wait_for
+            async def wait_for(awaitable, timeout):
+                timeouts.append(timeout)
+                return await real_wait_for(awaitable,timeout)
+            async def generate(**kwargs):
+                self.assertEqual(p._planner_diagnostics[core.FakeEvent.unified_msg_origin]["phase"],"request")
+                if len(timeouts)==1:
+                    clock[0]=first_seconds
+                    return LLMResponse("assistant",completion_text='{"prompt":"window","subjects":{}}')
+                clock[0]=59
+                return good
+            p.context.llm_generate.side_effect=generate
+            with patch("main.time.perf_counter",side_effect=lambda:clock[0]),patch("main.asyncio.wait_for",side_effect=wait_for):
+                await p._quick_draw(core.FakeEvent("/n 换白裙"),"换白裙")
+            self.assertEqual(p.context.llm_generate.await_count,expected)
+            self.assertEqual(timeouts[0],60)
+            if expected==2:
+                self.assertEqual(timeouts[1],60-first_seconds)
+                p._call_official.assert_awaited_once()
+            else: p._call_official.assert_not_awaited()
+        asyncio.run(run(53,2)); asyncio.run(run(59,1))
+
     def test_direct_drawing_receipt_and_request_are_visible_to_next_main_and_drawing_calls(self):
         async def run():
             p = self.make_planner(); del p._finish_event
@@ -167,6 +255,8 @@ class DrawingRoutesTests(unittest.TestCase):
             await p._quick_draw(core.FakeEvent("/n 换白裙"),"换白裙")
             kwargs = p.context.llm_generate.await_args.kwargs
             self.assertEqual(kwargs["tools"].names(), ["submit_drawing_plan"])
+            self.assertEqual(kwargs["tool_choice"],"required")
+            self.assertEqual(kwargs["request_max_retries"],1)
             self.assertEqual([tool.name for tool in llm_tools.func_list],before)
             self.assertIn("missing", json.loads(kwargs["prompt"])["format_correction"]["previous_output"])
             self.assertIn("提交方案", json.loads(kwargs["prompt"])["format_correction"]["previous_output"])
@@ -249,11 +339,13 @@ class DrawingRoutesTests(unittest.TestCase):
                         "function":{"name":"submit_drawing_plan","arguments":json.dumps(plan)}}]}}]})
             create = AsyncMock(return_value=completion)
             provider.client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
-            response = await provider._query({"model":"grok-model","messages":[{"role":"user","content":"draw"}]},
-                planner.plan_tools(),request_max_retries=1)
+            provider.api_keys=["mock-test-key"]
+            provider._prepare_chat_payload=AsyncMock(return_value=({"model":"grok-model","messages":[{"role":"user","content":"draw"}]},[]))
+            response = await provider.text_chat(prompt="draw",func_tool=planner.plan_tools(),tool_choice="required",request_max_retries=1)
             schema = create.await_args.kwargs["tools"][0]["function"]
             self.assertEqual(schema["name"],"submit_drawing_plan")
             self.assertIn("subjects",schema["parameters"]["properties"])
+            self.assertEqual(create.await_args.kwargs["tool_choice"],"required")
             self.assertEqual(planner.response_plan(response)["prompt"],plan["prompt"])
         asyncio.run(run())
 

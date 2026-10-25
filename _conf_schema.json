@@ -22,7 +22,7 @@
     "description": "独立绘图 LLM Provider ID（留空关闭）",
     "type": "string",
     "default": "",
-    "hint": "填写已在 AstrBot 配置的聊天模型 Provider ID。暗号触发时不依赖主模型转交意图，正常回复后由此模型理解用户原文、回复与同一会话上下文；/n 只由此模型出图。主模型仍可通过工具委托绘图。"
+    "hint": "仅 n 暗号和 /n 使用此模型。n 在主模型完整回复发送后规划，/n 只出图。普通绘图工具始终由主模型直接写参数出图，配置此项不会自动转述。"
   },
   "drawing_trigger": {
     "description": "图文双线暗号（留空关闭）", "type": "string", "default": "n",
@@ -32,11 +32,11 @@
     "description": "绘图 LLM 输出协议", "type": "string", "default": "auto",
     "options": ["auto", "tool", "json"],
     "labels": {"auto": "自动（OpenAI 兼容优先参数工具）", "tool": "内部参数提交工具", "json": "JSON 文本"},
-    "hint": "内部 submit_drawing_plan 只收参数，由插件校验后生图，不执行其他工具。兼容接口不支持工具时可选 JSON 文本。"
+    "hint": "工具模式要求提交 submit_drawing_plan 参数，减少先输出文本再纠正的额外调用。工具只收参数；不支持工具的兼容接口可选 JSON 文本。"
   },
   "drawing_llm_format_retry": {
     "description": "格式或字段错误时纠正一次", "type": "bool", "default": true,
-    "hint": "把错误和前一次输出反馈给绘图 LLM，最多再调用一次；验证通过前不请求图片服务。拒绝、超时和网络失败不自动重试。"
+    "hint": "先清理可识别的工具包装和冗余默认字段；仍无效且总超时预算剩余至少 3 秒时，反馈错误纠正一次。验证前不请求图片服务，拒绝/网络失败不重试。"
   },
   "drawing_llm_debug": {
     "description": "记录绘图 LLM 回包预览", "type": "bool", "default": false,
@@ -49,10 +49,10 @@
     "hint": "0-30 条 user/assistant 消息，每条最多 2000 字符；0 不读取旧对话。用户本轮原文与本轮回复仍会提供。"
   },
   "drawing_llm_timeout": {
-    "description": "绘图 LLM 超时（秒）",
+    "description": "绘图 LLM 总超时预算（秒）",
     "type": "int",
     "default": 60,
-    "hint": "5-180 秒，每次规划调用的超时。启用格式纠正时最多两次；不自动切回主模型。"
+    "hint": "5-180 秒，首次规划和一次格式纠正共同使用此预算；重试仅使用剩余时间，不再追加一个完整超时。等待主模型回复和图片服务时间另计。"
   },
   "drawing_llm_use_images": {
     "description": "允许绘图 LLM 读取本轮附图与上一张成图",

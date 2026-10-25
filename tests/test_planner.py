@@ -32,6 +32,11 @@ class PlannerTests(unittest.TestCase):
         await plugin.drawing_capture_reply(event, LLMResponse("assistant", completion_text=text))
         await plugin.drawing_after_reply(event)
 
+    async def queue_marker(self, plugin, event):
+        if planner.marker_request(event.message, "n") is None:
+            event.message += " n"
+        return await plugin.drawing_marker_event(event)
+
     def test_queue_does_not_generate_until_main_reply_then_receives_user_original(self):
         async def run():
             p = self.make_planner()
@@ -42,9 +47,9 @@ class PlannerTests(unittest.TestCase):
                 {"role":"system", "content":"Do not share this persona"},
                 {"role":"user", "content":"Earlier request"}, {"role":"tool", "content":"Old tool payload"},
                 {"role":"assistant", "content":"我刚走进房间。"}])
+            await self.queue_marker(p, event)
             await p.drawing_identity_context(event, request)
-            queued = await p.novelai_generate_image(event, "画现在的你")
-            self.assertIn("DRAWING_REQUEST_QUEUED", queued)
+            self.assertTrue(event.get_extra("nai_planner_pending"))
             p.context.llm_generate.assert_not_awaited()
             p._call_official.assert_not_awaited()
             await p.drawing_after_reply(event)
@@ -52,7 +57,10 @@ class PlannerTests(unittest.TestCase):
             await self.complete_reply(p, event)
             payload = json.loads(p.context.llm_generate.await_args.kwargs["prompt"])
             self.assertEqual(payload["user_request"], event.message)
-            self.assertEqual(payload["drawing_intent"]["prompt"], "画现在的你")
+            self.assertEqual(payload["drawing_request"], "把裙子换成白色，坐到窗前，保持耳朵不变")
+            self.assertNotIn("drawing_intent",payload)
+            self.assertNotIn("style_prompt",payload["available_cards"][0])
+            self.assertNotIn("negative_prompt",payload["available_cards"][0])
             self.assertIn("坐到窗前", payload["current_reply"])
             self.assertEqual(len(payload["recent_dialogue"]), 2)
             self.assertNotIn("Old tool payload", str(payload))
@@ -71,9 +79,8 @@ class PlannerTests(unittest.TestCase):
         async def run():
             p = self.make_planner()
             event = core.FakeEvent("画一张你")
-            results = await asyncio.gather(p.novelai_generate_image(event,"画你"), p.novelai_generate_image(event,"再画你"))
-            self.assertEqual(sum("DRAWING_REQUEST_QUEUED" in result and "DUPLICATE" not in result for result in results), 1)
-            self.assertEqual(sum("DUPLICATE" in result for result in results), 1)
+            await asyncio.gather(self.queue_marker(p,event), self.queue_marker(p,event))
+            self.assertTrue(event.get_extra("nai_planner_pending"))
             await p.drawing_capture_reply(event, LLMResponse("assistant", completion_text="好。"))
             await asyncio.gather(p.drawing_after_reply(event), p.drawing_after_reply(event))
             await p.drawing_after_reply(event)
@@ -109,7 +116,7 @@ class PlannerTests(unittest.TestCase):
             p.context.llm_generate.side_effect = error
             p._notify = AsyncMock()
             event = core.FakeEvent()
-            await p.novelai_generate_image(event,"primary tags, portrait")
+            await self.queue_marker(p,event)
             await self.complete_reply(p,event)
             expected_calls = 2 if response.startswith("{") else 1
             self.assertEqual(p.context.llm_generate.await_count, expected_calls)
@@ -117,7 +124,7 @@ class PlannerTests(unittest.TestCase):
             p._notify.assert_awaited_once()
             await p.drawing_after_reply(event)
             self.assertEqual(p.context.llm_generate.await_count, expected_calls)
-        for response,error in (("I cannot process this request",None), ('{"prompt":"room","subjects":"[]"}',None),
+        for response,error in (("I cannot process this request",None), ('{"prompt":"room","subjects":"broken"}',None),
             ('{"prompt":"room","subjects":[{"source":"card","preset_id":"missing"}]}',None),
             ("",asyncio.TimeoutError()), ("",RuntimeError("service failure"))):
             with self.subTest(response=response,error=error): asyncio.run(run(response,error))
@@ -126,7 +133,7 @@ class PlannerTests(unittest.TestCase):
         async def run(during):
             p = self.make_planner(); p._notify = AsyncMock()
             event = core.FakeEvent()
-            await p.novelai_generate_image(event,"draw")
+            await self.queue_marker(p,event)
             async def reset_then_return(**kwargs):
                 reset = core.FakeEvent(); reset.set_extra("_clean_group_context_session", True)
                 await p.drawing_context_lifecycle(reset)
@@ -151,7 +158,7 @@ class PlannerTests(unittest.TestCase):
             self.assertTrue(event.stopped)
             payload = json.loads(p.context.llm_generate.await_args.kwargs["prompt"])
             self.assertEqual(payload["user_request"], "/n 换白裙坐到窗前")
-            self.assertEqual(payload["drawing_intent"]["prompt"], "换白裙坐到窗前")
+            self.assertEqual(payload["drawing_request"], "换白裙坐到窗前")
             self.assertEqual(payload["current_reply"], "")
             self.assertIn("white dress", p._call_official.await_args.args[0])
         asyncio.run(run())
@@ -163,8 +170,8 @@ class PlannerTests(unittest.TestCase):
             event = core.FakeEvent("照我发的图调整站姿")
             req = ProviderRequest(prompt=event.message, contexts=[{"role":"user","content":"old secret"}],
                 image_urls=["https://example.org/user.png"])
+            await self.queue_marker(p,event)
             await p.drawing_identity_context(event,req)
-            await p.novelai_generate_image(event,"pose")
             await self.complete_reply(p,event)
             kwargs = p.context.llm_generate.await_args.kwargs
             self.assertEqual(kwargs["image_urls"], ["https://example.org/user.png"] if enabled else None)
@@ -181,14 +188,14 @@ class PlannerTests(unittest.TestCase):
             source = p.temp_dir / "generated.png"; source.write_bytes(b"test-image")
             p._call_official.return_value = str(source)
             event = self.drawing_event("画你坐在窗前", "one")
-            await p.novelai_generate_image(event,"window")
+            await self.queue_marker(p,event)
             await self.complete_reply(p,event)
             self.assertEqual(len(p._drawing_memory), 1)
             copied = Path(next(iter(p._drawing_memory.values()))["image"])
             self.assertTrue(copied.exists())
             self.persist_turn(p,event)
             event2 = self.drawing_event("站起来，衣服不变", "two")
-            await p.novelai_generate_image(event2,"stand")
+            await self.queue_marker(p,event2)
             await self.complete_reply(p,event2)
             kwargs = p.context.llm_generate.await_args.kwargs
             payload = json.loads(kwargs["prompt"])
@@ -225,7 +232,7 @@ class PlannerTests(unittest.TestCase):
         async def run():
             p = self.make_planner({"prompt":"room","subjects":[{"source":"self","outfit":"kimono","state_scope":"story"}]})
             event = core.FakeEvent("设想穿和服")
-            await p.novelai_generate_image(event,"kimono")
+            await self.queue_marker(p,event)
             await self.complete_reply(p,event)
             self.assertIn("kimono", p._call_official.await_args.args[0])
             self.assertFalse(p._ledger().states)
@@ -237,7 +244,7 @@ class PlannerTests(unittest.TestCase):
             p.config["llm_card_mode"] = "strict"
             p.config["llm_auto_reference"] = False
             event = core.FakeEvent("画你微笑")
-            await p.novelai_generate_image(event,"smiling")
+            await self.queue_marker(p,event)
             await self.complete_reply(p,event)
             p._call_official.assert_awaited_once()
         asyncio.run(run())
@@ -255,7 +262,7 @@ class PlannerTests(unittest.TestCase):
             event.get_sender_name = lambda: "user"
             event._outline_chain = lambda chain: "reply"
             event.clear_result = lambda: setattr(event, "result", None)
-            await p.novelai_generate_image(event,"window")
+            await self.queue_marker(p,event)
             text = "我站在窗前，穿着白裙。"
             async def capture_hook(current, kind, response, *args):
                 await p.drawing_capture_reply(current, response)
@@ -282,7 +289,7 @@ class PlannerTests(unittest.TestCase):
     def test_stream_finish_triggers_planner_once_and_preserves_complete_reply(self):
         async def run():
             p = self.make_planner(); event = core.FakeEvent("把裙子换白色")
-            await p.novelai_generate_image(event, "change dress")
+            await self.queue_marker(p,event)
             text = "开始的动作。" + "剧情" * 5000 + "结尾的动作。"
             await p.drawing_capture_reply(event, LLMResponse("assistant", completion_text=text))
             event.result = MessageEventResult().message(text)
@@ -299,7 +306,7 @@ class PlannerTests(unittest.TestCase):
         async def run(during):
             p = self.make_planner(); p._notify = AsyncMock()
             event = core.FakeEvent("draw")
-            await p.novelai_generate_image(event,"draw")
+            await self.queue_marker(p,event)
             if during:
                 async def generate(**kwargs):
                     p.config["drawing_llm_provider_id"] = "another-provider"

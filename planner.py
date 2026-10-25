@@ -41,14 +41,50 @@ def marker_request(message: str, marker: str) -> str | None:
 
 def recent_dialogue(records, count: int) -> list[dict[str, str]]:
     """Only conversational text; exclude tools, system prompts and catalogs."""
+    if count <= 0:
+        return []
     result = []
-    for role, text in records or ():
+    for role, text in reversed(records or ()):
         if role not in {"user", "assistant"} or not text:
             continue
         text = re.sub(r"\[NovelAI drawing identities\].*?\[End NovelAI drawing identities\]", "", text, flags=re.S).strip()
         if text:
             result.append({"role": role, "text": text[-2000:]})
-    return result[-count:] if count else []
+            if len(result) >= count:
+                break
+    return list(reversed(result))
+
+
+def normalize_plan(result):
+    """Unwrap explicit tool-shaped text; never guess missing scene content."""
+    if not isinstance(result, dict):
+        return result
+    if set(result) <= {"type", "function"} and result.get("type", "function") == "function" and isinstance(result.get("function"), dict):
+        result = result["function"]
+    if isinstance(result.get("name"), str) and result["name"] in {"submit_drawing_plan", "novelai_generate_image"}:
+        fields = set(result)
+        key = "arguments" if "arguments" in fields else "parameters"
+        if fields == {"name", key}:
+            result = result[key]
+            if isinstance(result, str):
+                try:
+                    result = json.loads(result)
+                except ValueError as exc:
+                    raise PlanError("工具包装中的参数不是有效 JSON。") from exc
+    if not isinstance(result, dict):
+        return result
+    result = dict(result)
+    # These are redundant defaults from the public image tool, not edits.
+    if result.get("operation") == "generate":
+        result.pop("operation")
+    if result.get("reference_type") == "":
+        result.pop("reference_type")
+    if isinstance(result.get("subjects"), str):
+        try:
+            result["subjects"] = json.loads(result["subjects"])
+        except ValueError as exc:
+            raise PlanError("subjects 字符串没有包含有效 JSON 数组。") from exc
+    return result
 
 
 def parse_plan(text: str) -> dict:
@@ -77,10 +113,13 @@ def parse_plan(text: str) -> dict:
             raise PlanError("绘图 LLM 表示无法处理该请求，本次未请求图片服务。", "refusal", False) from exc
         detail = f"第 {exc.lineno} 行第 {exc.colno} 列：{exc.msg}" if isinstance(exc, json.JSONDecodeError) else "未找到 JSON 对象"
         raise PlanError(f"绘图 LLM 未返回有效 JSON（{detail}）；本次没有请求图片服务。") from exc
+    result = normalize_plan(result)
     if isinstance(result, dict) and isinstance(result.get("error"), str):
         raise PlanError("绘图 LLM 表示无法处理该请求，本次未请求图片服务。", "refusal", False)
-    if not isinstance(result, dict) or set(result) - {"prompt", "subjects", "style"}:
-        raise ValueError("绘图 LLM 应返回 prompt、subjects 和可选 style。")
+    if not isinstance(result, dict):
+        raise ValueError("绘图 LLM 应返回 prompt、subjects 和可选 style 的对象。")
+    if extra := set(result) - {"prompt", "subjects", "style"}:
+        raise ValueError("绘图 LLM 含不支持的字段：" + ", ".join(sorted(extra))[:120] + "；仅接收 prompt、subjects、style。")
     if not isinstance(result.get("prompt"), str) or not result["prompt"].strip() or len(result["prompt"]) > 8000:
         raise ValueError("绘图 LLM 缺少有效画面描述。")
     if not isinstance(result.get("subjects"), list) or len(result["subjects"]) > 6 or any(not isinstance(s, dict) for s in result["subjects"]):
@@ -125,12 +164,19 @@ def response_plan(response) -> dict:
 def plan_tools():
     """A request-local schema; no global registration or tool execution."""
     from astrbot.core.agent.tool import FunctionTool, ToolSet
-    if __package__:
-        from . import drawing
-    else:
-        import drawing
-    properties = {key: value for key, value in drawing.TOOL_PARAMETERS["properties"].items()
-        if key in {"prompt", "subjects", "style"}}
+    # A compact planning contract, not the larger public image tool schema.
+    properties = {
+        "prompt": {"type": "string", "description": "共享场景、构图、光线的英文 Tag，不重复卡内身份/画风。", "maxLength": 8000},
+        "subjects": {"type": "array", "maxItems": 6, "items": {"type": "object",
+            "properties": {
+                "source": {"type": "string", "enum": ["self", "card", "custom"]},
+                "preset_id": {"type": "string", "description": "仅 card 填准确 ID。"},
+                "prompt": {"type": "string", "maxLength": 4000, "description": "个人动作表情；custom 还写角色名及外貌。"},
+                "outfit": {"type": "string", "maxLength": 4000, "description": "换装时提交完整服饰，空串为无服饰。"},
+                "use_reference": {"type": "boolean", "description": "默认省略，仅卡参考图符合本图外观时开启。"}},
+            "required": ["source"], "additionalProperties": False}},
+        "style": {"type": "string", "maxLength": 4000, "description": "仅明确改画风时填写，否则省略。"},
+    }
     properties["error"] = {"type": "string", "description": "无法处理时说明原因，不编造画面。"}
     return ToolSet([FunctionTool(name="submit_drawing_plan", description="提交一份最终绘图方案，只交参数，不执行生图。",
         parameters={"type": "object", "properties": properties, "additionalProperties": False,

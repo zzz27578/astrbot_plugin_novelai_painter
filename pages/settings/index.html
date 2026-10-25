@@ -54,14 +54,14 @@
       </div>
       <div class="capability" id="capability"></div>
       <div class="divider"></div>
-      <div class="section-head compact"><div><span class="kicker">DRAWING LLM</span><h3>独立绘图 LLM</h3><p>暗号触发图文双线，/n 只出图；均直接读取当前会话。主模型也可通过工具转交绘图意图。Provider 留空时仅保留直接 Tag 与主模型工具入口。</p></div></div>
+      <div class="section-head compact"><div><span class="kicker">DRAWING LLM</span><h3>独立绘图 LLM</h3><p>仅暗号 n 和 /n 使用此模型并读取当前会话。普通绘图工具始终由主模型直接写参数出图，配置 Provider 不会自动转述。n 保留完整回复发送后再规划的时序。</p></div></div>
       <div class="grid two">
         <label class="field"><span>绘图 LLM Provider ID</span><input data-config="drawing_llm_provider_id" type="text" list="drawing-provider-options" maxlength="200" placeholder="留空关闭；选择 AstrBot 中已配置的模型" /><datalist id="drawing-provider-options"></datalist><small>使用 AstrBot 的聊天模型 Provider ID；这里不是 NovelAI 图片模型 ID。</small></label>
         <label class="field"><span>图文双线暗号</span><input data-config="drawing_trigger" type="text" maxlength="16" placeholder="n；留空关闭" /><small>单独发送或放在消息首尾，如 n画窗前的你。主模型正常回复，随后绘图 LLM 独立出图；不依赖主模型写 Tag。</small></label>
-        <label class="field"><span>绘图输出协议</span><select data-config="drawing_llm_output_mode"><option value="auto">自动（兼容接口优先参数工具）</option><option value="tool">内部参数提交工具</option><option value="json">JSON 文本</option></select><small>适配 OpenAI 兼容 /v1 服务。工具只提交方案，插件校验后统一生图；不支持工具时选择 JSON 文本。</small></label>
+        <label class="field"><span>绘图输出协议</span><select data-config="drawing_llm_output_mode"><option value="auto">自动（兼容接口优先参数工具）</option><option value="tool">内部参数提交工具</option><option value="json">JSON 文本</option></select><small>工具模式要求直接提交参数，减少先输出文本再纠正的额外调用。工具只提交方案，不支持工具的接口可选 JSON 文本。</small></label>
         <label class="field"><span>最近对话消息数</span><input data-config="drawing_llm_context_messages" type="number" min="0" max="30" /><small>默认 12 条，每条最多 2000 字符。用户本轮原文和主模型完整回复另行提供，避免转述丢失改图需求。</small></label>
-        <label class="field"><span>每次规划超时（秒）</span><input data-config="drawing_llm_timeout" type="number" min="5" max="180" /><small>格式纠正最多追加一次 LLM 调用；图片服务在参数通过前不会收到请求。</small></label>
-        <label class="switch-row"><input data-config="drawing_llm_format_retry" type="checkbox" /><span><b>格式错误纠正一次</b><small>清理包装后仍无效，将具体错误反馈给绘图 LLM。拒绝、超时和网络错误停止，不自动重试。</small></span></label>
+        <label class="field"><span>规划总超时预算（秒）</span><input data-config="drawing_llm_timeout" type="number" min="5" max="180" /><small>首次规划与一次格式纠正共同使用此预算，重试只用剩余时间；等待主模型和图片服务另计。</small></label>
+        <label class="switch-row"><input data-config="drawing_llm_format_retry" type="checkbox" /><span><b>格式错误纠正一次</b><small>先清理可识别的包装和冗余默认字段；仍无效且预算足够才反馈纠正。拒绝、超时和网络错误停止。</small></span></label>
         <label class="switch-row"><input data-config="drawing_llm_debug" type="checkbox" /><span><b>记录绘图回包预览</b><small>排查时开启，日志和任务快照显示最多 2000 字符的返回内容，可能包含画面描述。默认仅记录错误类型、长度与次数。</small></span></label>
         <label class="switch-row"><input data-config="drawing_llm_use_images" type="checkbox" /><span><b>读取附图和最近成图</b><small>需要视觉模型。最多发送两张本轮附图和一张有效的上一张成图；旧图只补连续性，不覆盖新要求。成图参考最多保留 30 分钟。</small></span></label>
         <label class="field full"><span>绘图偏好（可选）</span><textarea data-config="drawing_llm_prompt" rows="3" maxlength="4000" placeholder="例如：保持当前场景连续，优先人物互动与清楚的构图"></textarea><small>内置绘图技能自动加载。/n [自然语言要求] 只唤醒绘图 LLM；/nai &lt;Tag&gt; 直接提交图片服务。两种 LLM 读取同一当前会话，绘图不会另建聊天。</small></label>

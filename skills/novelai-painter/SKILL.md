@@ -7,11 +7,11 @@ description: 使用 novelai_generate_image 绘制用户明确请求的图片，�
 
 绘图时阅读本轮临时工具上下文中的 `[NovelAI drawing identities]` 目录和模式，再选择人物。这份目录不写入聊天历史；其中的默认/当前服饰是绘图状态，不是新发生的剧情，不改变聊天人设。角色身份和画风由插件直接应用，不需要抄写全部卡词。
 
-若本轮提示已启用独立绘图 LLM，调用工具时只需在 `prompt` 提交绘图意图与必要的补充要求，`subjects` 可选。插件直接向绘图 LLM 提供用户本轮原话、限定上下文和你的最终回复，由它整理 Tag；无需转述或重写角色卡。收到 `DRAWING_REQUEST_QUEUED` 后正常完成本轮对话，不再调用绘图工具，不提前声称图片已发送。图片会在回复发送后单独生成。不要将本图假想换装写成已发生的剧情。
+普通绘图请求始终由主模型编写完整 `prompt` 和人物参数，调用 `novelai_generate_image` 直接出图。即使配置了独立绘图 LLM，本工具也不会转交意图；不要只传“画现在的你”等简短意图。
 
 本轮提示若说明绘图暗号已排队，只需正常聊天，完全不必写 Tag、转交意图或调用绘图工具。插件会独立读取用户原话与同一会话的当前上下文，在回复完成后出图。临时素材中的最近绘图记录可用于理解后续指代，但绘图设想不是剧情事实。
 
-独立绘图 LLM 的参数整理规则见 [references/drawing-planner.md](references/drawing-planner.md)，插件自动加载这份专用说明；主聊天模型仅在需要了解委托协议时阅读。以下完整 Tag 示例适用于未配置独立模型的直接绘图模式。
+独立绘图 LLM 只服务暗号和 `/n`，其规则见 [references/drawing-planner.md](references/drawing-planner.md)，由插件自动加载。以下完整 Tag 示例用于主模型工具调用。
 
 - `subjects` 直接传 JSON 数组，每人一项，不要再编码成字符串。
 - 画 AI 自己用 `source=self`；指定库中角色用 `source=card`、`preset_id`；其他角色用 `source=custom`，可在自己的 `prompt` 或 `appearance_prompt` 写准确角色名或外貌，无需建卡；完整描述已在顶层时不必重复。多人可以混用这些来源。风景、物品用空数组。
