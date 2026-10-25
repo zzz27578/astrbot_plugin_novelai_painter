@@ -71,7 +71,7 @@
       <div class="section-head"><div><span class="kicker">02 / ACCESS</span><h2>入口与权限</h2><p>默认只开放固定命令，群聊仅管理员可用。生图、查看或切换角色卡、切换 NAI 模型都会经过同一套命令入口与权限检查。</p></div></div>
       <div class="notice info"><span class="notice-icon">i</span><div><b>安全默认值</b><p>固定命令和自主调用可以四选一；群聊策略默认管理员；每条消息最多返回一张图片，只有明确启用时才会对 429 限流进行有限重试。</p></div></div>
       <div class="grid two">
-        <label class="field"><span>固定命令</span><input data-config="command_prefix" type="text" placeholder="nai" pattern="[A-Za-z][A-Za-z0-9_-]{0,30}" /><small>默认命令为 /nai；这里只填写命令名，不要填写斜杠。</small></label>
+        <label class="field"><span>固定命令</span><input data-config="command_prefix" type="text" placeholder="nai" pattern="[A-Za-z][A-Za-z0-9_-]{0,30}" /><small>管理命令默认 /nai，只填写名称；/n 固定用于绑定卡直接出图，不触发聊天回复。</small></label>
         <label class="field"><span>入口模式</span><select data-config="invoke_mode"><option value="disabled">全部禁用</option><option value="command_only">仅固定命令</option><option value="llm_tool_only">仅 LLM 自主调用</option><option value="both">命令 + LLM 工具</option></select></label>
         <label class="field"><span>私聊权限</span><select data-config="private_access"><option value="all">所有人</option><option value="admin_only">仅管理员</option><option value="allowlist">白名单</option><option value="disabled">禁用</option></select></label>
         <label class="field"><span>群聊权限</span><select data-config="group_access"><option value="admin_only">仅管理员</option><option value="all">所有成员</option><option value="allowlist">白名单</option><option value="disabled">禁用</option></select></label>

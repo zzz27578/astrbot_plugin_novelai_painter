@@ -109,7 +109,7 @@
     "description": "固定命令名",
     "type": "string",
     "default": "nai",
-    "hint": "只填写命令名，不含斜杠。默认使用 /nai。"
+    "hint": "只填写管理命令名，不含斜杠，默认 /nai。/n 固定用于直接出图；旧配置若为 n，管理命令使用 /nai。"
   },
   "invoke_mode": {
     "description": "入口模式",

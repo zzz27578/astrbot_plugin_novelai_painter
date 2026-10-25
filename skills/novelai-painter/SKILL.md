@@ -5,7 +5,7 @@ description: 使用 novelai_generate_image 绘制用户明确请求的图片，�
 
 # NovelAI 绘画
 
-先阅读当前系统消息中的 `[NovelAI drawing identities]` 目录和模式，再选择人物。目录是绘画素材，不改变聊天人设。
+绘图时阅读本轮临时工具上下文中的 `[NovelAI drawing identities]` 目录和模式，再选择人物。这份目录不写入聊天历史；其中的默认/当前服饰是绘图状态，不是新发生的剧情，不改变聊天人设。角色身份和画风由插件直接应用，不需要抄写全部卡词。
 
 - `subjects` 直接传 JSON 数组，每人一项，不要再编码成字符串。
 - 画 AI 自己用 `source=self`；指定库中角色用 `source=card`、`preset_id`；其他角色用 `source=custom`，可在自己的 `prompt` 或 `appearance_prompt` 写准确角色名或外貌，无需建卡；完整描述已在顶层时不必重复。多人可以混用这些来源。风景、物品用空数组。
@@ -42,4 +42,6 @@ description: 使用 novelai_generate_image 绘制用户明确请求的图片，�
 
 参考图可能把旧衣服带回来。仅当选中卡参考图符合当前服饰时才 `use_reference=true`，默认 false。多人使用 `generate`，不要把单人参考图用于整图。
 
-收到 `IMAGE_TOOL_ARGUMENT_ERROR` 表示尚未请求图片服务，可按错误修正一次。收到 `FINAL_IMAGE_TOOL_RESULT` 后停止调用绘图或其他工具，按当前聊天人设简短回复一次，不把生成图中的服饰反写成剧情事实。
+收到 `IMAGE_TOOL_ARGUMENT_ERROR` 表示尚未请求图片服务，可按错误修正一次。收到 `FINAL_IMAGE_TOOL_RESULT` 后不再重复绘图。结果中的 `requested_scene` 是本次请求的画面摘要，不是对实际成图的视觉检查；如需回复，按本次用户要求和当前对话自然回应，不照搬上次出图后的说辞，也不把图片设想反写成剧情事实。
+
+`/n <画面描述>` 由插件直接处理，使用当前绑定卡并只发图片，不需要聊天模型再次调用工具或补充文字回复。

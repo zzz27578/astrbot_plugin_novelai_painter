@@ -12,7 +12,9 @@ from types import SimpleNamespace
 import drawing
 
 from main import DEFAULT_NEGATIVE, GenerationResult, NovelAIPainterPlugin, ProviderError
-from astrbot.api.provider import LLMResponse
+from astrbot.api.provider import LLMResponse, ProviderRequest
+from astrbot.core.agent.message import Message, TextPart, dump_messages_with_checkpoints
+from astrbot.core.message.components import Image
 from astrbot.core.message.message_event_result import MessageChain
 
 
@@ -25,6 +27,8 @@ class FakeEvent:
         self.message = message
         self.result = None
         self.extras = {}
+        self.call_llm = True
+        self.stopped = False
     async def send(self, message): self.sent.append(message)
     def is_private_chat(self): return False
     def is_admin(self): return self.role == "admin"
@@ -36,6 +40,8 @@ class FakeEvent:
     def set_extra(self, key, value): self.extras[key] = value
     def get_extra(self, key, default=None): return self.extras.get(key, default)
     def plain_result(self, message): return message
+    def should_call_llm(self, enabled): self.call_llm = enabled
+    def stop_event(self): self.stopped = True
 
 
 class CoreTests(unittest.TestCase):
@@ -88,6 +94,9 @@ class CoreTests(unittest.TestCase):
         history.append({"role": "user", "content": event.message})
         history.append({"role": "assistant", "content": "ok"})
         conversation.history = json.dumps(history)
+
+    def drawing_context(self, req):
+        return next(part.text for part in req.extra_user_content_parts if part.text.startswith("[NovelAI drawing identities]"))
 
     def test_native_and_legacy_subject_arrays_produce_equivalent_prompts(self):
         async def run():
@@ -271,12 +280,12 @@ class CoreTests(unittest.TestCase):
             self.persist_turn(p, e)
             req = SimpleNamespace(system_prompt="Original persona")
             await p.drawing_identity_context(self.drawing_event("继续", "next"), req)
-            self.assertIn('"current_story_outfit": "white dress"', req.system_prompt)
+            self.assertIn('"current_story_outfit": "white dress"', self.drawing_context(req))
             p.context.conversation_manager.get_conversation.return_value.history = "[]"
             await p.drawing_identity_context(self.drawing_event("新对话", "new"), req)
-            self.assertNotIn('"current_story_outfit": "white dress"', req.system_prompt)
-            self.assertEqual(req.system_prompt.count("[NovelAI drawing identities]"), 1)
-            self.assertTrue(req.system_prompt.startswith("Original persona"))
+            self.assertNotIn('"current_story_outfit": "white dress"', self.drawing_context(req))
+            self.assertEqual(len(req.extra_user_content_parts), 1)
+            self.assertEqual(req.system_prompt, "Original persona")
         asyncio.run(run())
 
     def test_contextual_reference_requires_explicit_opt_in(self):
@@ -1220,7 +1229,7 @@ flat cell shading, clean lineart, masterpiece, best quality"""
             event = FakeEvent()
             result = await p.novelai_generate_image(event)
             self.assertIn("FINAL_IMAGE_TOOL_RESULT", result)
-            self.assertIn("reply to the user once", result)
+            self.assertEqual(json.loads(result.partition(": ")[2])["status"], "completed")
             p._run_job.assert_awaited_once_with(
                 event,
                 "1girl, silver hair, blue eyes, night city",
@@ -1397,18 +1406,20 @@ flat cell shading, clean lineart, masterpiece, best quality"""
             p.presets.append({"id": "disabled", "name": "Hidden", "enabled": False})
             req = SimpleNamespace(system_prompt="Original persona")
             await p.drawing_identity_context(FakeEvent(), req)
-            self.assertTrue(req.system_prompt.startswith("Original persona"))
-            self.assertIn('"self_card": {"id": "p1", "name": "P1"}', req.system_prompt)
-            self.assertIn("source=custom", req.system_prompt)
-            self.assertNotIn("Hidden", req.system_prompt)
-            self.assertNotIn("blonde hair", req.system_prompt)
-            previous = req.system_prompt
+            self.assertEqual(req.system_prompt, "Original persona")
+            self.assertIn('"self_card": {"id": "p1", "name": "P1"}', self.drawing_context(req))
+            self.assertIn("source=custom", self.drawing_context(req))
+            self.assertNotIn("Hidden", self.drawing_context(req))
+            self.assertNotIn("blonde hair", self.drawing_context(req))
+            previous = self.drawing_context(req)
             await p.drawing_identity_context(FakeEvent(), req)
-            self.assertEqual(req.system_prompt, previous)
+            self.assertEqual(self.drawing_context(req), previous)
+            self.assertEqual(len(req.extra_user_content_parts), 1)
             p.config["invoke_mode"] = "command_only"
             req.system_prompt = "Original persona"
             await p.drawing_identity_context(FakeEvent(), req)
             self.assertEqual(req.system_prompt, "Original persona")
+            self.assertEqual(req.extra_user_content_parts, [])
         asyncio.run(run())
 
     def test_explicit_self_selection_uses_resolved_card_without_keyword_guessing(self):
@@ -1426,6 +1437,63 @@ flat cell shading, clean lineart, masterpiece, best quality"""
             self.assertIn("smiling", args[0])
             self.assertEqual(args[1], "reference")
             p._resolve_active_preset.assert_awaited_once()
+        asyncio.run(run())
+
+    def test_drawing_context_is_temporary_in_real_provider_assembly_and_history(self):
+        async def run():
+            p = self.make_context_plugin()
+            original_system = "Original persona\nKeep the original system whitespace.\n"
+            history = [{"role":"user", "content":"Earlier request"}, {"role":"assistant", "content":"Earlier response"}]
+            req = ProviderRequest(prompt="画你在窗前微笑", system_prompt=original_system,
+                contexts=history.copy(), extra_user_content_parts=[TextPart(text="Other plugin context")])
+            await p.drawing_identity_context(FakeEvent(req.prompt), req)
+            self.assertEqual(req.system_prompt, original_system)
+            self.assertEqual(req.contexts, history)
+            self.assertEqual(req.prompt, "画你在窗前微笑")
+            assembled = await req.assemble_context()
+            self.assertIn("[NovelAI drawing identities]", drawing.text_content(assembled["content"]))
+            saved = dump_messages_with_checkpoints([Message.model_validate(assembled)])
+            saved_text = drawing.text_content(saved[0]["content"])
+            self.assertEqual(saved_text, "画你在窗前微笑\nOther plugin context")
+            self.assertNotIn("NovelAI drawing identities", json.dumps(saved))
+            self.assertNotIn("identity_prompt", self.drawing_context(req))
+            self.assertNotIn("style_prompt", self.drawing_context(req))
+        asyncio.run(run())
+
+    def test_legacy_system_injection_is_removed_without_overwriting_other_plugins(self):
+        async def run():
+            p = self.make_context_plugin()
+            req = ProviderRequest(prompt="继续", system_prompt="Persona\n[NovelAI drawing identities]\nold card rules\n[End NovelAI drawing identities]\nOther plugin rules",
+                extra_user_content_parts=[TextPart(text="Other temporary content").mark_as_temp()])
+            await p.drawing_identity_context(FakeEvent(), req)
+            self.assertEqual(req.system_prompt, "Persona\n\nOther plugin rules")
+            self.assertEqual(req.extra_user_content_parts[0].text, "Other temporary content")
+            self.assertEqual(len(req.extra_user_content_parts), 2)
+            p.presets[0]["name"] = "Updated card"
+            await p.drawing_identity_context(FakeEvent(), req)
+            self.assertEqual(len(req.extra_user_content_parts), 2)
+            self.assertIn("Updated card", self.drawing_context(req))
+            self.assertNotIn("old card rules", req.system_prompt)
+            self.assertEqual(req.system_prompt, "Persona\n\nOther plugin rules")
+        asyncio.run(run())
+
+    def test_completed_tool_result_reports_this_scene_without_persona_reply_template(self):
+        async def run():
+            p = self.make_context_plugin()
+            summaries = []
+            for index, scene in enumerate(("window, smiling, standing", "garden, running, laughing", "appearance, " * 100 + "dancing beside the lake")):
+                result = await p.novelai_generate_image(self.drawing_event("画当前画面", str(index)), scene, subjects=[{"source":"self"}])
+                summary = json.loads(result.partition(": ")[2])
+                self.assertEqual(summary["status"], "completed")
+                if len(scene) <= 800:
+                    self.assertEqual(summary["requested_scene"], scene)
+                else:
+                    self.assertTrue(summary["requested_scene"].endswith("dancing beside the lake"))
+                self.assertEqual(summary["request"], "画当前画面")
+                self.assertNotIn("persona", result)
+                self.assertNotIn("reply to the user once", result)
+                summaries.append(summary)
+            self.assertNotEqual(summaries[0]["requested_scene"], summaries[1]["requested_scene"])
         asyncio.run(run())
 
     def test_multi_subject_shared_style_change_preserves_other_subject_features(self):
@@ -1485,8 +1553,7 @@ flat cell shading, clean lineart, masterpiece, best quality"""
             event = FakeEvent("给我画一张你现在的样子")
             first = await p.novelai_generate_image(event, "full body, standing")
             second = await p.novelai_generate_image(event, "full body, standing")
-            self.assertIn("reply to the user once", first)
-            self.assertIn("reply to the user once", second)
+            self.assertEqual(json.loads(first.partition(": ")[2])["status"], "completed")
             self.assertIn("ENTRY_GATE_BLOCKED_DUPLICATE", second)
             self.assertEqual(p._call_official.await_count, 1)
         asyncio.run(run())
@@ -1564,6 +1631,103 @@ flat cell shading, clean lineart, masterpiece, best quality"""
             unrelated = await collect(p, FakeEvent("/help"))
             self.assertEqual(unrelated, [])
 
+        asyncio.run(run())
+
+    def test_n_command_sends_only_an_image_with_bound_card_and_no_chat_model(self):
+        async def run():
+            p = self.make_context_plugin()
+            del p._finish_event
+            p.config.update({"auto_clean_delay":0, "command_prefix":"paint", "show_queue_notice":True})
+            p.context.llm_generate = AsyncMock()
+            p.context.get_current_chat_provider_id = AsyncMock()
+            event = FakeEvent("/n@Painter white dress, smiling, window\nsoft lighting")
+            replies = [value async for value in p.cmd_draw(event)]
+            self.assertEqual(replies, [])
+            self.assertFalse(event.call_llm)
+            self.assertTrue(event.stopped)
+            self.assertEqual(len(event.sent), 1)
+            self.assertTrue(all(isinstance(component, Image) for component in event.sent[0].chain))
+            args = p._call_official.await_args.args
+            self.assertIn("blonde hair", args[0])
+            self.assertIn("white dress, smiling, window\nsoft lighting", args[0])
+            self.assertNotIn("black bodysuit", args[0])
+            self.assertIn("extra arms", args[5])
+            self.assertEqual(args[1], "generate")
+            p.context.llm_generate.assert_not_awaited()
+            p.context.get_current_chat_provider_id.assert_not_awaited()
+            self.assertFalse(p._ledger().states)
+        asyncio.run(run())
+
+    def test_n_command_respects_story_outfit_without_saving_image_only_changes(self):
+        async def run():
+            p = self.make_context_plugin()
+            event = self.drawing_event("剧情中已换上和服", "story")
+            await p.novelai_generate_image(event, "room", subjects=[{"source":"self", "outfit":"kimono", "state_scope":"story"}])
+            self.persist_turn(p, event)
+            async for _ in p.cmd_draw(self.drawing_event("/n white dress, garden", "n-1")): pass
+            self.assertIn("white dress", p._call_official.await_args.args[0])
+            self.assertNotIn("kimono", p._call_official.await_args.args[0])
+            async for _ in p.cmd_draw(self.drawing_event("/n window, smiling", "n-2")): pass
+            self.assertIn("kimono", p._call_official.await_args.args[0])
+            self.assertNotIn("white dress", p._call_official.await_args.args[0])
+        asyncio.run(run())
+
+    def test_n_command_without_card_uses_raw_prompt_and_failure_does_not_start_chat(self):
+        async def run():
+            p = self.make_context_plugin()
+            p.config["default_preset_id"] = ""
+            del p._finish_event
+            p._call_official.side_effect = ProviderError("network", "test service unavailable")
+            event = FakeEvent("/n starry sky, mountains")
+            async for _ in p.cmd_draw(event): pass
+            self.assertFalse(event.call_llm)
+            self.assertTrue(event.stopped)
+            self.assertEqual(p._call_official.await_args.args[0], "starry sky, mountains")
+            self.assertEqual(len(event.sent), 1)
+            self.assertFalse(any(isinstance(component, Image) for component in event.sent[0].chain))
+        asyncio.run(run())
+
+    def test_n_command_explicit_style_replaces_card_style_for_this_image(self):
+        async def run():
+            p = self.make_context_plugin()
+            async for _ in p.cmd_draw(self.drawing_event("/n oil painting, smiling", "oil")): pass
+            self.assertIn("oil painting", p._call_official.await_args.args[0])
+            self.assertIn("blonde hair", p._call_official.await_args.args[0])
+            self.assertNotIn("watercolor", p._call_official.await_args.args[0])
+            async for _ in p.cmd_draw(self.drawing_event("/n window, smiling", "default")): pass
+            self.assertIn("watercolor", p._call_official.await_args.args[0])
+        asyncio.run(run())
+
+    def test_n_command_blocks_llm_for_help_permission_and_disabled_entry(self):
+        async def run():
+            for command, mode, role in (("/n", "both", "admin"), ("/n window", "both", "member"),
+                ("/n window", "llm_tool_only", "admin"), ("/n " + "x" * 8001, "both", "admin")):
+                p = self.make_context_plugin()
+                p.config["invoke_mode"] = mode
+                p._run_job = AsyncMock()
+                p._notify = AsyncMock()
+                event = FakeEvent(command); event.role = role
+                async for _ in p.cmd_draw(event): pass
+                self.assertFalse(event.call_llm)
+                self.assertTrue(event.stopped)
+                p._run_job.assert_not_awaited()
+                p._notify.assert_awaited_once()
+        asyncio.run(run())
+
+    def test_n_command_is_fixed_and_does_not_consume_other_command_names(self):
+        async def run():
+            p = self.make_context_plugin()
+            p.config["command_prefix"] = "n"
+            p._run_job = AsyncMock(return_value=GenerationResult(True, "job", "novelai_official", send_image=False))
+            async for _ in p.cmd_draw(FakeEvent("/n card list")): pass
+            self.assertEqual(p._run_job.await_args.args[1], "card list")
+            help_replies = [value async for value in p.cmd_draw(FakeEvent("/nai"))]
+            self.assertIn("/n <画面描述>", help_replies[0])
+            self.assertIn("/nai card list", help_replies[0])
+            event = FakeEvent("/novel other command")
+            async for _ in p.cmd_draw(event): pass
+            self.assertTrue(event.call_llm)
+            self.assertFalse(event.stopped)
         asyncio.run(run())
 
     def test_job_records_can_be_deleted_individually_or_cleared(self):
