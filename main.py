@@ -9,6 +9,7 @@ import mimetypes
 import os
 import random
 import re
+import shutil
 import time
 import uuid
 import zipfile
@@ -35,14 +36,15 @@ except ImportError:
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.core.agent.message import TextPart
 from astrbot.core.message.components import Image
-from astrbot.core.message.message_event_result import MessageChain
+from astrbot.core.message.message_event_result import MessageChain, ResultContentType
 if __package__:
-    from . import drawing
+    from . import drawing, planner
 else:  # Standalone test discovery.
     import drawing
+    import planner
 
 PLUGIN_NAME = "astrbot_plugin_novelai_painter"
-VERSION = "2.8.0"
+VERSION = "2.9.0"
 STICKER_EMOTION_TOOL_NAME = "novelai_set_emotion"
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 MAX_RESPONSE_BYTES = 48 * 1024 * 1024
@@ -107,7 +109,7 @@ CONFIG_KEYS = {
     "default_preset_id", "persona_preset_map", "llm_auto_reference", "llm_card_mode", "img2img_enabled",
     "reference_enabled", "img2img_strength", "img2img_noise", "img2img_color_correct",
     "reference_strength", "reference_fidelity", "reference_information_extracted",
-} | STICKER_DEFAULTS.keys()
+} | STICKER_DEFAULTS.keys() | planner.DEFAULTS.keys()
 
 
 @dataclass
@@ -161,6 +163,7 @@ class NovelAIPainterPlugin(Star):
         self._preset_schema_migrated = False
         self.presets = self._load_presets()
         self._ensure_defaults()
+        self._cleanup_expired()
         self._sync_sticker_emotion_tool()
         self._sync_drawing_tool_schema()
         if self._preset_schema_migrated:
@@ -170,6 +173,10 @@ class NovelAIPainterPlugin(Star):
                 logger.warning(f"[{PLUGIN_NAME}] 保存角色卡迁移结果失败: {exc}")
         self._migrate_embedded_persona_bindings()
         self._register_web_api()
+
+    async def terminate(self):
+        for key in list(getattr(self, "_drawing_memory", {})):
+            self._drop_drawing_memory(key)
 
     # --------------------------- configuration ---------------------------
     def _ensure_defaults(self) -> None:
@@ -225,6 +232,7 @@ class NovelAIPainterPlugin(Star):
             "reference_fidelity": 0.6,
             "reference_information_extracted": 1.0,
             **STICKER_DEFAULTS,
+            **planner.DEFAULTS,
         }
         changed = False
         for key, value in defaults.items():
@@ -1105,6 +1113,9 @@ class NovelAIPainterPlugin(Star):
         # renamed commands. Never guess lifecycle from user message keywords.
         if event.get_extra("_clean_group_context_session", False):
             self._ledger().clear(str(event.unified_msg_origin))
+            for key in list(getattr(self, "_drawing_memory", {})):
+                if key[0] == str(event.unified_msg_origin):
+                    self._drop_drawing_memory(key)
             for key in list(getattr(self, "_request_snapshots", {})):
                 if key == str(event.unified_msg_origin):
                     self._request_snapshots.pop(key, None)
@@ -1199,6 +1210,12 @@ class NovelAIPainterPlugin(Star):
         active = await self._resolve_active_preset(event)
         view = await self._story_view(event) if self._contextual_cards_enabled() else None
         event.set_extra("nai_story_view", view)
+        if self._drawing_llm_id():
+            count = max(0, min(30, int(self._cfg("drawing_llm_context_messages", 12))))
+            records = drawing.history_records(getattr(req, "contexts", None))
+            event.set_extra("nai_planner_context", planner.recent_dialogue(records or (view.history if view else ()), count))
+            event.set_extra("nai_planner_images", list(getattr(req, "image_urls", None) or [])[:2]
+                if self._as_bool(self._cfg("drawing_llm_use_images", False)) else [])
         conversation = getattr(req, "conversation", None)
         request_cid = getattr(conversation, "cid", None)
         request_history = drawing.history_records(getattr(conversation, "history", None))
@@ -1224,6 +1241,11 @@ class NovelAIPainterPlugin(Star):
             rules += "明确换装可用完整 outfit；默认 state_scope=image 仅本图，实际剧情换装才用 story。仅用户要求改画风时填写 style。"
         else:
             rules += "当前为严格模式：各角色 prompt 写动作和明确修改，不使用 outfit/style 或剧情状态字段。"
+        if self._drawing_llm_id():
+            rules = ("已启用独立绘图 LLM。用户请求画图时调用 novelai_generate_image；prompt 可仅写简短绘图意图，无需编写 Tag。"
+                "subjects 可指定 self/card/custom；拿不准可省略，由绘图 LLM 结合本轮对话选择。图片在你正常回复完成后生成。"
+                "不要预先声称图片已发送，不要将绘图设想当作剧情事实。以下只是可选绘画角色目录，不改变聊天人设。")
+            catalog = [{key: card[key] for key in ("id", "name", "description")} for card in catalog]
         context = marker + "\n" + rules + "\n" + json.dumps({
             "self_card": {"id": active.get("id", ""), "name": active.get("name", "")} if active else None,
             "available_cards": catalog}, ensure_ascii=False) + "\n" + end
@@ -1232,6 +1254,165 @@ class NovelAIPainterPlugin(Star):
         req.extra_user_content_parts.append(TextPart(text=context).mark_as_temp())
 
     # --------------------------- permissions and dedupe ---------------------------
+    def _drawing_llm_id(self) -> str:
+        return str(self._cfg("drawing_llm_provider_id", "") or "").strip()
+
+    def _drop_drawing_memory(self, key) -> None:
+        memory = getattr(self, "_drawing_memory", {}).pop(key, {})
+        if memory.get("image"):
+            try:
+                Path(memory["image"]).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _previous_drawing(self, view: drawing.StoryView | None) -> dict:
+        for key, row in list(getattr(self, "_drawing_memory", {}).items()):
+            if time.time() - row["created_at"] > 1800:
+                self._drop_drawing_memory(key)
+        if not view:
+            return {}
+        row = getattr(self, "_drawing_memory", {}).get(view.scope, {})
+        if not row:
+            return {}
+        index = row["position"]
+        actual = view.history[index][1] if index < len(view.history) and view.history[index][0] == "user" else ""
+        valid_source = row["turn"] == view.turn or bool(row["message"] and (actual == row["message"] or actual.startswith(row["message"] + "\n")))
+        cards_current = all(self._get_preset(card_id) and drawing.StoryLedger.signature(drawing.card_layers(self._get_preset(card_id))) == signature
+            for card_id, signature in row["cards"].items())
+        if row["epoch"] != view.epoch or not self._ledger().valid(view) or not valid_source or not cards_current:
+            self._drop_drawing_memory(view.scope)
+            return {}
+        return row
+
+    def _remember_planned_drawing(self, event, result: GenerationResult) -> None:
+        plan = event.get_extra("nai_planner_plan")
+        view = event.get_extra("nai_generation_view")
+        if not plan or not view or not self._ledger().valid(view):
+            return
+        if not hasattr(self, "_drawing_memory"):
+            self._drawing_memory = {}
+        self._drop_drawing_memory(view.scope)
+        position = next((i for i in range(len(view.history) - 1, -1, -1)
+            if view.history[i][0] == "user" and (view.history[i][1] == view.message or view.history[i][1].startswith(view.message + "\n"))), len(view.history))
+        row = {"plan": plan, "epoch": view.epoch, "turn": view.turn, "position": position,
+            "message": view.message, "created_at": time.time(), "image": "", "cards": {}}
+        for detail in event.get_extra("nai_drawing_details", []):
+            card = self._get_preset(detail.get("preset_id", ""))
+            if card:
+                row["cards"][card["id"]] = drawing.StoryLedger.signature(drawing.card_layers(card))
+        if self._as_bool(self._cfg("drawing_llm_use_images", False)) and result.path:
+            source = Path(result.path)
+            if source.exists() and source.stat().st_size <= 8 * 1024 * 1024:
+                target = self.temp_dir / ("planner-" + uuid.uuid4().hex + source.suffix)
+                shutil.copyfile(source, target)
+                row["image"] = str(target)
+                async def expire():
+                    await asyncio.sleep(1800)
+                    target.unlink(missing_ok=True)
+                asyncio.create_task(expire())
+        self._drawing_memory[view.scope] = row
+        while len(self._drawing_memory) > 8:
+            self._drop_drawing_memory(next(iter(self._drawing_memory)))
+
+    async def _plan_drawing(self, event, seed: dict) -> dict:
+        if not self._can_use(event)[0]:
+            raise ValueError("当前会话已没有绘图权限，旧请求已取消。")
+        provider_id = self._drawing_llm_id()
+        if not provider_id or event.get_extra("nai_planner_provider", provider_id) != provider_id:
+            raise ValueError("独立绘图 LLM 配置已更改，请重新提交绘图请求。")
+        view = await self._story_view(event)
+        expected = event.get_extra("nai_planner_view")
+        if expected and (not view or expected.scope != view.scope or expected.epoch != view.epoch):
+            raise ValueError("对话已切换或清空，已取消旧绘图请求。")
+        previous = self._previous_drawing(view)
+        count = max(0, min(30, int(self._cfg("drawing_llm_context_messages", 12))))
+        dialogue = event.get_extra("nai_planner_context")
+        if dialogue is None:
+            dialogue = planner.recent_dialogue(view.history if view else (), count)
+        dialogue = dialogue[-count:] if count else []
+        active = await self._resolve_active_preset(event)
+        catalog = []
+        for original in self.presets:
+            if not self._as_bool(original.get("enabled", True), True):
+                continue
+            card = drawing.card_layers(original)
+            catalog.append({"id": card["id"], "name": card.get("name", ""), "description": card.get("description", ""),
+                **{key: card[key] for key in drawing.LAYERS},
+                "current_story_outfit": self._ledger().current(view, card).get("outfit")})
+        images = []
+        if self._as_bool(self._cfg("drawing_llm_use_images", False)):
+            images = list(event.get_extra("nai_planner_images", []))[:2]
+            if not images and hasattr(event, "get_messages"):
+                components = [component for component in event.get_messages() if isinstance(component, Image)][:2]
+                try:
+                    images = [await asyncio.wait_for(component.convert_to_file_path(), timeout=15) for component in components]
+                except Exception as exc:
+                    raise ValueError("当前附图读取失败，本次绘图已停止；可以关闭图片理解后重试。") from exc
+            if previous.get("image") and Path(previous["image"]).is_file():
+                images.append(previous["image"])
+        payload = {"user_request": event.get_message_str(), "drawing_intent": seed,
+            "recent_dialogue": dialogue, "current_reply": event.get_extra("nai_planner_reply", ""),
+            "self_card_id": active.get("id") if active else None, "available_cards": catalog,
+            "card_mode": self._cfg("llm_card_mode", "context"), "previous_drawing": previous.get("plan"),
+            "images": {"current_user_images": len(images) - int(bool(previous.get("image") and previous["image"] in images)),
+                "previous_drawing_attached": bool(previous.get("image") and previous["image"] in images)},
+            "preferences": self._cfg("drawing_llm_prompt", "")}
+        skill = (Path(__file__).parent / "skills" / "novelai-painter" / "references" / "drawing-planner.md").read_text(encoding="utf-8")
+        try:
+            response = await asyncio.wait_for(self.context.llm_generate(
+                chat_provider_id=provider_id, prompt=json.dumps(payload, ensure_ascii=False),
+                system_prompt=skill, image_urls=images or None),
+                timeout=max(5, min(180, int(self._cfg("drawing_llm_timeout", 60)))))
+        except asyncio.TimeoutError as exc:
+            raise ValueError("独立绘图 LLM 超时，本次未请求图片服务。") from exc
+        except Exception as exc:
+            logger.warning(f"[{PLUGIN_NAME}] 独立绘图 LLM 调用失败: {type(exc).__name__}")
+            raise ValueError("独立绘图 LLM 调用失败，请检查所配置的 Provider 和图片理解能力。") from exc
+        plan = planner.parse_plan(getattr(response, "completion_text", ""))
+        if self._drawing_llm_id() != provider_id:
+            raise ValueError("绘图规划期间 Provider 已更改，旧任务已取消。")
+        if not self._contextual_cards_enabled():
+            for subject in plan["subjects"]:
+                subject.pop("state_scope", None)
+        current = await self._story_view(event)
+        if view and (not current or current.scope != view.scope or current.epoch != view.epoch):
+            raise ValueError("绘图规划期间对话已切换或清空，旧任务已取消。")
+        if view:
+            event.set_extra("nai_story_view", view)
+        event.set_extra("nai_planner_plan", plan)
+        return plan
+
+    @filter.on_llm_response()
+    async def drawing_capture_reply(self, event: AstrMessageEvent, response: LLMResponse) -> None:
+        if not event.get_extra("nai_planner_pending") or getattr(response, "tools_call_name", None) or getattr(response, "role", "") != "assistant":
+            return
+        event.set_extra("nai_planner_reply", str(getattr(response, "completion_text", "") or ""))
+        event.set_extra("nai_planner_reply_ready", True)
+
+    @filter.on_decorating_result()
+    async def drawing_stream_finished(self, event: AstrMessageEvent) -> None:
+        # AstrBot sends the stream before yielding STREAMING_FINISH, and skips
+        # OnAfterMessageSent for that result. Normal replies use the hook below.
+        result = event.get_result()
+        if result and getattr(result, "result_content_type", None) == ResultContentType.STREAMING_FINISH:
+            await self.drawing_after_reply(event)
+
+    @filter.after_message_sent()
+    async def drawing_after_reply(self, event: AstrMessageEvent) -> None:
+        pending = event.get_extra("nai_planner_pending")
+        if not pending or not event.get_extra("nai_planner_reply_ready") or event.get_extra("nai_planner_consumed"):
+            return
+        event.set_extra("nai_planner_consumed", True)
+        event.set_extra("sticker_consumed", True)
+        try:
+            if not self._drawing_llm_id() or not self._mode_allows("llm_tool"):
+                raise ValueError("独立绘图 LLM 已关闭，本轮排队请求已取消。")
+            plan = await self._plan_drawing(event, pending)
+            await self._image_tool_entry(event, **plan, operation=pending.get("operation", "generate"),
+                reference_type=pending.get("reference_type", ""), accepted=True)
+        except ValueError as exc:
+            await self._notify(event, str(exc), "error")
+
     def _event_key(self, event: AstrMessageEvent, prompt: str, operation: str) -> str:
         """Return one generation key per incoming message, regardless of tool rewrites."""
         message_obj = getattr(event, "message_obj", None)
@@ -1323,7 +1504,8 @@ class NovelAIPainterPlugin(Star):
         max_age = max(60, int(self._cfg("auto_clean_delay", 300) or 300) + 60)
         for path in self.temp_dir.glob("*"):
             try:
-                if path.is_file() and now - path.stat().st_mtime > max_age:
+                age_limit = 1800 if path.name.startswith("planner-") else max_age
+                if path.is_file() and now - path.stat().st_mtime > age_limit:
                     path.unlink(missing_ok=True)
             except Exception:
                 pass
@@ -1828,7 +2010,6 @@ class NovelAIPainterPlugin(Star):
         delivered_jobs[result.job_id] = time.time()
         try:
             await self._send_generated_image(event, result)
-            return result.message
         except Exception as exc:
             logger.warning(f"[{PLUGIN_NAME}] 发送图片失败 job={result.job_id}: {exc}")
             try:
@@ -1837,6 +2018,11 @@ class NovelAIPainterPlugin(Star):
                 pass
             await self._notify(event, "图片已生成，但发送到当前会话失败。", "error")
             return "图片已生成，但发送失败。"
+        try:
+            self._remember_planned_drawing(event, result)
+        except Exception as exc:
+            logger.debug(f"[{PLUGIN_NAME}] 缓存连续性参考失败: {type(exc).__name__}")
+        return result.message
 
     async def _send_generated_image(
         self,
@@ -2332,13 +2518,17 @@ class NovelAIPainterPlugin(Star):
         """仅在用户明确要求生成、绘制或修改图片时调用；每条用户消息最多生成并发送一张图片。先区分绘画对象与当前聊天人设；角色卡只用于选中的绘画角色，绝不默认合并到其他角色。已知角色无需提前建卡。图片发送后不再绘图；按当前对话自然回应，不套用上次的出图回复，不将图片设想当成剧情事实。
 
         Args:
-            prompt(string): 完整画面描述，或共享场景、构图、人数和光线；允许包含人物与服饰，优先使用英文 NovelAI / Danbooru Tag。换装推荐各自 outfit。无卡角色用 custom，风景用 subjects=[]。
+            prompt(string): 若临时上下文说明启用独立绘图 LLM，可只传简短绘图意图，人物参数可省略，图片在本轮正常回复后生成。未启用时写完整画面，优先英文 NovelAI / Danbooru Tag。无卡角色用 custom，风景用 subjects=[]。
             operation(string): generate、img2img 或 reference。普通生图用 generate；剧情锚点模式仅在 use_reference=true 时自动使用选中卡参考图。用户明确要求基于参考图修改时可用 img2img/reference；多人图用 generate。
             reference_type(string): reference 模式用 character、style 或 both；省略时继承本次选中卡的参考类型。
             subjects(list[object]): 原生角色数组，每人一项，最多 6 人。source=self 画 AI 自己或使用当前绑定卡；card 配 preset_id 选择卡。明确用内置卡时不要传空数组后重写卡词。custom 可用 prompt 或 appearance_prompt 写角色名外貌，完整描述已在顶层时可省略。人物 prompt 可含服饰。绑定卡身份和画风由插件保留；outfit 是完整服饰，整体替换，空串明确无服饰。state_scope 默认 image 仅本图，剧情实际换装才用 story。省略 outfit 时尊重本次普通描述中的服饰；未描述服饰才沿用当前剧情服饰或默认服饰。use_reference 默认 false。不要使用 appearance_patch 或重写绑定卡的 appearance_prompt。
             style(string): 仅用户明确改画风时填写本图完整画风，替换原卡画风；常规用卡画图省略，保留原始画师名及权重。无卡画图可自由使用。
         """
-        if not self._mode_allows("llm_tool"):
+        return await self._image_tool_entry(event, prompt, operation, reference_type, subjects, style)
+
+    async def _image_tool_entry(self, event, prompt="", operation="generate", reference_type="", subjects=None,
+                                style=None, *, accepted=False, entry="llm_tool", quiet=False):
+        if not self._mode_allows(entry):
             await self._notify(event, "当前未启用自然语言生图入口。", "error")
             return (
                 "FINAL_IMAGE_TOOL_RESULT: Natural-language image generation is disabled. "
@@ -2349,13 +2539,39 @@ class NovelAIPainterPlugin(Star):
             await self._notify(event, reason, "error")
             return f"FINAL_IMAGE_TOOL_RESULT: {reason} Do not call any tool again for this message."
 
-        if self._llm_tool_claimed(event):
+        if not accepted and self._llm_tool_claimed(event):
             return (
                 "FINAL_IMAGE_TOOL_RESULT: ENTRY_GATE_BLOCKED_DUPLICATE. An image generation call for this "
                 "exact user message was already accepted before backend preparation. Do not call any tool "
                 "again. The accepted call is responsible for sending the image; reply to the user once only "
                 "after that accepted call completes."
             )
+
+        if self._drawing_llm_id() and not accepted:
+            if not isinstance(prompt, str) or len(prompt) > 8000:
+                return "IMAGE_TOOL_ARGUMENT_ERROR: prompt 应为不超过 8000 字符的简短绘图意图。No image request was sent."
+            if not isinstance(operation, str) or not isinstance(reference_type, str) or operation not in {"generate", "img2img", "reference"} or reference_type not in {"", "character", "style", "both"}:
+                return "IMAGE_TOOL_ARGUMENT_ERROR: 无效的图片操作或参考类型。No image request was sent."
+            try:
+                subject_size = len(json.dumps(subjects, ensure_ascii=False))
+            except (TypeError, ValueError):
+                return "IMAGE_TOOL_ARGUMENT_ERROR: subjects 应为可序列化的角色数组。No image request was sent."
+            if subject_size > 24000:
+                return "IMAGE_TOOL_ARGUMENT_ERROR: subjects 过长。No image request was sent."
+            if style is not None and (not isinstance(style, str) or len(style) > 4000):
+                return "IMAGE_TOOL_ARGUMENT_ERROR: style 应为不超过 4000 字符的字符串。No image request was sent."
+            view = await self._story_view(event)
+            requested_view = event.get_extra("nai_story_view")
+            if event.get_extra("nai_story_request_stale") or (requested_view and (not view or view.scope != requested_view.scope or view.epoch != requested_view.epoch)):
+                return "FINAL_IMAGE_TOOL_RESULT: 对话已切换或清空，旧绘图请求已取消。"
+            if not self._claim_llm_tool_invocation(event):
+                return "FINAL_IMAGE_TOOL_RESULT: ENTRY_GATE_BLOCKED_DUPLICATE."
+            event.set_extra("nai_planner_view", view)
+            event.set_extra("nai_planner_provider", self._drawing_llm_id())
+            event.set_extra("nai_planner_pending", {"prompt": prompt, "subjects": subjects, "style": style,
+                "operation": operation, "reference_type": reference_type})
+            event.set_extra("sticker_consumed", True)
+            return "DRAWING_REQUEST_QUEUED: 绘图意图已交给独立绘图 LLM，将在本轮正常回复发送后结合用户原文、上下文和完整回复生成。现在图片尚未生成，不要重复绘图。继续正常对话即可。"
 
         normalized_prompt = prompt.strip() if isinstance(prompt, str) else ""
         if not normalized_prompt:
@@ -2413,6 +2629,9 @@ class NovelAIPainterPlugin(Star):
             if len(drawing_subjects) > 1 and str(operation).lower().strip() in {"img2img", "reference"}:
                 raise ValueError("多人同框请使用 generate；人物参考图会影响全图，不能自动归属到单个角色。")
         except ValueError as exc:
+            if accepted:
+                await self._notify(event, f"独立绘图 LLM 参数无效：{exc}", "error")
+                return "FINAL_IMAGE_TOOL_RESULT: 独立绘图参数校验失败，未请求图片服务。"
             failures = getattr(self, "_llm_validation_failures", None)
             if failures is None:
                 self._llm_validation_failures = failures = {}
@@ -2438,7 +2657,7 @@ class NovelAIPainterPlugin(Star):
             normalized_prompt = self._filter_llm_prompt_conflicts(normalized_prompt, event, active_preset)
         if style is not None:
             normalized_prompt = drawing.join(normalized_prompt, style)
-        if not self._claim_llm_tool_invocation(event):
+        if not accepted and not self._claim_llm_tool_invocation(event):
             return "FINAL_IMAGE_TOOL_RESULT: ENTRY_GATE_BLOCKED_DUPLICATE. Do not call any tool again for this message."
         if view:
             event.set_extra("nai_generation_view", view)
@@ -2465,6 +2684,7 @@ class NovelAIPainterPlugin(Star):
             reference_type=normalized_reference_type,
             preset_override=active_preset,
             **({"character_prompts": character_prompts} if character_prompts else {}),
+            **({"quiet": True} if quiet else {}),
         )
         user_visible_result = await self._finish_event(event, result)
         scene_summary = normalized_prompt if len(normalized_prompt) <= 800 else normalized_prompt[:400] + "\n…\n" + normalized_prompt[-400:]
@@ -2495,6 +2715,15 @@ class NovelAIPainterPlugin(Star):
             await self._notify(event, "画面描述不能超过 8000 字符。", "error")
             return
         if not self._claim_llm_tool_invocation(event):
+            return
+        if self._drawing_llm_id():
+            try:
+                event.set_extra("nai_planner_view", await self._story_view(event))
+                event.set_extra("nai_planner_provider", self._drawing_llm_id())
+                plan = await self._plan_drawing(event, {"prompt": prompt, "subjects": [{"source": "self"}], "entry": "/n"})
+                await self._image_tool_entry(event, **plan, accepted=True, entry="command", quiet=True)
+            except ValueError as exc:
+                await self._notify(event, str(exc), "error")
             return
         try:
             subjects = await self._resolve_drawing_subjects(event, [{"source": "self"}])
@@ -2670,12 +2899,18 @@ class NovelAIPainterPlugin(Star):
 
     async def page_settings(self):
         personas = []
+        drawing_providers = []
         try:
             items = await self.context.persona_manager.get_all_personas()
             personas = [{"id": str(p.persona_id), "name": str(p.persona_id)} for p in items]
         except Exception:
             pass
-        return json_response({"config": self._public_config(), "presets": self._public_presets(), "references": self._reference_list(), "personas": personas, "capabilities": self._capabilities()})
+        try:
+            drawing_providers = [{"id": provider.meta().id, "model": provider.get_model()} for provider in self.context.get_all_providers()]
+        except Exception:
+            pass
+        return json_response({"config": self._public_config(), "presets": self._public_presets(), "references": self._reference_list(),
+            "personas": personas, "drawing_providers": drawing_providers, "capabilities": self._capabilities()})
 
     async def page_save_config(self):
         payload = await request.json(default={})
@@ -2715,6 +2950,7 @@ class NovelAIPainterPlugin(Star):
             "notify_429", "show_retry_notice", "llm_auto_reference", "img2img_enabled",
             "reference_enabled", "img2img_color_correct",
             "sticker_enabled", "sticker_auto_reference", "sticker_emotion_tool",
+            "drawing_llm_use_images",
         ):
             if key in fields:
                 fields[key] = self._as_bool(fields[key])
@@ -2786,6 +3022,17 @@ class NovelAIPainterPlugin(Star):
         for key, limit in (("sticker_llm_provider_id", 200), ("sticker_prompt", 4000), ("sticker_decision_prompt", 4000)):
             if key in fields:
                 fields[key] = str(fields[key] or "").strip()[:limit]
+        for key, lower, upper in (("drawing_llm_context_messages", 0, 30), ("drawing_llm_timeout", 5, 180)):
+            if key in fields:
+                try:
+                    fields[key] = min(upper, max(lower, int(fields[key])))
+                except (TypeError, ValueError):
+                    return self._page_error(f"{key} 必须是整数")
+        for key, limit in (("drawing_llm_provider_id", 200), ("drawing_llm_prompt", 4000)):
+            if key in fields:
+                if not isinstance(fields[key], str) or len(fields[key]) > limit:
+                    return self._page_error(f"{key} 必须是不超过 {limit} 字符的字符串")
+                fields[key] = fields[key].strip()
         allowed_enums = {
             "provider": {"novelai_official", "openai_compatible"},
             "invoke_mode": {"disabled", "command_only", "llm_tool_only", "both"},

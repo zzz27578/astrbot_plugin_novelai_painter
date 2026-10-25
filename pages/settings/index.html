@@ -54,6 +54,15 @@
       </div>
       <div class="capability" id="capability"></div>
       <div class="divider"></div>
+      <div class="section-head compact"><div><span class="kicker">DRAWING LLM</span><h3>独立绘图 LLM</h3><p>主模型正常聊天，收到绘图工具请求后，在本轮回复发送完成时由独立模型编写画面。留空则保持原有流程。</p></div></div>
+      <div class="grid two">
+        <label class="field"><span>绘图 LLM Provider ID</span><input data-config="drawing_llm_provider_id" type="text" list="drawing-provider-options" maxlength="200" placeholder="留空关闭；选择 AstrBot 中已配置的模型" /><datalist id="drawing-provider-options"></datalist><small>使用 AstrBot 的聊天模型 Provider ID；这里不是 NovelAI 图片模型 ID。</small></label>
+        <label class="field"><span>最近对话消息数</span><input data-config="drawing_llm_context_messages" type="number" min="0" max="30" /><small>默认 12 条，每条最多 2000 字符。用户本轮原文和主模型完整回复另行提供，避免转述丢失改图需求。</small></label>
+        <label class="field"><span>绘图规划超时（秒）</span><input data-config="drawing_llm_timeout" type="number" min="5" max="180" /><small>每张图规划一次；失败时给出提示，不自动切回主模型。</small></label>
+        <label class="switch-row"><input data-config="drawing_llm_use_images" type="checkbox" /><span><b>读取附图和最近成图</b><small>需要视觉模型。最多发送两张本轮附图和一张有效的上一张成图；旧图只补连续性，不覆盖新要求。成图参考最多保留 30 分钟。</small></span></label>
+        <label class="field full"><span>绘图偏好（可选）</span><textarea data-config="drawing_llm_prompt" rows="3" maxlength="4000" placeholder="例如：保持当前场景连续，优先人物互动与清楚的构图"></textarea><small>内置专用绘图技能自动加载。/n 也会直接将用户原文交给此模型，只返回图片；普通聊天不会自行触发生图。</small></label>
+      </div>
+      <div class="divider"></div>
       <div class="section-head compact"><div><span class="kicker">基础参数</span><h3>生成默认值</h3></div></div>
       <div class="grid four">
         <label class="field"><span>宽度</span><input data-config="width" type="number" min="64" max="2048" step="64" /></label>

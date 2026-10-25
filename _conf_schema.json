@@ -18,6 +18,36 @@
       "openai_compatible": "OpenAI / NewAPI 兼容"
     }
   },
+  "drawing_llm_provider_id": {
+    "description": "独立绘图 LLM Provider ID（留空关闭）",
+    "type": "string",
+    "default": "",
+    "hint": "填写已在 AstrBot 配置的聊天模型 Provider ID。主模型只需提交绘图意图，回复发送后由此模型理解用户原文、当前回复与上下文并写 Tag；/n 也会调用它。"
+  },
+  "drawing_llm_context_messages": {
+    "description": "绘图 LLM 读取的最近对话消息数",
+    "type": "int",
+    "default": 12,
+    "hint": "0-30 条 user/assistant 消息，每条最多 2000 字符；0 不读取旧对话。用户本轮原文与本轮回复仍会提供。"
+  },
+  "drawing_llm_timeout": {
+    "description": "绘图 LLM 超时（秒）",
+    "type": "int",
+    "default": 60,
+    "hint": "5-180 秒。每张图仅请求一次，不自动切回主模型或重试规划。"
+  },
+  "drawing_llm_use_images": {
+    "description": "允许绘图 LLM 读取本轮附图与上一张成图",
+    "type": "bool",
+    "default": false,
+    "hint": "需要支持视觉的 LLM，会向所选 Provider 发送最多两张当前附图及一张有效的上一张成图。仅作理解参考，不自动成为图生图底图。最近成图最多保留 30 分钟，重置对话后失效。"
+  },
+  "drawing_llm_prompt": {
+    "description": "独立绘图 LLM 的附加偏好",
+    "type": "text",
+    "default": "",
+    "hint": "可填写构图、Tag 组织和连续性偏好，最多 4000 字符。内置专用绘图技能会自动加载。"
+  },
   "api_token": {
     "description": "NovelAI Persistent Token",
     "type": "string",

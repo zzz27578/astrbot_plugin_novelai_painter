@@ -7,6 +7,7 @@ const EMPTY_STATE = {
   presets: [],
   references: [],
   personas: [],
+  drawing_providers: [],
   capabilities: {},
 };
 
@@ -114,6 +115,7 @@ function normalizeState(payload) {
     presets: Array.isArray(next.presets) ? next.presets : [],
     references: Array.isArray(next.references) ? next.references : [],
     personas: Array.isArray(next.personas) ? next.personas : [],
+    drawing_providers: Array.isArray(next.drawing_providers) ? next.drawing_providers : [],
     capabilities: next.capabilities && typeof next.capabilities === "object"
       ? next.capabilities
       : {},
@@ -217,6 +219,9 @@ function fillConfig() {
   renderStatus();
   renderPersonaOptions();
   renderPersonaMappings();
+  const drawingOptions = $("#drawing-provider-options");
+  if (drawingOptions) drawingOptions.innerHTML = state.drawing_providers.map((provider) =>
+    `<option value="${esc(provider.id)}">${esc(provider.model || provider.id)}</option>`).join("");
 }
 
 function renderStickerCard() {
