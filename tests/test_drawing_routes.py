@@ -72,7 +72,7 @@ class DrawingRoutesTests(unittest.TestCase):
             await self.complete_reply(p,event,"我换好白裙，在窗前坐下。")
             p.context.llm_generate.assert_awaited_once()
             p._call_official.assert_awaited_once()
-            payload = json.loads(p.context.llm_generate.await_args.kwargs["prompt"])
+            payload = core.planning_payload(p.context.llm_generate.await_args.kwargs)
             self.assertEqual(payload["user_request"], event.message)
             self.assertEqual(payload["drawing_request"], "换白裙坐到窗前")
             self.assertIn("白裙",payload["current_reply"])
@@ -89,7 +89,7 @@ class DrawingRoutesTests(unittest.TestCase):
             await p.drawing_stream_finished(event)
             await p.drawing_after_reply(event)
             p.context.llm_generate.assert_awaited_once()
-            self.assertIn("当前场景", json.loads(p.context.llm_generate.await_args.kwargs["prompt"])["drawing_request"])
+            self.assertIn("当前场景", core.planning_payload(p.context.llm_generate.await_args.kwargs)["drawing_request"])
         asyncio.run(run())
 
     def test_dynamic_filter_only_wakes_configured_markers(self):
@@ -108,7 +108,7 @@ class DrawingRoutesTests(unittest.TestCase):
             event = core.FakeEvent("/n")
             async for _ in p.cmd_draw(event): pass
             self.assertFalse(event.call_llm); self.assertTrue(event.stopped)
-            payload = json.loads(p.context.llm_generate.await_args.kwargs["prompt"])
+            payload = core.planning_payload(p.context.llm_generate.await_args.kwargs)
             self.assertEqual(payload["current_reply"], "")
             self.assertIn("白裙", str(payload["recent_dialogue"]))
             p._call_official.assert_awaited_once()
@@ -169,7 +169,7 @@ class DrawingRoutesTests(unittest.TestCase):
             p.context.llm_generate.assert_not_awaited()
             self.persist_turn(p,event)
             await p._quick_draw(self.drawing_event("/n 改上一张的视角，其他不变","edit"),"改上一张的视角，其他不变")
-            payload=json.loads(p.context.llm_generate.await_args.kwargs["prompt"])
+            payload=core.planning_payload(p.context.llm_generate.await_args.kwargs)
             self.assertEqual(payload["previous_drawing"]["subjects"][0]["outfit"],"white dress")
             self.assertEqual(payload["previous_user_request"],event.message)
         asyncio.run(run())
@@ -231,7 +231,7 @@ class DrawingRoutesTests(unittest.TestCase):
             self.assertIn("只在这张图换白裙",catalog)
             self.assertNotIn("window, sunlight",catalog) # raw generation Tags stay out of main context
             await self.complete_reply(p,next_event)
-            payload = json.loads(p.context.llm_generate.await_args.kwargs["prompt"])
+            payload = core.planning_payload(p.context.llm_generate.await_args.kwargs)
             self.assertEqual(payload["previous_user_request"],event.message)
             self.assertIn("white dress", str(payload["previous_drawing"]))
             reset = core.FakeEvent(); reset.set_extra("_clean_group_context_session",True)
@@ -254,12 +254,12 @@ class DrawingRoutesTests(unittest.TestCase):
             before = [tool.name for tool in llm_tools.func_list]
             await p._quick_draw(core.FakeEvent("/n 换白裙"),"换白裙")
             kwargs = p.context.llm_generate.await_args.kwargs
-            self.assertEqual(kwargs["tools"].names(), ["submit_drawing_plan"])
-            self.assertEqual(kwargs["tool_choice"],"required")
+            self.assertEqual(kwargs["tools"].names(), ["novelai_generate_image"])
+            self.assertEqual(kwargs["tool_choice"],"auto")
             self.assertEqual(kwargs["request_max_retries"],1)
             self.assertEqual([tool.name for tool in llm_tools.func_list],before)
-            self.assertIn("missing", json.loads(kwargs["prompt"])["format_correction"]["previous_output"])
-            self.assertIn("提交方案", json.loads(kwargs["prompt"])["format_correction"]["previous_output"])
+            self.assertIn("missing", core.planning_payload(kwargs)["format_correction"]["previous_output"])
+            self.assertIn("提交方案", core.planning_payload(kwargs)["format_correction"]["previous_output"])
             p._call_official.assert_awaited_once()
         asyncio.run(run())
 
@@ -280,7 +280,7 @@ class DrawingRoutesTests(unittest.TestCase):
             calls = []
             async def generate(**kwargs):
                 p._call_official.assert_not_awaited()
-                calls.append(json.loads(kwargs["prompt"]))
+                calls.append(core.planning_payload(kwargs))
                 return LLMResponse("assistant",completion_text=bad) if len(calls)==1 else good
             p.context.llm_generate.side_effect = generate
             await p._quick_draw(core.FakeEvent("/n 换白裙"),"换白裙")
@@ -343,7 +343,7 @@ class DrawingRoutesTests(unittest.TestCase):
             provider._prepare_chat_payload=AsyncMock(return_value=({"model":"grok-model","messages":[{"role":"user","content":"draw"}]},[]))
             response = await provider.text_chat(prompt="draw",func_tool=planner.plan_tools(),tool_choice="required",request_max_retries=1)
             schema = create.await_args.kwargs["tools"][0]["function"]
-            self.assertEqual(schema["name"],"submit_drawing_plan")
+            self.assertEqual(schema["name"],"novelai_generate_image")
             self.assertIn("subjects",schema["parameters"]["properties"])
             self.assertEqual(create.await_args.kwargs["tool_choice"],"required")
             self.assertEqual(planner.response_plan(response)["prompt"],plan["prompt"])

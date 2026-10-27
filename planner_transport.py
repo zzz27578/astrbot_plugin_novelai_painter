@@ -7,8 +7,10 @@ from contextlib import aclosing
 
 if __package__:
     from . import planner
+    from .planner_http import HTTPObservation, borrowed_client
 else:
     import planner
+    from planner_http import HTTPObservation, borrowed_client
 
 
 def is_openai(provider):
@@ -16,22 +18,32 @@ def is_openai(provider):
     return isinstance(config, dict) and "openai" in str(config.get("type", "")).lower()
 
 
-def select(provider, transport):
+def select(provider, transport, *, main_streaming=None):
     supported = callable(getattr(provider, "text_chat_stream", None))
     if transport == "stream":
         if not supported:
             raise planner.PlanError("该 Provider 没有流式接口，请选择非流式调用。", "transport", False)
         return "stream"
-    return "stream" if transport == "auto" and is_openai(provider) and supported else "nonstream"
+    return "stream" if transport == "auto" and main_streaming is not False and is_openai(provider) and supported else "nonstream"
 
 
-def request_provider(provider, effort, max_tokens):
+def request_provider(provider, effort, max_tokens, *, mode=None, record=None, debug=False):
     overrides = {}
     if effort != "inherit":
         overrides["reasoning_effort"] = effort
     if max_tokens:
         overrides["max_completion_tokens"] = max_tokens
-    if not overrides:
+    observe = record is not None and is_openai(provider)
+    if observe:
+        from openai import AsyncOpenAI
+        observe = isinstance(getattr(provider, "client", None), AsyncOpenAI)
+        if not observe:
+            record("http_unavailable", {"http_observable": False})
+    chat_completions = is_openai(provider) and "responses" not in str(provider.provider_config.get("type", "")).lower()
+    if mode == "json" and chat_completions:
+        overrides["response_format"] = {"type": "json_object"}
+    clear_format = mode == "tool" and is_openai(provider) and "response_format" in (provider.provider_config.get("custom_extra_body") or {})
+    if not overrides and not observe and not clear_format:
         return provider, overrides
     if not is_openai(provider):
         raise planner.PlanError("绘图推理强度和输出预算覆盖仅支持 OpenAI 兼容 Provider；请选择继承/0。", "transport", False)
@@ -47,6 +59,14 @@ def request_provider(provider, effort, max_tokens):
         extra.pop("max_completion_tokens", None)
     extra.update(overrides)
     local.provider_config["custom_extra_body"] = extra
+    if mode == "tool":
+        # An inherited text-format constraint must not compete with tool args.
+        extra.pop("response_format", None)
+    if observe:
+        client = provider.client
+        observation = HTTPObservation(record, debug)
+        local.client = client.with_options(max_retries=0,
+            http_client=borrowed_client(client._client, observation))
     return local, overrides
 
 

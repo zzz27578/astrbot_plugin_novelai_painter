@@ -1,86 +1,59 @@
-# 2.10.3：验证调用修复与 503 重试
+# 2.10.4：独立绘图调用测试
 
-新 /n 日志中，无主回复等待，准备 19 毫秒、Provider 调用 115.36 秒、可见 JSON 437 字符，却报告 6153 个输出 Token。2.10.3 修复独立路线固定非流式的调用差异，支持流式与本次请求的推理/输出预算覆盖，同时增加 503 次数配置。本轮检查实际耗时是否改善，并进一步区分等待首段与后续输出耗时；不预先承诺降到某个秒数。
+本版调整请求结构和格式契约，关闭 OpenAI SDK 隐式重试，并记录实际 HTTP 阶段。目标是解决独立调用与主 Agent 的差距，真实延迟仍需在同一个 Grok Provider 上复测。
 
-## 更新与基线设置
+## 最小测试
 
-更新插件并重载，确认版本为 **2.10.3**。主聊天和插件选择**同一个 Grok 4.7 Provider ID**。入口选择“两者都启用”，绑定同一张角色卡，生图模型、尺寸和步数保持相同。
+更新并重载插件，确认版本 **2.10.4**，主聊天和独立绘图都选择同一个 Grok 4.7 Provider ID，并绑定同一张角色卡。
 
-先记录之前慢轮所用的输出协议、最近对话消息数、视觉开关、格式纠正开关和超时值，然后使用以下诊断设置：
+建议先用以下设置执行两次测试，无需跑完多组排列：
 
-| 设置 | 本轮取值 | 原因 |
-|---|---|---|
-| 绘图输出协议 | JSON 文本 | 与此前慢日志一致，先建立基线 |
-| 绘图 LLM 调用方式 | 流式 | 验证本次修复，日志应有 streaming=true |
-| 绘图 LLM 推理强度 | 继承 Provider | 首先只改变流式调用，不同时改变推理设置 |
-| 绘图 LLM 输出 Token 预算 | 0 | 继承 Provider，避免预算包含隐藏推理而截断 |
-| 最近对话消息数 | 0 | 保持你原来的设置；0 是主动关闭历史，仍传本轮原话和完整回复 |
-| 读取附图和最近成图 | 关闭 | 排除当前/上张图片的视觉处理时间 |
-| 格式错误纠正一次 | 关闭 | 先测单次调用，格式错误会直接留下诊断结果 |
-| 规划总超时预算 | 180 秒 | 让约 117 秒的慢响应有机会完整返回；这是上限，不是固定等待 |
-| 记录绘图回包预览 | 开启 | 输出最多 2000 字符绘图回包，便于检查格式；测试后可关闭 |
-| 429 / 503 自动重试 | 暂时关闭 | 先单独测绘图模型；503 功能另行验证 |
-
-保持 Grok Provider 的推理参数、最大输出长度和主聊天流式设置原样，记录它们即可。测试期间每次等上一张图完成或报错后再继续。
-
-## 第一组：比较三条入口
-
-每项测试前 reset/新建对话，确认仍绑定同一卡；用下面这个普通场景，无须发送图片。最小测试是 B、C 各一次；已有主 Grok 的近期直出基准可直接提供，无须重复许多次。
-
-| 编号 | 发送内容 | 应出现的流程 |
-|---|---|---|
-| A | `请用绑定角色卡画一张你坐在窗边看书的画面，简短回应。` | 主 Grok 写参数并调用 novelai_generate_image，直接生图 |
-| B | `请用绑定角色卡画一张你坐在窗边看书的画面，简短回应。n` | 主 Grok 正常回复，发送后独立 Grok 规划并生图 |
-| C | `/n 请用绑定角色卡画一张你坐在窗边看书的画面。` | 独立 Grok 规划并生图，不调用主模型 |
-
-记录发送时间、主回复时间（C 没有）、图片到达或报错时间。A 的主模型在图后追加回复时，也保留那一段日志；它能判断出图后是否又经历工具循环。
-
-## 仍慢时：一次只改变一个设置
-
-先将“推理强度”从继承改为**低**，保持流式、JSON、预算 0，重复 C 一次。日志应有 `request_overrides.reasoning_effort=low`。如果服务不支持该字段，保留 400 等报错并改回继承，插件不会悄悄再发一次。
-
-需要进一步比较协议时，保持相同推理强度，将“输出协议”改为**内部参数提交工具**再试 C。需要比较旧调用路径时，保持 JSON、继承、预算 0，只把“调用方式”改为**非流式**再试 C。按出现的差异选择一项即可，不必一次跑完所有组合。
-
-## 验证 503 次数配置
-
-将“503 自动重试次数”设为 **1**，“重试基础等待”设为 **3 秒**，429 重试保持关闭。正常出图即可，不需要故意填错地址。遇到服务真实 503 时应出现：
-
-1. `image_api_error`：`error_code/status=http_503`、`retry=true`。
-2. `image_retry_wait`：`next_attempt=2`、`max_attempts=2`；上游 Retry-After 更长时遵守更长等待。
-3. 同一 job_id 的第二次 `image_api_request`。绘图 LLM 不重新调用，最终成功只发一张图片。
-4. 第二次仍 503 则停止并报错，不出现第三次图片 API 请求。
-
-次数设为 0 关闭，最多额外 3 次。429 和 503 各自计数，总上限为首次 1 次加两种重试额度，最多 6 次。503 重发可能重复计费。网络中断、超时、其他 5xx 不自动重试；重试等待中 reset 会阻止旧图继续请求。
-
-## 返回哪些资料
-
-提供每次从收到消息到图片发送/最终报错的**完整时间区间日志**，包含 Core 的工具调用、Provider 警告和插件的“绘图规划”行。注明 A/B/C、协议、调用方式、推理强度和 Provider ID。日志中的 `request_id` 关联同一条消息，`job_id` 关联图片任务。Provider/API 密钥无需提供。
-
-WebUI“任务记录 → 最近一次请求快照”也可复制；其中 `snapshots.request`、`snapshots.response` 保存规划输入统计和回包元数据，即使图片已发送也保留。完整日志更适合比较多轮。
-
-## 日志读法与判断边界
-
-| 字段/阶段 | 能判断什么 |
+| 设置 | 取值 |
 |---|---|
-| waiting_reply → prepare / reply_wait_ms | n 等主模型回复和发送的时间 |
-| prepare_ms、context_prepare_ms、image_prepare_ms | 本地素材准备、会话读取和图片路径转换的时间 |
-| payload_size、system_size、tool_schema_size、total_text_chars | 业务 JSON、内置技能、工具 schema 的输入大小；不是上游实际 Token 或完整 HTTP 大小 |
-| field_chars | 原话、完整回复、历史、角色目录、上一张方案各自占多大 |
-| context_messages_configured、context_disabled、context_source | 历史是否主动关闭、来自主请求快照还是当前会话 |
-| image_sources | 本轮主请求图片、本轮消息图片或上一张成图；路径/URL 不输出 |
-| request → received / provider_ms | 一次 Context/Provider 调用耗时，含 SDK 和上游等待；不是首 Token 时间 |
-| transport、streaming、request_overrides | 实际选择的调用路径与本次请求覆盖参数 |
-| first_chunk_ms、first_text_ms、first_reasoning_ms | Provider 向插件交付首段流式文字/推理的时间，非原始 HTTP 首 Token；没提供相应片段就不填 |
-| chunks、streamed_text_chars、streamed_reasoning_chars、final_response_ms | SDK 可见输出片段数量、累计长度和最终结果时间；工具模式可能只有最终参数，chunks=0 不等于没使用流式 HTTP |
-| raw_content_chars、raw_reasoning_fields | 适配器清理前的正文及常见推理字段长度，有助于追查短 JSON 与大量计费 Token 的差异 |
-| provider_wait | 每 30 秒仍在等待，既不发新请求也不重试 |
-| response / validation_ms、retry、attempt | 本地校验时间，是否追加过格式纠正调用 |
-| provider_details | Provider、当前模型、接口指纹、SDK 重试配置及部分配置参数；这些是观测到的配置，不是拦截到的最终 HTTP 参数 |
-| response_details | 上游返回的模型、结束原因、请求 ID、Token/缓存/推理用量；空 usage 表示未取得数据，不能当 0 |
-| main_request_hook、main_response_hook | 主模型输入统计及回包元数据；hook_elapsed_ms 包含整个 Agent 阶段，可能包含工具和生图时间，不能与 provider_ms 直接比较 |
-| image_api_request / queue_ms、image_api_response | 本地生图通道等待和图片服务调用时间（包含上传、处理、下载） |
-| image_end / generation_ms、delivery_ms | 生图流程与图片发送各自耗时 |
-| duplicate_tool / drawing_state | 主模型是否在已排队或已完成后又调用绘图工具；此类调用不会再生图 |
-| failed、exception_type、http_status、server_request_id | 准备、SDK 或服务异常；状态和请求 ID 仅在可取得时输出 |
+| 绘图输出协议 | 自动（OpenAI 兼容使用与主绘图同名的参数工具） |
+| 绘图调用方式 | 自动（跟随主聊天的流式设置） |
+| 绘图推理强度 | 继承 |
+| 绘图输出 Token 预算 | 0 |
+| 最近对话消息数 | 保持之前的 0；这是主动关闭历史，本轮原话和 n 的完整回复仍传入 |
+| 读取附图和最近成图 | 首次关闭 |
+| 格式错误纠正一次 | 首次关闭，方便确认单次调用 |
+| 规划超时 | 保持原来的 120 秒 |
+| 记录绘图回包预览 | 开启，超时时也可保留有限正文/参数片段；测试后可关闭 |
 
-如果流式明显改善而非流式复现慢，支持调用/中转流式路径差异。如果首段很快但最终结果很慢且累计输出很长，优先追查多余输出或推理；如果降低推理强度后改善，支持推理预算相关。Provider 调用内部的实际 HTTP 排队和重试次数仍需结合 Provider 警告或上游请求记录确认。插件使用请求局部配置副本，不改写共享 Provider 或拦截其 HTTP 客户端。
+1. 新对话发送：`/n 请用绑定角色卡画一张你坐在窗边看书的画面。` 应只走独立规划和生图，不调用主模型。
+2. 等上一项完成或报错，再新对话发送：`请用绑定角色卡画一张你坐在窗边看书的画面，简短回应。n` 应先正常回复，再由独立模型出图。
+3. 有近期相同场景的主 Grok 直出基准可以直接一起提供；需要新基准时发送同样场景并去掉 n。
+
+若要验证你之前使用的 JSON 模式，只改输出协议为 JSON，再试一次 /n。本版会发送真正的 json_object 格式约束；接口若不支持，会明确提示改用自动/工具模式，不静默重发。
+
+如果仍慢，保留当前设置并提供日志，不需要继续反复调整超时、推理预算或流式开关。已有图片 503 重试配置保持生效，它只重试图片 API。
+
+## 提供的日志
+
+给出每次从收到消息到图片发送或最终报错的完整日志区间，注明 /n、n 或主模型直出，以及协议、调用方式、推理强度。保留 Provider 的报错行，密钥无需提供。
+
+新增日志均带 request_id，图片阶段另有 job_id。WebUI 请求快照保存本轮请求、HTTP 结果与超时信息。
+
+## 新日志如何定位
+
+| 阶段或字段 | 含义 |
+|---|---|
+| request.request_layout=native_dialogue | 已使用新消息结构；原生角色对话和最后一条自然语言绘图要求 |
+| request.provider_details.sdk_max_retries=0 | 绘图专用 SDK 副本已关闭隐式重试，主聊天配置不变 |
+| http_request / wire | 实际 HTTP 请求开始；记录最终字段、模型、消息角色、工具名、stream、格式约束 |
+| wire.tools=[novelai_generate_image] | 正在使用与主模型同名的绘图参数工具 |
+| wire.response_format_type=json_object | JSON 模式已发送 API 格式约束 |
+| http_attempts | 实际 HTTP send 累计次数；格式纠正、AstrBot Key/兼容性回退均会增加，不包含中转内部重试 |
+| network_events | 支持 httpcore trace 时记录连接/TLS/发送请求头/接收响应头的阶段；复用连接时可能没有连接建立事件 |
+| http_headers / headers_ms | 已收到响应头；耗时包含本地连接池、网络和上游等待，不能等同于纯上游时间 |
+| http_first_body / first_body_ms | 开始收到响应体字节；SSE 心跳也可能先到 |
+| http_first_content / first_content_ms | 可解析的正文内容开始出现 |
+| http_first_tool_arguments / first_tool_arguments_ms | 工具参数开始出现，即使 AstrBot 尚未向插件交付最终参数 |
+| http_first_reasoning / reasoning_chars | 服务器显式返回了推理字段；只记长度，不记录内容；隐藏推理未必返回 |
+| http_end / body_elapsed_ms、outcome | 正文接收结束或取消，包含字节数、正文/参数长度与服务提供的 Token 用量 |
+| http_error / headers_received=false | 在拿到响应头之前异常或取消；仍需结合异常类型判断网络、连接池或服务等待 |
+| timeout / http_metrics | 超时发生时已取得的 HTTP 指标；开启预览才含有限正文/工具参数片段 |
+| provider_wait | 每 30 秒进度，包含最近的 HTTP 和 SDK 片段统计，不会发新请求 |
+| image_api_request / image_api_response | 真正图片服务的开始和结束，和前面的 LLM 参数生成分开计时 |
+
+响应头很快、内容很晚：继续查模型/中转生成过程。响应头也很晚：结合 HTTP 错误和上游请求 ID 查连接池、网络或中转等待。正文持续增长而结束很晚：查多余输出/显式推理。http_attempts 大于 1：先找格式纠正或 AstrBot 回退行。仅这些客户端日志不能直接测出服务内部排队、隐藏推理或中转内部重试。

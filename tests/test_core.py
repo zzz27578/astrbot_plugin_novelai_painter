@@ -18,6 +18,19 @@ from astrbot.core.message.components import Image
 from astrbot.core.message.message_event_result import MessageChain
 
 
+def planning_payload(kwargs):
+    """Read reference materials and native messages from a captured request."""
+    import planner
+    contexts = kwargs["contexts"]
+    result = json.loads(contexts[0]["content"][len(planner.MATERIALS_HEADER):])
+    count = result.pop("dialogue_message_count")
+    has_reply = result.pop("current_reply_included")
+    result["drawing_request"] = kwargs["prompt"]
+    result["recent_dialogue"] = [{"role": m["role"], "text": m["content"]} for m in contexts[1:1+count]]
+    result["current_reply"] = contexts[-1]["content"] if has_reply else ""
+    return result
+
+
 class FakeEvent:
     unified_msg_origin = "test:group:1"
     role = "admin"

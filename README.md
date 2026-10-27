@@ -22,9 +22,9 @@
 
     git clone https://github.com/zzz27578/astrbot_plugin_novelai_painter.git
 
-安装后进入 AstrBot WebUI 的插件详情页，打开 NovelAI Painter 设置页面完成配置。2.10.3 要求 AstrBot >= 4.27.3，使用统一人设解析接口和不保存到历史的临时消息内容；会话强制人设、Conversation 人设和默认人设与 AstrBot 主 Agent 的选择结果一致。
+安装后进入 AstrBot WebUI 的插件详情页，打开 NovelAI Painter 设置页面完成配置。2.10.4 要求 AstrBot >= 4.27.3，使用统一人设解析接口和不保存到历史的临时消息内容；会话强制人设、Conversation 人设和默认人设与 AstrBot 主 Agent 的选择结果一致。
 
-## 2.10.3 绘图入口与独立 LLM
+## 2.10.4 绘图入口与独立 LLM
 
 先在 AstrBot 中配置一个聊天模型 Provider，再到插件页面“连接与模型 → 独立绘图 LLM”填写或选择其 **Provider ID**。它仅用于暗号 `n` 和 `/n`，图片仍由 NovelAI / 兼容图片服务生成。**普通工具调用始终由主模型写完整参数直接出图，配置独立模型不再自动转述。** 留空关闭暗号和 `/n`，主模型工具不受影响。
 
@@ -47,21 +47,23 @@
 
 `/n 换白裙坐在窗前，保留耳朵和发型` 立即交给独立模型，成功只发图片。单独 `/n` 表示画当前场景；未配置独立模型时给出配置提示，不再把中文直接发给 NAI。原来的直接 Tag 入口移为 `/nai white dress, sitting by a window`，沿用当前绑定/默认卡，不调用任一 LLM；`/nai draw <Tag>` 仍为不套卡的自由绘画。
 
-输出协议默认“自动”：AstrBot OpenAI 兼容 Provider 使用请求内的 `submit_drawing_plan` 参数工具，并设置 `tool_choice=required`，明确要求直接提交参数，减少先输出一段文本再纠正的额外调用；其余 Provider 使用 JSON 文本。内部工具采用精简的规划 schema，不执行图片服务或其他工具。兼容服务不支持工具时可选“JSON 文本”，不修改 Provider 全局配置。
+输出协议默认“自动”：AstrBot OpenAI 兼容 Provider 使用请求内的 `novelai_generate_image` 参数工具，复用主绘图工具的 prompt/subjects/style 字段定义，tool_choice 与主 Agent 一样使用 auto。插件只读取这一次参数提交，校验后出图，不运行聊天工具循环。旧 submit_drawing_plan 回包仍可解析。显式选择 JSON 模式时，OpenAI Chat Completions 兼容请求携带 response_format=json_object；不支持会明确报错，不静默切换协议重发。其他 Provider 仍按技能要求返回 JSON。
 
-2.10.3 修复独立路线固定使用非流式调用的差异。“绘图 LLM 调用方式”默认自动，OpenAI 兼容 Provider 使用 `text_chat_stream`，其他 Provider 保留非流式；可手动选择流式或非流式做兼容与速度对照。JSON 和参数工具均支持，流式内容仅在插件内部接收，等完整最终结果并校验后才请求图片服务。连接中断或缺失最终结果会明确报错，不用部分 JSON 出图，也不自动切换路径再发一遍。
+2.10.4 重新整理独立调用：“绘图 LLM 调用方式”自动模式跟随主聊天的流式设置；取不到设置时，OpenAI 兼容 Provider 使用流式。可显式选择流式或非流式。JSON 和参数工具均支持，流式内容仅在插件内部接收，等完整最终结果并校验后才请求图片服务。连接中断或缺失最终结果会明确报错，不用部分 JSON 出图，也不自动切换路径再发一遍。
 
 新增“绘图 LLM 推理强度”和“输出 Token 预算”：默认继承/0，不覆盖 Provider；选择低/中/高或非 0 预算时，仅覆盖本次 OpenAI 兼容绘图请求的 `reasoning_effort` / `max_completion_tokens`。使用独立配置副本传入适配器，避免 AstrBot 丢弃任意 kwargs，也不改变主聊天配置。上游需支持这些字段。Token 预算可能包含隐藏推理；截断会停止，不能靠再跑一次相同预算修复。
 
 解析清理思考块、围栏和说明文字中的唯一完整 JSON，也识别明确命名的工具参数包装、旧式 subjects 数组字符串，以及冗余的 `operation=generate` / 空 reference_type；不丢弃未知的语义字段或改写 Tag 权重。仍无效时默认反馈错误和前次输出，最多纠正一次。**首次调用与纠正共用总超时预算，默认 60 秒，可调 5–180 秒**，第二次仅使用剩余时间，少于 3 秒不再发起纠正。参数通过前不请求图片服务；拒绝、截断、超时和网络错误停止，不回退主模型 Tag。图片后端的有限 429/503 重试与此独立。
 
-绘图素材保留原话、完整回复、配置范围内的历史、角色身份和服饰；不重复发送由后端直接使用的卡内画风、负面词或转述意图。固定素材位于 JSON 前部，紧凑编码；主模型直接出图的成功方案仍可用于后续 `/n` 改图。
+绘图输入保留用户原话、完整本轮回复及配置范围内的历史。历史以原生 user/assistant 消息传入，本轮要求直接作为最后一条用户消息；角色目录和上一张方案独立标记为辅助素材，不再把所有对话压成一个素材 JSON。精简系统技能，角色卡原始身份、画风、权重和负面词仍由后端应用；主模型直接出图的成功方案仍可用于后续 `/n` 改图。
 
 日志用 request_id 关联主聊天、等待回复、准备素材、调用 Provider、收到回包、校验和图片任务。2.10.2 增加 Provider/模型及接口指纹、允许公开的推理/长度参数、SDK 重试配置、技能与工具 schema 大小、各输入字段长度、上下文来源、当前/上张图片来源，以及上游提供的模型名、结束原因、Token/缓存/推理用量和服务请求 ID。默认不记录正文、图片地址或密钥；开启“记录绘图回包预览”才显示最多 2000 字符绘图返回。快照保留本轮最近请求与结果、最多 24 个阶段，避免发图覆盖规划回包。
 
 每等待 Provider 30 秒记录一次 `provider_wait`；`received.provider_ms` 单独计 Provider 等待，`response.validation_ms` 计本地校验。2.10.3 流式调用增加首段文字/推理的可见时间、累计长度及最终结果时间，并记录覆盖参数、原始正文长度和原始推理字段长度，帮助判断短 JSON 却报告数千输出 Token 的原因。AstrBot 可能只在流结束提供工具参数，此时不虚报首 Token 时间。`request` 是调用 Provider 的时点，包含后续 SDK 准备、重试及上游等待；不代表 HTTP 已到服务器。主模型 `hook_elapsed_ms` 可能包含多轮工具和生图，不能当单次模型耗时。切换 Provider 或对话会取消旧任务。实际 Grok 速度仍需服务实测确认。
 
-对照操作见 [延迟诊断测试步骤](DIAGNOSTIC_TEST_GUIDE.md)。验证及实现说明见 [2.10.3 更新说明](UPDATE_REPORT_2.10.3.md)，前版见 [2.10.2 更新说明](UPDATE_REPORT_2.10.2.md)。
+2.10.4 为 OpenAI 兼容绘图请求创建局部 SDK 客户端副本，关闭 SDK 自带重试（max_retries=0），不改主模型的配置、鉴权或连接池。AstrBot 自身的 Key/兼容性回退仍可能追加请求，每次实际 HTTP send 都计数。新增 http_request/http_headers/http_first_body/http_first_content/http_first_tool_arguments/http_end/http_error，记录序列化请求的字段、消息角色、格式类型、响应头等待、首字节、正文/工具参数长度、状态码和服务器请求 ID；支持 httpx/httpx2 和压缩回包，network_events 记录底层提供的连接/TLS/请求头及响应头阶段。超时保留已有指标，调试开启时保留最多 2000 字符的绘图输出预览，不记录推理正文。HTTP send 时点包含本地连接池与网络等待，不能据此测出上游内部排队或隐藏推理。
+
+对照操作见 [延迟诊断测试步骤](DIAGNOSTIC_TEST_GUIDE.md)。验证及实现说明见 [2.10.4 更新说明](UPDATE_REPORT_2.10.4.md)，前版见 [2.10.3 更新说明](UPDATE_REPORT_2.10.3.md)。
 
 ## 命令
 

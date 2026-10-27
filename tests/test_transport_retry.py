@@ -175,11 +175,14 @@ class TransportRetryTests(unittest.TestCase):
             create.assert_awaited_once()
             wire = create.await_args.kwargs
             self.assertTrue(wire["stream"])
-            self.assertEqual(wire["extra_body"], {"reasoning_effort": "low", "max_completion_tokens": 2048})
+            expected = {"reasoning_effort": "low", "max_completion_tokens": 2048}
+            if mode == "json":
+                expected["response_format"] = {"type": "json_object"}
+            self.assertEqual(wire["extra_body"], expected)
             self.assertEqual(provider.provider_config["custom_extra_body"], {"reasoning_effort": "high"})
             if mode == "tool":
-                self.assertEqual(wire["tool_choice"], "required")
-                self.assertEqual(wire["tools"][0]["function"]["name"], "submit_drawing_plan")
+                self.assertEqual(wire["tool_choice"], "auto")
+                self.assertEqual(wire["tools"][0]["function"]["name"], "novelai_generate_image")
             response = p._planner_diagnostics[core.FakeEvent.unified_msg_origin]
             self.assertEqual(response["response_details"]["usage"]["total_tokens"], 150)
             if mode == "json":
@@ -257,7 +260,7 @@ class TransportRetryTests(unittest.TestCase):
             else:
                 await p._quick_draw(event, "画窗边的你")
             self.assertEqual(len(calls), 1)
-            payload = json.loads(calls[0]["prompt"])
+            payload = core.planning_payload(calls[0])
             self.assertEqual(payload["user_request"], event.message)
             self.assertEqual(payload["current_reply"], "完整的本轮回复" if marker else "")
             p.context.llm_generate.assert_not_awaited()
@@ -334,5 +337,6 @@ class TransportRetryTests(unittest.TestCase):
             user = seen[0]["messages"][-1]["content"]
             if isinstance(user, list):
                 user = "".join(part.get("text", "") for part in user)
-            self.assertEqual(json.loads(user)["drawing_request"], "画窗边的你")
+            self.assertEqual(user, "画窗边的你")
+            self.assertEqual(seen[0]["response_format"], {"type": "json_object"})
         asyncio.run(run())

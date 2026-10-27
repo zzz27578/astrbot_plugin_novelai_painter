@@ -214,7 +214,7 @@ class DiagnosticsTests(unittest.TestCase):
             request = next(row for row in self.logs(logger) if row["phase"] == "request")
             self.assertEqual(request["image_sources"], ["current_message_image", "previous_drawing"])
             self.assertTrue(request["previous_plan_included"])
-            payload = json.loads(p.context.llm_generate.await_args.kwargs["prompt"])
+            payload = core.planning_payload(p.context.llm_generate.await_args.kwargs)
             self.assertEqual(payload["images"], {"current_user_images": 1, "previous_drawing_attached": True})
             self.assertNotIn(str(image), json.dumps(self.logs(logger)))
         asyncio.run(run())

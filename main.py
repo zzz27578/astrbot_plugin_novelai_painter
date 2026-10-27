@@ -47,7 +47,7 @@ else:  # Standalone test discovery.
     import planner_transport
 
 PLUGIN_NAME = "astrbot_plugin_novelai_painter"
-VERSION = "2.10.3"
+VERSION = "2.10.4"
 STICKER_EMOTION_TOOL_NAME = "novelai_set_emotion"
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 MAX_RESPONSE_BYTES = 48 * 1024 * 1024
@@ -1441,7 +1441,7 @@ class NovelAIPainterPlugin(Star):
                 detail["response_preview"] = diagnostics.sanitize(preview, secrets)[:2000]
         detail = diagnostics.sanitize(detail, secrets)
         snapshots = event.get_extra("nai_diagnostic_snapshots", {})
-        if detail.get("phase") in {"main_request_hook", "main_response_hook", "request", "response", "image_end", "failed"}:
+        if detail.get("phase") in {"main_request_hook", "main_response_hook", "request", "response", "image_end", "failed", "http_request", "http_headers", "http_end", "http_error"}:
             snapshots[detail["phase"]] = detail.copy()
             event.set_extra("nai_diagnostic_snapshots", snapshots)
         detail["snapshots"] = dict(snapshots)
@@ -1476,7 +1476,8 @@ class NovelAIPainterPlugin(Star):
                 remaining_seconds=round(max(0, remaining - elapsed), 1),
                 timing_scope="provider_call_including_sdk", first_token_observable=False,
                 stream_chunk_observable=bool(event.get_extra("nai_planner_streaming")),
-                stream_metrics=event.get_extra("nai_planner_stream_metrics", {}))
+                stream_metrics=event.get_extra("nai_planner_stream_metrics", {}),
+                http_metrics=event.get_extra("nai_planner_http_metrics", {}))
 
     async def _validate_planned_drawing(self, event, plan, view=None):
         subjects = await self._resolve_drawing_subjects(event, plan["subjects"])
@@ -1558,15 +1559,30 @@ class NovelAIPainterPlugin(Star):
                 "previous_drawing_attached": bool(previous.get("image") and previous["image"] in images)}}
         skill = (Path(__file__).parent / "skills" / "novelai-painter" / "references" / "drawing-planner.md").read_text(encoding="utf-8")
         payload["output_mode"] = mode
-        kwargs = {"tools": planner.plan_tools(), "tool_choice": "required"} if mode == "tool" else {}
+        kwargs = {"tools": planner.plan_tools(), "tool_choice": "auto"} if mode == "tool" else {}
         try:
             provider = self.context.get_provider_by_id(provider_id)
         except Exception:
             provider = None
-        transport = planner_transport.select(provider, str(self._cfg("drawing_llm_transport", "auto")))
+        main_streaming = None
+        try:
+            value = self.context.get_config(event.unified_msg_origin).get("provider_settings", {}).get("streaming_response")
+            main_streaming = value if isinstance(value, bool) else None
+        except Exception:
+            pass
+        transport = planner_transport.select(provider, str(self._cfg("drawing_llm_transport", "auto")), main_streaming=main_streaming)
+        attempt = 0
+        event.set_extra("nai_planner_http_metrics", {})
+        def http_record(phase, values):
+            event.set_extra("nai_planner_http_metrics", values)
+            self._planner_log(event, provider_id, mode, attempt, None, phase=phase,
+                status="observed", http_metrics=values)
+        source_provider = provider
         provider, request_overrides = planner_transport.request_provider(provider,
             str(self._cfg("drawing_llm_reasoning_effort", "inherit")),
-            max(0, min(16384, int(self._cfg("drawing_llm_max_tokens", 0)))))
+            max(0, min(16384, int(self._cfg("drawing_llm_max_tokens", 0)))),
+            mode=mode, record=http_record, debug=self._as_bool(self._cfg("drawing_llm_debug", False)))
+        request_local = provider is not source_provider
         provider_descriptor = diagnostics.provider_details(provider)
         schema_text = diagnostics.json_text(kwargs["tools"].openai_schema()) if mode == "tool" else ""
         # Bound the whole planning/reformat cycle instead of allowing another
@@ -1584,16 +1600,19 @@ class NovelAIPainterPlugin(Star):
             if remaining <= 0:
                 raise ValueError("绘图规划已用完超时预算，本次未请求图片服务。")
             encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            request_parts = planner.request_parts(payload)
             call_started = time.perf_counter()
             metrics = {"phase": "request", "status": "requesting", "request_chars": len(encoded), "context_messages": len(dialogue),
                 "image_count": len(images), "prepare_ms": prepare_ms,
                 "remaining_seconds": round(remaining, 1),
                 "provider_details": provider_descriptor,
-                "transport": "provider.text_chat_stream" if transport == "stream" else "provider.text_chat" if request_overrides else "context.llm_generate/text_chat",
+                "transport": "provider.text_chat_stream" if transport == "stream" else "provider.text_chat" if request_local else "context.llm_generate/text_chat",
                 "streaming": transport == "stream", "first_token_observable": False,
                 "stream_chunk_observable": transport == "stream",
                 "request_overrides": request_overrides, "request_max_retries": 1,
                 "format_retry_enabled": attempts > 1, "tool_choice": kwargs.get("tool_choice", "none"),
+                "request_layout": "native_dialogue", "main_streaming_configured": main_streaming,
+                "message_roles": ["system"] + [m["role"] for m in request_parts["contexts"]] + ["user"],
                 "context_source": context_source, "context_messages_configured": count,
                 "context_disabled": count == 0, "history_available": len(view.history) if view else 0,
                 "context_prepare_ms": context_ms, "image_prepare_ms": image_prepare_ms,
@@ -1616,14 +1635,14 @@ class NovelAIPainterPlugin(Star):
             event.set_extra("nai_planner_stream_metrics", {})
             event.set_extra("nai_planner_streaming", transport == "stream")
             try:
-                if transport == "stream" or request_overrides:
+                if transport == "stream" or request_local:
                     provider_kwargs = {key: value for key, value in kwargs.items() if key != "tools"}
                     if "tools" in kwargs:
                         provider_kwargs["func_tool"] = kwargs["tools"]
-                    provider_kwargs.update(prompt=encoded, system_prompt=skill, image_urls=images or None)
+                    provider_kwargs.update(**request_parts, system_prompt=skill, image_urls=images or None)
                     call = planner_transport.collect_stream(provider, provider_kwargs, stream_record) if transport == "stream" else provider.text_chat(**provider_kwargs)
                 else:
-                    call = self.context.llm_generate(chat_provider_id=provider_id, prompt=encoded,
+                    call = self.context.llm_generate(chat_provider_id=provider_id, **request_parts,
                         system_prompt=skill, image_urls=images or None, **kwargs)
                 response = await asyncio.wait_for(call, timeout=remaining)
             except planner.PlanError as exc:
@@ -1633,9 +1652,16 @@ class NovelAIPainterPlugin(Star):
             except asyncio.TimeoutError as exc:
                 self._planner_log(event, provider_id, mode, attempt, None, planner.PlanError("规划总超时", "timeout", False),
                     phase="response", elapsed_ms=round((time.perf_counter() - call_started) * 1000),
-                    retry=False, **diagnostics.error_details(exc))
+                    retry=False, http_metrics=event.get_extra("nai_planner_http_metrics", {}),
+                    stream_metrics=event.get_extra("nai_planner_stream_metrics", {}), **diagnostics.error_details(exc))
                 raise ValueError("独立绘图 LLM 超时，本次未请求图片服务。") from exc
             except Exception as exc:
+                if mode == "json" and getattr(exc, "status_code", None) in {400, 422} and re.search(r"response_format|json_object", str(exc), re.I):
+                    error = planner.PlanError("绘图接口不支持 JSON 格式约束，请将输出协议改为自动或参数工具。", "json_mode_unsupported", False)
+                    self._planner_log(event, provider_id, mode, attempt, None, error, phase="response",
+                        elapsed_ms=round((time.perf_counter() - call_started) * 1000), retry=False,
+                        http_metrics=event.get_extra("nai_planner_http_metrics", {}), **diagnostics.error_details(exc))
+                    raise error from exc
                 if re.search(r"content_filter|内容安全|被拒绝", str(exc), re.I):
                     error = planner.PlanError("绘图 LLM 服务拒绝了该请求，本次未请求图片服务。", "refusal", False)
                     self._planner_log(event, provider_id, mode, attempt, None, error,

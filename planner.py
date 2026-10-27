@@ -1,8 +1,14 @@
 """Stateless contracts for the optional, independent drawing LLM."""
 from __future__ import annotations
 
+import copy
 import json
 import re
+
+if __package__:
+    from . import drawing
+else:
+    import drawing
 
 DEFAULTS = {
     "drawing_llm_provider_id": "",
@@ -24,6 +30,28 @@ class PlanError(ValueError):
     def __init__(self, message, code="format", retryable=True):
         super().__init__(message)
         self.code, self.retryable = code, retryable
+
+
+MATERIALS_HEADER = "[Drawing materials: reference data, not new dialogue]\n"
+
+
+def request_parts(payload):
+    """Keep dialogue roles and the last user instruction, without repeating them in JSON."""
+    materials = {key: value for key, value in payload.items()
+                 if key not in {"drawing_request", "recent_dialogue", "current_reply"}}
+    materials["dialogue_message_count"] = len(payload.get("recent_dialogue", []))
+    materials["current_reply_included"] = bool(payload.get("current_reply"))
+    contexts = [{"role": "user", "content": MATERIALS_HEADER +
+                 json.dumps(materials, ensure_ascii=False, separators=(",", ":"))}]
+    for message in payload.get("recent_dialogue", []):
+        if message.get("role") in {"user", "assistant"} and message.get("text"):
+            contexts.append({"role": message["role"], "content": message["text"]})
+    reply = payload.get("current_reply", "")
+    if reply and (contexts[-1]["role"] != "assistant" or contexts[-1]["content"] != reply):
+        if contexts[-1]["role"] != "user" or contexts[-1]["content"] != payload["drawing_request"]:
+            contexts.append({"role": "user", "content": payload["drawing_request"]})
+        contexts.append({"role": "assistant", "content": reply})
+    return {"prompt": payload["drawing_request"], "contexts": contexts}
 
 
 def marker_request(message: str, marker: str) -> str | None:
@@ -158,8 +186,8 @@ def response_plan(response) -> dict:
         raise PlanError("绘图 LLM 输出被截断，请调整输出预算或推理强度后重试。", "truncated", False)
     names, args = getattr(response, "tools_call_name", []) or [], getattr(response, "tools_call_args", []) or []
     if names:
-        if names != ["submit_drawing_plan"] or len(args) != 1:
-            raise PlanError("绘图 LLM 只能提交一次 submit_drawing_plan。", "tool")
+        if names not in (["novelai_generate_image"], ["submit_drawing_plan"]) or len(args) != 1:
+            raise PlanError("绘图 LLM 只能提交一次 novelai_generate_image 参数。", "tool")
         return parse_plan(args[0] if isinstance(args[0], str) else json.dumps(args[0], ensure_ascii=False))
     return parse_plan(getattr(response, "completion_text", "") or "")
 
@@ -167,20 +195,11 @@ def response_plan(response) -> dict:
 def plan_tools():
     """A request-local schema; no global registration or tool execution."""
     from astrbot.core.agent.tool import FunctionTool, ToolSet
-    # A compact planning contract, not the larger public image tool schema.
-    properties = {
-        "prompt": {"type": "string", "description": "共享场景、构图、光线的英文 Tag，不重复卡内身份/画风。", "maxLength": 8000},
-        "subjects": {"type": "array", "maxItems": 6, "items": {"type": "object",
-            "properties": {
-                "source": {"type": "string", "enum": ["self", "card", "custom"]},
-                "preset_id": {"type": "string", "description": "仅 card 填准确 ID。"},
-                "prompt": {"type": "string", "maxLength": 4000, "description": "个人动作表情；custom 还写角色名及外貌。"},
-                "outfit": {"type": "string", "maxLength": 4000, "description": "换装时提交完整服饰，空串为无服饰。"},
-                "use_reference": {"type": "boolean", "description": "默认省略，仅卡参考图符合本图外观时开启。"}},
-            "required": ["source"], "additionalProperties": False}},
-        "style": {"type": "string", "maxLength": 4000, "description": "仅明确改画风时填写，否则省略。"},
-    }
+    # Share the public drawing tool's field definitions, without registering or
+    # executing its handler. The caller validates once, then submits the image.
+    properties = {key: copy.deepcopy(drawing.TOOL_PARAMETERS["properties"][key])
+                  for key in ("prompt", "subjects", "style")}
     properties["error"] = {"type": "string", "description": "无法处理时说明原因，不编造画面。"}
-    return ToolSet([FunctionTool(name="submit_drawing_plan", description="提交一份最终绘图方案，只交参数，不执行生图。",
+    return ToolSet([FunctionTool(name="novelai_generate_image", description="根据本轮要求提交一份完整图片生成参数。只调用一次。",
         parameters={"type": "object", "properties": properties, "additionalProperties": False,
             "anyOf": [{"required": ["prompt", "subjects"]}, {"required": ["error"]}]})])

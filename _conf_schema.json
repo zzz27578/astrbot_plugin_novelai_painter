@@ -31,8 +31,8 @@
   "drawing_llm_output_mode": {
     "description": "绘图 LLM 输出协议", "type": "string", "default": "auto",
     "options": ["auto", "tool", "json"],
-    "labels": {"auto": "自动（OpenAI 兼容优先参数工具）", "tool": "内部参数提交工具", "json": "JSON 文本"},
-    "hint": "工具模式要求提交 submit_drawing_plan 参数，减少先输出文本再纠正的额外调用。工具只收参数；不支持工具的兼容接口可选 JSON 文本。"
+    "labels": {"auto": "自动（OpenAI 兼容优先参数工具）", "tool": "绘图参数工具", "json": "JSON 文本"},
+    "hint": "工具模式复用 novelai_generate_image 的字段定义，一次提交参数后校验出图。JSON 模式对 OpenAI 兼容接口发送 json_object 格式约束；不支持时明确报错，不自动重发。"
   },
   "drawing_llm_format_retry": {
     "description": "格式或字段错误时纠正一次", "type": "bool", "default": true,
@@ -41,8 +41,8 @@
   "drawing_llm_transport": {
     "description": "绘图 LLM 调用方式", "type": "string", "default": "auto",
     "options": ["auto", "stream", "nonstream"],
-    "labels": {"auto": "自动（OpenAI 兼容使用流式）", "stream": "流式", "nonstream": "非流式（旧路径）"},
-    "hint": "n 和 /n 共用。流式只在插件内部接收，不向聊天发送 Tag；等完整最终结果再生图。非流式用于兼容与耗时对照；失败不自动换路径重复请求。"
+    "labels": {"auto": "自动（跟随主聊天流式设置）", "stream": "流式", "nonstream": "非流式"},
+    "hint": "n 和 /n 共用。自动模式跟随主聊天的流式设置；取不到设置时 OpenAI 兼容接口使用流式。完整参数通过校验后才出图，失败不自动切换重发。"
   },
   "drawing_llm_reasoning_effort": {
     "description": "绘图 LLM 推理强度", "type": "string", "default": "inherit",

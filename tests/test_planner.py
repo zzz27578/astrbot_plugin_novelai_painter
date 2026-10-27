@@ -55,7 +55,7 @@ class PlannerTests(unittest.TestCase):
             await p.drawing_after_reply(event)
             p.context.llm_generate.assert_not_awaited()
             await self.complete_reply(p, event)
-            payload = json.loads(p.context.llm_generate.await_args.kwargs["prompt"])
+            payload = core.planning_payload(p.context.llm_generate.await_args.kwargs)
             self.assertEqual(payload["user_request"], event.message)
             self.assertEqual(payload["drawing_request"], "把裙子换成白色，坐到窗前，保持耳朵不变")
             self.assertNotIn("drawing_intent",payload)
@@ -156,7 +156,7 @@ class PlannerTests(unittest.TestCase):
             self.assertEqual(replies, [])
             self.assertFalse(event.call_llm)
             self.assertTrue(event.stopped)
-            payload = json.loads(p.context.llm_generate.await_args.kwargs["prompt"])
+            payload = core.planning_payload(p.context.llm_generate.await_args.kwargs)
             self.assertEqual(payload["user_request"], "/n 换白裙坐到窗前")
             self.assertEqual(payload["drawing_request"], "换白裙坐到窗前")
             self.assertEqual(payload["current_reply"], "")
@@ -175,7 +175,7 @@ class PlannerTests(unittest.TestCase):
             await self.complete_reply(p,event)
             kwargs = p.context.llm_generate.await_args.kwargs
             self.assertEqual(kwargs["image_urls"], ["https://example.org/user.png"] if enabled else None)
-            payload = json.loads(kwargs["prompt"])
+            payload = core.planning_payload(kwargs)
             self.assertEqual(payload["recent_dialogue"], [])
             self.assertEqual(payload["user_request"], event.message)
         asyncio.run(run(False)); asyncio.run(run(True))
@@ -198,7 +198,7 @@ class PlannerTests(unittest.TestCase):
             await self.queue_marker(p,event2)
             await self.complete_reply(p,event2)
             kwargs = p.context.llm_generate.await_args.kwargs
-            payload = json.loads(kwargs["prompt"])
+            payload = core.planning_payload(kwargs)
             self.assertEqual(payload["previous_drawing"]["subjects"][0]["outfit"], "white dress")
             self.assertIn(str(copied), kwargs["image_urls"])
             self.assertTrue(payload["images"]["previous_drawing_attached"])
@@ -299,7 +299,7 @@ class PlannerTests(unittest.TestCase):
             await p.drawing_stream_finished(event)
             await p.drawing_after_reply(event)
             p.context.llm_generate.assert_awaited_once()
-            self.assertEqual(json.loads(p.context.llm_generate.await_args.kwargs["prompt"])["current_reply"], text)
+            self.assertEqual(core.planning_payload(p.context.llm_generate.await_args.kwargs)["current_reply"], text)
         asyncio.run(run())
 
     def test_changing_provider_cancels_queued_or_inflight_plan(self):
