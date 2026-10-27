@@ -66,7 +66,7 @@
         <label class="field"><span>规划总超时预算（秒）</span><input data-config="drawing_llm_timeout" type="number" min="5" max="180" /><small>首次规划与一次格式纠正共同使用此预算，重试只用剩余时间；等待主模型和图片服务另计。</small></label>
         <label class="switch-row"><input data-config="drawing_llm_format_retry" type="checkbox" /><span><b>格式错误纠正一次</b><small>先清理可识别的包装和冗余默认字段；仍无效且预算足够才反馈纠正。拒绝、超时和网络错误停止。</small></span></label>
         <label class="switch-row"><input data-config="drawing_llm_debug" type="checkbox" /><span><b>记录绘图回包预览</b><small>排查时开启，日志和任务快照显示最多 2000 字符的绘图返回内容，可能包含画面描述。默认记录阶段耗时、Provider、输入大小、图片来源和 Token 用量，不记录正文。</small></span></label>
-        <label class="switch-row"><input data-config="drawing_llm_use_images" type="checkbox" /><span><b>读取附图和最近成图</b><small>需要视觉模型。最多发送两张本轮附图和一张有效的上一张成图；旧图只补连续性，不覆盖新要求。成图参考最多保留 30 分钟。</small></span></label>
+        <label class="switch-row"><input data-config="drawing_llm_use_images" type="checkbox" /><span><b>读取附图和按需读取成图</b><small>需要视觉模型。本轮附图最多两张；仅改图或延续画面时附带上一张成图，普通新图保留上次方案文字。成图参考最多保留 30 分钟。</small></span></label>
         <label class="field full"><span>绘图偏好（可选）</span><textarea data-config="drawing_llm_prompt" rows="3" maxlength="4000" placeholder="例如：保持当前场景连续，优先人物互动与清楚的构图"></textarea><small>内置绘图技能自动加载。/n [自然语言要求] 只唤醒绘图 LLM；/nai &lt;Tag&gt; 直接提交图片服务。两种 LLM 读取同一当前会话，绘图不会另建聊天。</small></label>
       </div>
       <div class="divider"></div>
@@ -102,7 +102,7 @@
         <label class="field"><span>队列超时（秒）</span><input data-config="queue_timeout" type="number" min="1" max="600" /></label>
         <label class="field"><span>重复事件去重窗口（秒）</span><input data-config="dedupe_window_seconds" type="number" min="1" max="300" /></label>
         <label class="field"><span>429 自动重试策略</span><select data-config="retry_mode"><option value="none">不重试 429</option><option value="rate_limit_once">429 自动重试 1 次</option><option value="rate_limit_twice">429 自动重试 2 次</option></select><small>只控制 429；网络超时和连接中断不自动重试。</small></label>
-        <label class="field"><span>503 自动重试次数</span><input data-config="retry_503_count" type="number" min="0" max="3" step="1" /><small>0 关闭，最多额外 3 次，仅重试图片服务，不重跑绘图 LLM。重发可能产生重复计费。</small></label>
+        <label class="field"><span>503 自动重试次数</span><input data-config="retry_503_count" type="number" min="0" max="3" step="1" /><small>0 关闭，最多额外 3 次，仅重试图片服务。主模型工具长任务会先返回处理中，插件继续同一任务，完成后发图。重发可能产生重复计费。</small></label>
         <label class="field" data-retry-setting><span>429 / 503 重试基础等待（秒）</span><input data-config="retry_delay" type="number" min="1" max="300" step="1" /><small>服务返回 Retry-After 时采用更长等待；等待时释放生图通道。</small></label>
         <label class="switch-row" data-retry-setting><input data-config="show_retry_notice" type="checkbox" /><span><b>发送重试提示</b><small>记录并提示下一次图片服务尝试；/n 仍只发送最终图片或错误。</small></span></label>
         <label class="field"><span>临时图片清理延迟（秒）</span><input data-config="auto_clean_delay" type="number" min="0" max="86400" /><small>设为 0 时会在发送后尽快清理。</small></label>

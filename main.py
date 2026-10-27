@@ -47,7 +47,9 @@ else:  # Standalone test discovery.
     import planner_transport
 
 PLUGIN_NAME = "astrbot_plugin_novelai_painter"
-VERSION = "2.10.4"
+VERSION = "2.10.5"
+# Leave room before the 60-second tool deadline seen in the supplied logs.
+IMAGE_TOOL_INLINE_SECONDS = 45
 STICKER_EMOTION_TOOL_NAME = "novelai_set_emotion"
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 MAX_RESPONSE_BYTES = 48 * 1024 * 1024
@@ -171,6 +173,7 @@ class NovelAIPainterPlugin(Star):
         self._llm_tool_claims: dict[str, float] = {}
         self._delivered_jobs: dict[str, float] = {}
         self._jobs: list[dict[str, Any]] = []
+        self._image_tasks: set[asyncio.Task] = set()
         self._story_ledger = drawing.StoryLedger()
         self._preset_schema_migrated = False
         self.presets = self._load_presets()
@@ -188,6 +191,11 @@ class NovelAIPainterPlugin(Star):
         self._register_web_api()
 
     async def terminate(self):
+        tasks = list(getattr(self, "_image_tasks", ()))
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         for key in list(getattr(self, "_drawing_memory", {})):
             self._drop_drawing_memory(key)
         self._sync_marker_filter(unbind=True)
@@ -981,6 +989,8 @@ class NovelAIPainterPlugin(Star):
         return bool(re.search(
             r"(?:画|绘制)(?:一张|一下|一个|给我看看)?(?:你自己|你现在的样子|你的(?:样子|照片|画像|自拍|全身像))|"
             r"(?:画|绘制)(?:一张|一下|一个)?你(?:[，。！？!?,\s]|$)|"
+            r"(?:画|绘制|生成|来)(?:一张|张|一下|一个)?你(?:自己)?(?:穿着|穿上|坐|站|躺|趴|看书|读书|睡觉)|"
+            r"(?:画|绘制|生成|来)(?:一张|张|一下|一个)?你(?:自己)?在.{0,50}(?:坐|站|躺|趴|看书|读书|睡觉|微笑)|"
             r"\b(?:draw|paint)\s+yourself\b|\b(?:picture|portrait) of\s+you\b|\byour\s+(?:portrait|selfie)\b",
             text,
         ))
@@ -1071,12 +1081,16 @@ class NovelAIPainterPlugin(Star):
             if set(item) - set(drawing.SUBJECT_SCHEMA["properties"]):
                 raise ValueError("subjects 含未知字段；请按当前工具结构提交 source、prompt、outfit 等字段。")
             source, selector = item.get("source"), item.get("preset_id", "")
-            if not isinstance(selector, str) or (source != "card" and selector):
+            if not isinstance(source, str) or source not in {"self", "card", "custom"}:
+                raise ValueError("角色 source 只能是 self、card 或 custom。")
+            if not isinstance(selector, str) or (source not in {"self", "card"} and selector):
                 raise ValueError("仅 source=card 可用字符串 preset_id 选择角色卡。")
             if source == "self":
                 if self_card is None:
                     self_card = await self._resolve_active_preset(event) or {}
                 preset = self_card
+                if selector and selector != preset.get("id"):
+                    raise ValueError("source=self 的 preset_id 与当前绑定卡不符；选择其他卡请用 source=card。")
             elif source == "card":
                 preset = self._find_role_card(selector)
                 if not self._as_bool(preset.get("enabled", True), True):
@@ -1544,7 +1558,8 @@ class NovelAIPainterPlugin(Star):
                         planner.PlanError("当前附图读取失败", "image_input", False), phase="prepare",
                         total_ms=round((time.perf_counter() - started) * 1000), **diagnostics.error_details(exc))
                     raise ValueError("当前附图读取失败，本次绘图已停止；可以关闭图片理解后重试。") from exc
-            if previous.get("image") and Path(previous["image"]).is_file():
+            if (planner.needs_previous_image(event.get_extra("nai_marker_body", seed.get("prompt", ""))
+                    or event.get_message_str()) and previous.get("image") and Path(previous["image"]).is_file()):
                 images.append(previous["image"])
                 image_sources.append("previous_drawing")
         image_prepare_ms = round((time.perf_counter() - started) * 1000) - context_ms
@@ -1617,6 +1632,8 @@ class NovelAIPainterPlugin(Star):
                 "context_disabled": count == 0, "history_available": len(view.history) if view else 0,
                 "context_prepare_ms": context_ms, "image_prepare_ms": image_prepare_ms,
                 "image_sources": image_sources, "previous_plan_included": bool(previous.get("plan")),
+                "previous_image_available": bool(previous.get("image")),
+                "previous_image_policy": "requested_edit_or_continuation",
                 "payload_size": diagnostics.text_size(encoded), "system_size": diagnostics.text_size(skill),
                 "system_fingerprint": diagnostics.fingerprint(skill),
                 "tool_schema_size": diagnostics.text_size(schema_text),
@@ -1702,7 +1719,12 @@ class NovelAIPainterPlugin(Star):
                     raise
                 payload["format_correction"] = {"error": str(exc)[:500],
                     "previous_output": planner.response_output(response)[:16000],
-                    "instruction": "只修正格式或字段，保留用户原意，提交一份完整方案；不要调用图片服务。"}
+                    "instruction": "修正格式或字段，重新核对最后一条用户要求（包括换装），提交完整方案。原生工具调用必须使用 API tool_calls，禁止用 XML、代码块或文字模拟。JSON 模式只输出完整 JSON 对象。"}
+                if mode == "tool":
+                    # Repeating auto after a pseudo tool response repeats the
+                    # same failure on some compatible gateways. This remains
+                    # the single, budgeted correction; error is a legal result.
+                    kwargs["tool_choice"] = "required"
                 continue
             self._planner_log(event, provider_id, mode, attempt, response,
                 phase="response", elapsed_ms=round((time.perf_counter() - call_started) * 1000),
@@ -2162,11 +2184,14 @@ class NovelAIPainterPlugin(Star):
         claim_attr = "_novelai_painter_generation_claim"
         claimed_job_id = getattr(event, claim_attr, None)
         if claimed_job_id:
+            state = event.get_extra("nai_image_status", "running")
+            stopped = state in {"failed", "cancelled"}
             return GenerationResult(
-                True,
+                not stopped,
                 str(claimed_job_id),
                 provider,
-                message="同一条用户消息的重复生成请求已被拦截。",
+                error_code=state if stopped else None,
+                message=f"本条消息的绘图状态为 {state}，重复生成请求已被拦截。",
                 attempts=0,
                 send_image=False,
             )
@@ -2228,6 +2253,7 @@ class NovelAIPainterPlugin(Star):
                 send_image=False,
             )
         inflight_jobs[key] = job_id
+        attempts = 0
         try:
             selected_preset = resolved_preset
             if not reference_id and selected_preset and operation in {"img2img", "reference"}:
@@ -2245,7 +2271,6 @@ class NovelAIPainterPlugin(Star):
             if reference:
                 reference["reference_type"] = effective_reference_type or "character"
             image_b64 = base64.b64encode(image_bytes).decode("ascii") if image_bytes and provider == "novelai_official" else None
-            attempts = 0
             failure_counts = {}
             while True:
                 queue_started = time.perf_counter()
@@ -2324,14 +2349,27 @@ class NovelAIPainterPlugin(Star):
                     # for a Retry-After window.
                     await asyncio.sleep(delay)
             self._recent_jobs[key] = (time.time(), result)
-            job_record = asdict(result)
-            job_record["has_image"] = bool(job_record.pop("path", None))
-            self._jobs.append({**job_record, "operation": operation, "preset_id": active_preset_id, "subject_preset_ids": [c["preset_id"] for c in character_prompts or []], "kind": job_kind, "emotion": emotion, "created_at": int(time.time())})
-            self._jobs = self._jobs[-50:]
+            self._record_image_job(result, operation, active_preset_id, character_prompts, job_kind, emotion)
             return result
+        except (asyncio.CancelledError, Exception) as exc:
+            code = "cancelled" if isinstance(exc, asyncio.CancelledError) else "internal_error"
+            result = GenerationResult(False, job_id, provider, error_code=code,
+                message="任务已取消；若请求已经发出，图片服务仍可能处理。" if code == "cancelled" else "图片任务异常终止。",
+                attempts=attempts, send_image=False)
+            self._recent_jobs[key] = (time.time(), result)
+            self._record_image_job(result, operation, active_preset_id, character_prompts, job_kind, emotion)
+            raise
         finally:
             if inflight_jobs.get(key) == job_id:
                 inflight_jobs.pop(key, None)
+
+    def _record_image_job(self, result, operation, preset_id, characters, kind, emotion):
+        record = asdict(result)
+        record["has_image"] = bool(record.pop("path", None))
+        self._jobs.append({**record, "operation": operation, "preset_id": preset_id,
+            "subject_preset_ids": [c["preset_id"] for c in characters or []],
+            "kind": kind, "emotion": emotion, "created_at": int(time.time())})
+        self._jobs = self._jobs[-50:]
 
     def _capture_drawing_request(self, event, job_id, provider, prompt, operation, negative,
                                  preset, characters, reference, size) -> None:
@@ -2377,7 +2415,12 @@ class NovelAIPainterPlugin(Star):
         if not result.send_image:
             return result.message
         if not result.path:
+            event.set_extra("nai_image_delivery", "failed")
             return "图片生成未完成：未找到图片文件。"
+        if not await self._generation_context_current(event):
+            event.set_extra("nai_image_delivery", "failed")
+            Path(result.path).unlink(missing_ok=True)
+            return "对话已切换或清空，旧图已取消发送。"
         delivered_jobs = getattr(self, "_delivered_jobs", None)
         if delivered_jobs is None:
             self._delivered_jobs = {}
@@ -2385,9 +2428,11 @@ class NovelAIPainterPlugin(Star):
         if result.job_id in delivered_jobs:
             return "图片已生成；重复发送已被拦截。"
         delivered_jobs[result.job_id] = time.time()
+        event.set_extra("nai_image_delivery", "sending")
         try:
             await self._send_generated_image(event, result)
         except Exception as exc:
+            event.set_extra("nai_image_delivery", "failed")
             logger.warning(f"[{PLUGIN_NAME}] 发送图片失败 job={result.job_id}: {exc}")
             try:
                 Path(result.path).unlink(missing_ok=True)
@@ -2395,6 +2440,7 @@ class NovelAIPainterPlugin(Star):
                 pass
             await self._notify(event, "图片已生成，但发送到当前会话失败。", "error")
             return "图片已生成，但发送失败。"
+        event.set_extra("nai_image_delivery", "completed")
         try:
             self._remember_planned_drawing(event, result)
         except Exception as exc:
@@ -2903,7 +2949,49 @@ class NovelAIPainterPlugin(Star):
             subjects(list[object]): 原生角色数组，每人一项，最多 6 人。source=self 画 AI 自己或使用当前绑定卡；card 配 preset_id 选择卡。明确用内置卡时不要传空数组后重写卡词。custom 可用 prompt 或 appearance_prompt 写角色名外貌，完整描述已在顶层时可省略。人物 prompt 可含服饰。绑定卡身份和画风由插件保留；outfit 是完整服饰，整体替换，空串明确无服饰。state_scope 默认 image 仅本图，剧情实际换装才用 story。省略 outfit 时尊重本次普通描述中的服饰；未描述服饰才沿用当前剧情服饰或默认服饰。use_reference 默认 false。不要使用 appearance_patch 或重写绑定卡的 appearance_prompt。
             style(string): 仅用户明确改画风时填写本图完整画风，替换原卡画风；常规用卡画图省略，保留原始画师名及权重。无卡画图可自由使用。
         """
-        return await self._image_tool_entry(event, prompt, operation, reference_type, subjects, style)
+        if event.get_extra("nai_main_hook_started") is not None and not event.get_extra("nai_main_first_tool_observed", False):
+            event.set_extra("nai_main_first_tool_observed", True)
+            self._planner_log(event, event.get_extra("nai_main_provider", ""), "main", 0, None,
+                phase="main_first_drawing_tool", status="observed",
+                elapsed_ms=round((time.perf_counter() - event.get_extra("nai_main_hook_started")) * 1000),
+                timing_scope="main_request_hook_to_first_drawing_tool_not_http",
+                arguments_size=diagnostics.text_size(diagnostics.json_text({"prompt": prompt, "subjects": subjects, "style": style})))
+        # Fast images finish inline as before. Long queue/retry jobs outlive the
+        # Agent's tool deadline, without a second LLM or image request.
+        task = asyncio.create_task(self._image_tool_entry(event, prompt, operation, reference_type, subjects, style))
+        tasks = getattr(self, "_image_tasks", None)
+        if tasks is None:
+            self._image_tasks = tasks = set()
+        tasks.add(task)
+        def completed(done):
+            tasks.discard(done)
+            if not done.cancelled() and done.exception() is not None:
+                logger.error(f"[{PLUGIN_NAME}] 图片任务异常: {type(done.exception()).__name__}")
+        task.add_done_callback(completed)
+        core_timeout = None
+        inline_seconds = IMAGE_TOOL_INLINE_SECONDS
+        try:
+            configured = self.context.get_config(event.unified_msg_origin).get("provider_settings", {}).get("tool_call_timeout")
+            if isinstance(configured, (int, float)) and not isinstance(configured, bool) and configured > 0:
+                core_timeout = configured
+                inline_seconds = min(inline_seconds, max(0.01, configured * 0.75))
+        except Exception:
+            pass
+        try:
+            done, _ = await asyncio.wait({task}, timeout=inline_seconds)
+            if done:
+                return task.result()
+        except asyncio.CancelledError:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
+        event.set_extra("nai_image_deferred", True)
+        self._planner_log(event, self._provider_name(), "image", 0, None,
+            phase="image_tool_deferred", status="running", inline_seconds=inline_seconds,
+            core_tool_timeout_seconds=core_timeout,
+            reason="avoid_core_tool_timeout", creates_new_image_request=False)
+        return ("DRAWING_IN_PROGRESS: 本次绘图仍在排队、生成或重试，图片尚未发送。"
+                "插件将继续同一个任务并发送结果，不要重复调用工具，不要声称已完成；自然回应用户一次即可。")
 
     async def _image_tool_entry(self, event, prompt="", operation="generate", reference_type="", subjects=None,
                                 style=None, *, accepted=False, entry="llm_tool", quiet=False):
@@ -2923,14 +3011,13 @@ class NovelAIPainterPlugin(Star):
             return f"FINAL_IMAGE_TOOL_RESULT: {reason} Do not call any tool again for this message."
 
         if not accepted and self._llm_tool_claimed(event):
+            state = event.get_extra("nai_image_status", "accepted")
             self._planner_log(event, event.get_extra("nai_main_provider", ""), "main", 0, None,
-                phase="duplicate_tool", status="blocked", drawing_state=event.get_extra("nai_image_status", "accepted"))
-            return (
-                "FINAL_IMAGE_TOOL_RESULT: ENTRY_GATE_BLOCKED_DUPLICATE. An image generation call for this "
-                "exact user message was already accepted before backend preparation. Do not call any tool "
-                "again. The accepted call is responsible for sending the image; reply to the user once only "
-                "after that accepted call completes."
-            )
+                phase="duplicate_tool", status="blocked", drawing_state=state)
+            detail = {"completed": "图片任务已完成。", "failed": "图片任务失败，不会继续发送。",
+                "cancelled": "图片任务已取消，不会继续发送；上游可能仍在处理已发出的请求。"}.get(state,
+                "图片任务仍在执行，尚未完成；同一任务将负责发送结果。")
+            return f"FINAL_IMAGE_TOOL_RESULT: ENTRY_GATE_BLOCKED_DUPLICATE. status={state}. {detail} Do not call any tool again for this message."
 
         normalized_prompt = prompt.strip() if isinstance(prompt, str) else ""
         if not normalized_prompt:
@@ -3051,29 +3138,48 @@ class NovelAIPainterPlugin(Star):
         self._planner_log(event, self._provider_name(), "image", 0, None,
             phase="image_start", status="running", entry=entry, planned=accepted, operation=resolved_operation)
         logger.info(f"[{PLUGIN_NAME}] 图片任务开始: entry={entry}, planned={accepted}, operation={resolved_operation}")
-        result = await self._run_job(
-            event,
-            normalized_prompt,
-            resolved_operation,
-            preset_id=str(active_preset.get("id", "")) if active_preset else None,
-            reference_type=normalized_reference_type,
-            preset_override=active_preset,
-            **({"character_prompts": character_prompts} if character_prompts else {}),
-            **({"quiet": True} if quiet else {}),
-        )
-        generation_ms = round((time.perf_counter() - image_started) * 1000)
-        delivery_started = time.perf_counter()
-        user_visible_result = await self._finish_event(event, result)
-        event.set_extra("nai_image_status", "completed" if result.ok else "failed")
+        try:
+            result = await self._run_job(
+                event,
+                normalized_prompt,
+                resolved_operation,
+                preset_id=str(active_preset.get("id", "")) if active_preset else None,
+                reference_type=normalized_reference_type,
+                preset_override=active_preset,
+                **({"character_prompts": character_prompts} if character_prompts else {}),
+                **({"quiet": True} if quiet else {}),
+            )
+            generation_ms = round((time.perf_counter() - image_started) * 1000)
+            delivery_started = time.perf_counter()
+            user_visible_result = await self._finish_event(event, result)
+        except (asyncio.CancelledError, Exception) as exc:
+            cancelled = isinstance(exc, asyncio.CancelledError)
+            state = "cancelled" if cancelled else "failed"
+            event.set_extra("nai_image_status", state)
+            self._planner_log(event, self._provider_name(), "image", 0, None,
+                phase="image_end", status=state, error_code=state if cancelled else "internal_error",
+                job_id=getattr(event, "_novelai_painter_generation_claim", ""),
+                elapsed_ms=round((time.perf_counter() - image_started) * 1000),
+                delivery_state=event.get_extra("nai_image_delivery", "not_started"),
+                error_type=type(exc).__name__, deferred=event.get_extra("nai_image_deferred", False))
+            if cancelled:
+                raise
+            logger.exception(f"[{PLUGIN_NAME}] 图片任务异常终止")
+            await self._notify(event, "图片任务异常终止，请查看插件日志。", "error")
+            return "FINAL_IMAGE_TOOL_RESULT: status=failed. 图片任务异常终止，不会继续发送。不要重复调用工具。"
+        completed = result.ok and event.get_extra("nai_image_delivery") != "failed"
+        event.set_extra("nai_image_status", "completed" if completed else "failed")
         self._planner_log(event, self._provider_name(), "image", 0, None,
-            phase="image_end", status="ok" if result.ok else "failed", job_id=result.job_id,
+            phase="image_end", status="ok" if completed else "failed", job_id=result.job_id,
             elapsed_ms=round((time.perf_counter() - image_started) * 1000), generation_ms=generation_ms,
             delivery_ms=round((time.perf_counter() - delivery_started) * 1000),
-            image_attempts=result.attempts, error_code=result.error_code)
+            image_attempts=result.attempts, error_code=result.error_code,
+            delivery_state=event.get_extra("nai_image_delivery", "unknown"),
+            deferred=event.get_extra("nai_image_deferred", False))
         logger.info(f"[{PLUGIN_NAME}] 图片任务结束: job={result.job_id}, ok={result.ok}, elapsed_ms={round((time.perf_counter() - image_started) * 1000)}")
         scene_summary = normalized_prompt if len(normalized_prompt) <= 800 else normalized_prompt[:400] + "\n…\n" + normalized_prompt[-400:]
         return "FINAL_IMAGE_TOOL_RESULT: " + json.dumps({
-            "status": "completed" if result.ok else "failed",
+            "status": "completed" if completed else "failed",
             "delivery": user_visible_result,
             "request": str(event.get_message_str() or "")[:400],
             "requested_scene": scene_summary,

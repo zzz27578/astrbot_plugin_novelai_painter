@@ -210,7 +210,7 @@ class DiagnosticsTests(unittest.TestCase):
             event = core.FakeEvent()
             event.get_messages = Mock(return_value=[component])
             with patch("main.logger.info") as logger:
-                await p._plan_drawing(event, {"prompt": "window"})
+                await p._plan_drawing(event, {"prompt": "修改上一张图，背景换成窗前"})
             request = next(row for row in self.logs(logger) if row["phase"] == "request")
             self.assertEqual(request["image_sources"], ["current_message_image", "previous_drawing"])
             self.assertTrue(request["previous_plan_included"])

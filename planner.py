@@ -35,6 +35,19 @@ class PlanError(ValueError):
 MATERIALS_HEADER = "[Drawing materials: reference data, not new dialogue]\n"
 
 
+def needs_previous_image(text: str) -> bool:
+    """Only upload the last drawing for a requested edit/visual continuation.
+
+    Its text plan remains available even when a new scene needs no image input.
+    Current user attachments are handled independently of this decision.
+    """
+    return bool(re.search(
+        r"上一(?:张|幅|个图)|(?:这|那)(?:张|幅)(?:图|画)?|原图|参考图|改图|"
+        r"(?:换|改|调整|保留|不变|继续|再来一张)|"
+        r"\b(?:previous|last|same)\s+(?:image|picture|drawing|composition|outfit)|"
+        r"\b(?:edit|modify|replace|change|keep|continue)\b", str(text or ""), re.I))
+
+
 def request_parts(payload):
     """Keep dialogue roles and the last user instruction, without repeating them in JSON."""
     materials = {key: value for key, value in payload.items()
@@ -124,6 +137,8 @@ def parse_plan(text: str) -> dict:
     cleaned = re.sub(r"<(think|analysis)>.*?</\1>", "", text, flags=re.I | re.S).strip().lstrip("\ufeff")
     if not cleaned:
         raise PlanError("绘图 LLM 返回空文本或仅有思考内容。", "empty")
+    if re.match(r"(?:```\s*xml\b|(?:call\s+)?tool\s+novelai_generate_image\b|call\s+tool\s+novelai_generate_image\b)", cleaned, re.I):
+        raise PlanError("返回了文本模拟工具调用；请使用原生工具调用，或提交完整 JSON 对象，不能用 XML/文字代替。", "pseudo_tool")
     if cleaned.startswith("["):
         raise PlanError("绘图 LLM 顶层需为对象，不能返回数组。")
     # Decode one complete object, never regex-cut through weighted tags/strings

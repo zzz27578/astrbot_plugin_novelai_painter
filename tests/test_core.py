@@ -1401,8 +1401,8 @@ flat cell shading, clean lineart, masterpiece, best quality"""
             self.assertIn("No image request was sent", result)
             p._run_job.assert_not_awaited()
         for subjects in (
-            "invalid", "{}", "[1]", '[{"source":"unknown"}]',
-            '[{"source":"card","preset_id":"missing"}]', '[{"source":"self","preset_id":"p1"}]',
+            "invalid", "{}", "[1]", '[{"source":"unknown"}]', '[{"source":[]}]', '[{"source":{}}]',
+            '[{"source":"card","preset_id":"missing"}]', '[{"source":"self","preset_id":"other-card"}]',
             '[{"source":"self","appearance_prompt":null}]',
             '[{"source":"self","negative_prompt":false}]', '[{"source":"self","use_reference":"false"}]',
             '[{"source":"self","state_scope":[]}]', '[{"source":"self","reset":true}]',
