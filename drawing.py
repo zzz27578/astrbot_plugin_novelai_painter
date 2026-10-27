@@ -242,7 +242,7 @@ SUBJECT_SCHEMA = {
 TOOL_PARAMETERS = {
     "type": "object", "additionalProperties": False,
     "properties": {
-        "prompt": {"type": "string", "description": "若临时上下文说明已启用独立绘图 LLM，可只写简短绘图意图，不必写 Tag；否则写完整画面或共享场景、人数、构图、光线。允许服饰和人物叙述。"},
+        "prompt": {"type": "string", "description": "直接写本次完整画面，优先英文 NovelAI / Danbooru Tag；多人写共享场景、人数、构图、光线。允许服饰和人物叙述。本工具直接请求图片服务，不转述给独立绘图 LLM；配置独立模型也必须提供完整参数。"},
         "subjects": {"type": "array", "items": SUBJECT_SCHEMA, "maxItems": 6, "description": "原生 JSON 角色数组，绝不再编码成字符串。self 使用当前绑定卡，card 配 preset_id 选卡，custom 画无卡角色。用户要求用内置/绑定卡时应选卡，不能传空数组重写卡词；空数组用于无卡场景。"},
         "operation": {"type": "string", "enum": ["generate", "img2img", "reference"]},
         "reference_type": {"type": "string", "enum": ["character", "style", "both"]},

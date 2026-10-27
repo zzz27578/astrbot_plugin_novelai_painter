@@ -22,9 +22,9 @@
 
     git clone https://github.com/zzz27578/astrbot_plugin_novelai_painter.git
 
-安装后进入 AstrBot WebUI 的插件详情页，打开 NovelAI Painter 设置页面完成配置。2.10.1 要求 AstrBot >= 4.27.3，使用统一人设解析接口和不保存到历史的临时消息内容；会话强制人设、Conversation 人设和默认人设与 AstrBot 主 Agent 的选择结果一致。
+安装后进入 AstrBot WebUI 的插件详情页，打开 NovelAI Painter 设置页面完成配置。2.10.2 要求 AstrBot >= 4.27.3，使用统一人设解析接口和不保存到历史的临时消息内容；会话强制人设、Conversation 人设和默认人设与 AstrBot 主 Agent 的选择结果一致。
 
-## 2.10.1 绘图入口与独立 LLM
+## 2.10.2 绘图入口与独立 LLM
 
 先在 AstrBot 中配置一个聊天模型 Provider，再到插件页面“连接与模型 → 独立绘图 LLM”填写或选择其 **Provider ID**。它仅用于暗号 `n` 和 `/n`，图片仍由 NovelAI / 兼容图片服务生成。**普通工具调用始终由主模型写完整参数直接出图，配置独立模型不再自动转述。** 留空关闭暗号和 `/n`，主模型工具不受影响。
 
@@ -53,9 +53,11 @@
 
 绘图素材保留原话、完整回复、配置范围内的历史、角色身份和服饰；不重复发送由后端直接使用的卡内画风、负面词或转述意图。固定素材位于 JSON 前部，紧凑编码；主模型直接出图的成功方案仍可用于后续 `/n` 改图。
 
-日志用 request_id 关联 `waiting_reply`（等待主回复）、`prepare`（准备素材）、`request`（即将调用 Provider）和 `response`（调用结束），记录准备毫秒数、等待回复毫秒数、请求字符数、上下文条数、图片数、调用耗时及是否纠正；图片任务另记开始和耗时。`request` 表示插件调用 Provider 的时点，Provider 内部排队/重试仍计入调用耗时。开启“记录绘图回包预览”后，日志及请求快照显示最多 2000 字符回包。切换 Provider 或对话会取消旧任务。
+日志用 request_id 关联主聊天、等待回复、准备素材、调用 Provider、收到回包、校验和图片任务。2.10.2 增加 Provider/模型及接口指纹、允许公开的推理/长度参数、SDK 重试配置、技能与工具 schema 大小、各输入字段长度、上下文来源、当前/上张图片来源，以及上游提供的模型名、结束原因、Token/缓存/推理用量和服务请求 ID。默认不记录正文、图片地址或密钥；开启“记录绘图回包预览”才显示最多 2000 字符绘图返回。快照保留本轮最近请求与结果、最多 24 个阶段，避免发图覆盖规划回包。
 
-验证及实现说明见 [2.10.1 更新说明](UPDATE_REPORT_2.10.1.md)，前版见 [2.10.0 更新说明](UPDATE_REPORT_2.10.0.md)。
+每等待 Provider 30 秒记录一次 `provider_wait`；`received.provider_ms` 单独计 Provider 等待，`response.validation_ms` 计本地校验。`request` 是插件调用 Provider 的时点，包含后续 SDK 准备、重试及上游等待，无法观察首 Token 或证明 HTTP 已到服务器。主模型 `hook_elapsed_ms` 可能包含多轮工具和生图，不能当单次模型耗时；图片阶段另记通道等待、服务调用和发送耗时。新增日志用于排查独立 Grok 长等待，尚未确认或解决其根因。切换 Provider 或对话会取消旧任务。
+
+对照操作见 [延迟诊断测试步骤](DIAGNOSTIC_TEST_GUIDE.md)。验证及实现说明见 [2.10.2 更新说明](UPDATE_REPORT_2.10.2.md)，前版见 [2.10.1 更新说明](UPDATE_REPORT_2.10.1.md)。
 
 ## 命令
 

@@ -13,6 +13,7 @@ import shutil
 import time
 import uuid
 import zipfile
+from contextlib import suppress
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Optional
@@ -38,13 +39,14 @@ from astrbot.core.agent.message import TextPart
 from astrbot.core.message.components import Image
 from astrbot.core.message.message_event_result import MessageChain, ResultContentType
 if __package__:
-    from . import drawing, planner
+    from . import drawing, planner, diagnostics
 else:  # Standalone test discovery.
     import drawing
     import planner
+    import diagnostics
 
 PLUGIN_NAME = "astrbot_plugin_novelai_painter"
-VERSION = "2.10.1"
+VERSION = "2.10.2"
 STICKER_EMOTION_TOOL_NAME = "novelai_set_emotion"
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 MAX_RESPONSE_BYTES = 48 * 1024 * 1024
@@ -1284,6 +1286,26 @@ class NovelAIPainterPlugin(Star):
         # AstrBot >= 4.27.3 preserves this flag through provider assembly and
         # strips the part when saving history, including checkpoint histories.
         req.extra_user_content_parts.append(TextPart(text=context).mark_as_temp())
+        # Hook timing is the whole Agent turn, including tool execution; it is
+        # deliberately not presented as an individual HTTP request duration.
+        event.set_extra("nai_main_hook_started", time.perf_counter())
+        provider_id, provider = "", None
+        try:
+            selected = event.get_extra("selected_provider")
+            provider = self.context.get_provider_by_id(selected) if isinstance(selected, str) and selected else await self.context.get_using_provider_async(event.unified_msg_origin)
+            config = getattr(provider, "provider_config", {})
+            provider_id = config.get("id", "") if isinstance(config, dict) else ""
+        except Exception:
+            pass  # Diagnostics must not interfere with the main chat.
+        event.set_extra("nai_main_provider", provider_id)
+        descriptor = diagnostics.provider_details(provider)
+        if isinstance(getattr(req, "model", None), str):
+            descriptor["request_model_override"] = req.model
+        self._planner_log(event, provider_id, "main", 0, None, phase="main_request_hook", status="observed",
+            provider_details=descriptor, timing_scope="agent_turn_including_tools",
+            system_prompt_chars=len(req.system_prompt or ""), prompt_chars=len(getattr(req, "prompt", "") or ""),
+            context_messages=len(getattr(req, "contexts", None) or []),
+            image_count=len(getattr(req, "image_urls", None) or []), temporary_drawing_chars=len(context))
 
     # --------------------------- permissions and dedupe ---------------------------
     @filter.custom_filter(DrawingMarkerFilter, priority=100)
@@ -1390,27 +1412,60 @@ class NovelAIPainterPlugin(Star):
     def _planner_log(self, event, provider_id, mode, attempt, response, error=None, **metrics):
         text = str(getattr(response, "completion_text", "") or "")
         names = getattr(response, "tools_call_name", []) or []
-        def redact(value, limit):
-            for key in ("api_token", "api_key"):
-                secret = str(self._cfg(key, "") or "")
-                if secret:
-                    value = value.replace(secret, "[redacted]")
-            return re.sub(r"(?i)(bearer\s+|sk-)[A-Za-z0-9_.-]+", "[redacted]", value)[:limit]
+        secrets = [str(self._cfg(key, "") or "") for key in ("api_token", "api_key")]
+        try:
+            secrets += diagnostics.secrets_from(self.context.get_provider_by_id(provider_id))
+        except Exception:
+            pass
         detail = {"provider": provider_id, "protocol": mode, "attempt": attempt,
             "request_id": hashlib.sha256(self._event_key(event, "", "generate").encode()).hexdigest()[:10],
             "text_length": len(text), "tool_calls": names,
             "status": "ok" if error is None else getattr(error, "code", "validation"),
-            "error": redact(str(error), 300) if error else ""}
+            "error": diagnostics.sanitize(str(error), secrets)[:300] if error else ""}
         detail.update(metrics)
+        if response is not None:
+            detail["response_details"] = diagnostics.response_details(response)
         if self._as_bool(self._cfg("drawing_llm_debug", False)):
             preview = planner.response_output(response)
-            detail["response_preview"] = redact(preview, 2000)
+            # Main replies remain private even when drawing previews are enabled.
+            if mode != "main":
+                detail["response_preview"] = diagnostics.sanitize(preview, secrets)[:2000]
+        detail = diagnostics.sanitize(detail, secrets)
+        snapshots = event.get_extra("nai_diagnostic_snapshots", {})
+        if detail.get("phase") in {"main_request_hook", "main_response_hook", "request", "response", "image_end", "failed"}:
+            snapshots[detail["phase"]] = detail.copy()
+            event.set_extra("nai_diagnostic_snapshots", snapshots)
+        detail["snapshots"] = dict(snapshots)
+        # Preserve a bounded content-free timeline in the WebUI's latest snapshot.
+        timeline = event.get_extra("nai_diagnostic_timeline", [])
+        timeline.append({key: detail[key] for key in ("phase", "protocol", "attempt", "status", "elapsed_ms", "provider_ms", "validation_ms", "total_ms") if key in detail})
+        event.set_extra("nai_diagnostic_timeline", timeline[-24:])
+        detail["timeline"] = timeline[-24:]
         if not hasattr(self, "_planner_diagnostics"):
             self._planner_diagnostics = {}
         self._planner_diagnostics[str(event.unified_msg_origin)] = detail
         while len(self._planner_diagnostics) > 20:
             self._planner_diagnostics.pop(next(iter(self._planner_diagnostics)))
-        logger.info(f"[{PLUGIN_NAME}] 绘图规划: {json.dumps(detail, ensure_ascii=False)}")
+        # Timeline is useful in the WebUI snapshot; repeating it on every log
+        # line obscures the individual phases and grows logs unnecessarily.
+        logger.info(f"[{PLUGIN_NAME}] 绘图规划: {json.dumps({k: v for k, v in detail.items() if k not in {'timeline', 'snapshots'}}, ensure_ascii=False)}")
+
+    async def _drawing_planning_failed(self, event, exc):
+        error = exc if isinstance(exc, planner.PlanError) else planner.PlanError(
+            str(exc), "validation" if isinstance(exc, ValueError) else "internal", False)
+        self._planner_log(event, self._drawing_llm_id(), self._planner_protocol(self._drawing_llm_id()), 0, None,
+            error, phase="failed", **diagnostics.error_details(exc))
+        message = str(exc) if isinstance(exc, ValueError) else "绘图准备或执行异常，本次任务已停止；请查看插件日志。"
+        await self._notify(event, message, "error")
+
+    async def _planner_wait_log(self, event, provider_id, mode, attempt, call_started, remaining):
+        while True:
+            await asyncio.sleep(30)
+            elapsed = time.perf_counter() - call_started
+            self._planner_log(event, provider_id, mode, attempt, None,
+                phase="provider_wait", status="waiting", elapsed_ms=round(elapsed * 1000),
+                remaining_seconds=round(max(0, remaining - elapsed), 1),
+                timing_scope="provider_call_including_sdk", first_token_observable=False)
 
     async def _validate_planned_drawing(self, event, plan, view=None):
         subjects = await self._resolve_drawing_subjects(event, plan["subjects"])
@@ -1450,6 +1505,7 @@ class NovelAIPainterPlugin(Star):
         dialogue = event.get_extra("nai_planner_context")
         if dialogue is None:
             dialogue = planner.recent_dialogue(view.history if view else (), count)
+        context_source = "main_request_snapshot" if event.get_extra("nai_planner_context") is not None else "current_conversation"
         dialogue = dialogue[-count:] if count else []
         active = await self._resolve_active_preset(event)
         catalog = []
@@ -1460,17 +1516,26 @@ class NovelAIPainterPlugin(Star):
             catalog.append({"id": card["id"], "name": card.get("name", ""), "description": card.get("description", ""),
                 "identity_prompt": card["identity_prompt"], "default_outfit_prompt": card["default_outfit_prompt"],
                 "current_story_outfit": self._ledger().current(view, card).get("outfit")})
+        context_ms = round((time.perf_counter() - started) * 1000)
         images = []
+        image_sources = []
         if self._as_bool(self._cfg("drawing_llm_use_images", False)):
             images = list(event.get_extra("nai_planner_images", []))[:2]
+            image_sources = ["main_request_image"] * len(images)
             if not images and hasattr(event, "get_messages"):
                 components = [component for component in event.get_messages() if isinstance(component, Image)][:2]
                 try:
                     images = [await asyncio.wait_for(component.convert_to_file_path(), timeout=15) for component in components]
+                    image_sources = ["current_message_image"] * len(images)
                 except Exception as exc:
+                    self._planner_log(event, provider_id, mode, 0, None,
+                        planner.PlanError("当前附图读取失败", "image_input", False), phase="prepare",
+                        total_ms=round((time.perf_counter() - started) * 1000), **diagnostics.error_details(exc))
                     raise ValueError("当前附图读取失败，本次绘图已停止；可以关闭图片理解后重试。") from exc
             if previous.get("image") and Path(previous["image"]).is_file():
                 images.append(previous["image"])
+                image_sources.append("previous_drawing")
+        image_prepare_ms = round((time.perf_counter() - started) * 1000) - context_ms
         payload = {"available_cards": catalog, "self_card_id": active.get("id") if active else None,
             "card_mode": self._cfg("llm_card_mode", "context"), "preferences": self._cfg("drawing_llm_prompt", ""),
             "user_request": event.get_message_str(),
@@ -1483,6 +1548,11 @@ class NovelAIPainterPlugin(Star):
         skill = (Path(__file__).parent / "skills" / "novelai-painter" / "references" / "drawing-planner.md").read_text(encoding="utf-8")
         payload["output_mode"] = mode
         kwargs = {"tools": planner.plan_tools(), "tool_choice": "required"} if mode == "tool" else {}
+        try:
+            provider_descriptor = diagnostics.provider_details(self.context.get_provider_by_id(provider_id))
+        except Exception:
+            provider_descriptor = {"available": False}
+        schema_text = diagnostics.json_text(kwargs["tools"].openai_schema()) if mode == "tool" else ""
         # Bound the whole planning/reformat cycle instead of allowing another
         # full timeout after a slow first response. The SDK also has retries.
         budget = max(5, min(180, int(self._cfg("drawing_llm_timeout", 60))))
@@ -1501,10 +1571,26 @@ class NovelAIPainterPlugin(Star):
             call_started = time.perf_counter()
             metrics = {"phase": "request", "status": "requesting", "request_chars": len(encoded), "context_messages": len(dialogue),
                 "image_count": len(images), "prepare_ms": prepare_ms,
-                "remaining_seconds": round(remaining, 1)}
+                "remaining_seconds": round(remaining, 1),
+                "provider_details": provider_descriptor, "transport": "context.llm_generate/text_chat",
+                "first_token_observable": False, "request_max_retries": 1,
+                "format_retry_enabled": attempts > 1, "tool_choice": kwargs.get("tool_choice", "none"),
+                "context_source": context_source, "context_messages_configured": count,
+                "context_disabled": count == 0, "history_available": len(view.history) if view else 0,
+                "context_prepare_ms": context_ms, "image_prepare_ms": image_prepare_ms,
+                "image_sources": image_sources, "previous_plan_included": bool(previous.get("plan")),
+                "payload_size": diagnostics.text_size(encoded), "system_size": diagnostics.text_size(skill),
+                "system_fingerprint": diagnostics.fingerprint(skill),
+                "tool_schema_size": diagnostics.text_size(schema_text),
+                "tool_schema_fingerprint": diagnostics.fingerprint(schema_text) if schema_text else "",
+                "total_text_chars": len(encoded) + len(skill) + len(schema_text),
+                "field_chars": {key: len(diagnostics.json_text(payload.get(key))) for key in (
+                    "available_cards", "preferences", "user_request", "drawing_request", "recent_dialogue",
+                    "current_reply", "previous_drawing", "format_correction") if key in payload}}
             if event.get_extra("nai_planner_queued_at") is not None:
                 metrics["reply_wait_ms"] = round((started - event.get_extra("nai_planner_queued_at")) * 1000)
             self._planner_log(event, provider_id, mode, attempt, None, **metrics)
+            wait_log = asyncio.create_task(self._planner_wait_log(event, provider_id, mode, attempt, call_started, remaining))
             try:
                 response = await asyncio.wait_for(self.context.llm_generate(
                     chat_provider_id=provider_id, prompt=encoded,
@@ -1512,18 +1598,34 @@ class NovelAIPainterPlugin(Star):
                     timeout=remaining)
             except asyncio.TimeoutError as exc:
                 self._planner_log(event, provider_id, mode, attempt, None, planner.PlanError("规划总超时", "timeout", False),
-                    phase="response", elapsed_ms=round((time.perf_counter() - call_started) * 1000))
+                    phase="response", elapsed_ms=round((time.perf_counter() - call_started) * 1000),
+                    retry=False, **diagnostics.error_details(exc))
                 raise ValueError("独立绘图 LLM 超时，本次未请求图片服务。") from exc
             except Exception as exc:
                 if re.search(r"content_filter|内容安全|被拒绝", str(exc), re.I):
                     error = planner.PlanError("绘图 LLM 服务拒绝了该请求，本次未请求图片服务。", "refusal", False)
                     self._planner_log(event, provider_id, mode, attempt, None, error,
-                        phase="response", elapsed_ms=round((time.perf_counter() - call_started) * 1000))
+                        phase="response", elapsed_ms=round((time.perf_counter() - call_started) * 1000),
+                        retry=False, **diagnostics.error_details(exc))
                     raise error from exc
                 self._planner_log(event, provider_id, mode, attempt, None,
                     planner.PlanError(f"{type(exc).__name__}: {exc}", "provider", False),
-                    phase="response", elapsed_ms=round((time.perf_counter() - call_started) * 1000))
+                    phase="response", elapsed_ms=round((time.perf_counter() - call_started) * 1000),
+                    retry=False, **diagnostics.error_details(exc))
                 raise ValueError("独立绘图 LLM 调用失败，请检查 Provider；工具不兼容时可将输出协议切换为 JSON 文本。") from exc
+            except asyncio.CancelledError:
+                self._planner_log(event, provider_id, mode, attempt, None,
+                    planner.PlanError("调用被取消", "cancelled", False), phase="response",
+                    elapsed_ms=round((time.perf_counter() - call_started) * 1000), retry=False)
+                raise
+            finally:
+                wait_log.cancel()
+                with suppress(asyncio.CancelledError):
+                    await wait_log
+            received_at = time.perf_counter()
+            provider_ms = round((received_at - call_started) * 1000)
+            self._planner_log(event, provider_id, mode, attempt, response, phase="received", status="received",
+                provider_ms=provider_ms, timing_scope="provider_call_including_sdk")
             try:
                 plan = planner.response_plan(response)
                 if not self._contextual_cards_enabled():
@@ -1533,7 +1635,8 @@ class NovelAIPainterPlugin(Star):
             except ValueError as exc:
                 retry = getattr(exc, "retryable", True) and attempt < attempts and deadline - time.perf_counter() >= 3
                 self._planner_log(event, provider_id, mode, attempt, response, exc,
-                    phase="response", elapsed_ms=round((time.perf_counter() - call_started) * 1000), retry=retry)
+                    phase="response", elapsed_ms=round((time.perf_counter() - call_started) * 1000),
+                    provider_ms=provider_ms, validation_ms=round((time.perf_counter() - received_at) * 1000), retry=retry)
                 if not retry:
                     raise
                 payload["format_correction"] = {"error": str(exc)[:500],
@@ -1542,6 +1645,7 @@ class NovelAIPainterPlugin(Star):
                 continue
             self._planner_log(event, provider_id, mode, attempt, response,
                 phase="response", elapsed_ms=round((time.perf_counter() - call_started) * 1000),
+                provider_ms=provider_ms, validation_ms=round((time.perf_counter() - received_at) * 1000), retry=False,
                 total_ms=round((time.perf_counter() - started) * 1000))
             break
         if self._drawing_llm_id() != provider_id:
@@ -1559,6 +1663,10 @@ class NovelAIPainterPlugin(Star):
 
     @filter.on_llm_response()
     async def drawing_capture_reply(self, event: AstrMessageEvent, response: LLMResponse) -> None:
+        if event.get_extra("nai_main_hook_started") is not None:
+            self._planner_log(event, event.get_extra("nai_main_provider", ""), "main", 0, response,
+                phase="main_response_hook", status="observed", timing_scope="agent_turn_including_tools",
+                hook_elapsed_ms=round((time.perf_counter() - event.get_extra("nai_main_hook_started")) * 1000))
         if not event.get_extra("nai_planner_pending") or getattr(response, "tools_call_name", None) or getattr(response, "role", "") != "assistant":
             return
         event.set_extra("nai_planner_reply", str(getattr(response, "completion_text", "") or ""))
@@ -1585,8 +1693,8 @@ class NovelAIPainterPlugin(Star):
                 raise ValueError("独立绘图 LLM 已关闭，本轮排队请求已取消。")
             plan = await self._plan_drawing(event, pending)
             await self._image_tool_entry(event, **plan, accepted=True, entry=entry)
-        except ValueError as exc:
-            await self._notify(event, str(exc), "error")
+        except Exception as exc:
+            await self._drawing_planning_failed(event, exc)
 
     def _event_key(self, event: AstrMessageEvent, prompt: str, operation: str) -> str:
         """Return one generation key per incoming message, regardless of tool rewrites."""
@@ -2066,6 +2174,7 @@ class NovelAIPainterPlugin(Star):
             image_b64 = base64.b64encode(image_bytes).decode("ascii") if image_bytes and provider == "novelai_official" else None
             attempts = 0
             while True:
+                queue_started = time.perf_counter()
                 try:
                     timeout = max(1, int(self._cfg("queue_timeout", 120) or 120))
                     if not quiet and self.lock.locked() and self._as_bool(self._cfg("show_queue_notice", True)):
@@ -2082,6 +2191,11 @@ class NovelAIPainterPlugin(Star):
                         self._capture_drawing_request(event, job_id, provider, composed_prompt,
                             operation, preset_negative, selected_preset, character_prompts,
                             reference if operation == "reference" else None, size)
+                        self._planner_log(event, provider, "image", attempts, None,
+                            phase="image_api_request", status="requesting", job_id=job_id,
+                            queue_ms=round((time.perf_counter() - queue_started) * 1000),
+                            prompt_chars=len(composed_prompt), operation=operation)
+                        api_started = time.perf_counter()
                         if provider == "novelai_official":
                             path = await self._call_official(
                                 composed_prompt,
@@ -2103,6 +2217,9 @@ class NovelAIPainterPlugin(Star):
                                 preset_negative,
                                 **({"size": size} if size is not None else {}),
                             )
+                        self._planner_log(event, provider, "image", attempts, None,
+                            phase="image_api_response", status="received", job_id=job_id,
+                            elapsed_ms=round((time.perf_counter() - api_started) * 1000))
                         if not await self._generation_context_current(event):
                             raise ProviderError("stale_context", "生成期间对话已切换或清空，旧图不再发送，请在当前对话重新请求。")
                     finally:
@@ -2110,6 +2227,10 @@ class NovelAIPainterPlugin(Star):
                     result = GenerationResult(True, job_id, provider, path=path, message="图片已生成并发送到当前会话。", attempts=attempts)
                     break
                 except ProviderError as exc:
+                    self._planner_log(event, provider, "image", attempts, None,
+                        planner.PlanError(exc.message, exc.code, False), phase="image_api_error", job_id=job_id,
+                        elapsed_ms=round((time.perf_counter() - queue_started) * 1000),
+                        retry=self._should_retry(exc, attempts))
                     logger.warning(f"[{PLUGIN_NAME}] job={job_id} attempt={attempts} provider={provider} code={exc.code}: {exc.message}")
                     if not self._should_retry(exc, attempts):
                         result = GenerationResult(False, job_id, provider, error_code=exc.code, message=exc.message, attempts=attempts)
@@ -2706,6 +2827,8 @@ class NovelAIPainterPlugin(Star):
     async def _image_tool_entry(self, event, prompt="", operation="generate", reference_type="", subjects=None,
                                 style=None, *, accepted=False, entry="llm_tool", quiet=False):
         if not accepted and event.get_extra("nai_planner_pending"):
+            self._planner_log(event, event.get_extra("nai_main_provider", ""), "main", 0, None,
+                phase="duplicate_tool", status="blocked", drawing_state="queued_or_consumed")
             return "DRAWING_REQUEST_QUEUED: ENTRY_GATE_BLOCKED_DUPLICATE. 本条绘图已排队，回复后由插件独立执行；无需再写 Tag 或调用绘图工具，继续正常回复即可。"
         if not self._mode_allows(entry):
             await self._notify(event, "当前未启用自然语言生图入口。", "error")
@@ -2719,6 +2842,8 @@ class NovelAIPainterPlugin(Star):
             return f"FINAL_IMAGE_TOOL_RESULT: {reason} Do not call any tool again for this message."
 
         if not accepted and self._llm_tool_claimed(event):
+            self._planner_log(event, event.get_extra("nai_main_provider", ""), "main", 0, None,
+                phase="duplicate_tool", status="blocked", drawing_state=event.get_extra("nai_image_status", "accepted"))
             return (
                 "FINAL_IMAGE_TOOL_RESULT: ENTRY_GATE_BLOCKED_DUPLICATE. An image generation call for this "
                 "exact user message was already accepted before backend preparation. Do not call any tool "
@@ -2841,6 +2966,9 @@ class NovelAIPainterPlugin(Star):
             else None
         )
         image_started = time.perf_counter()
+        event.set_extra("nai_image_status", "running")
+        self._planner_log(event, self._provider_name(), "image", 0, None,
+            phase="image_start", status="running", entry=entry, planned=accepted, operation=resolved_operation)
         logger.info(f"[{PLUGIN_NAME}] 图片任务开始: entry={entry}, planned={accepted}, operation={resolved_operation}")
         result = await self._run_job(
             event,
@@ -2852,7 +2980,15 @@ class NovelAIPainterPlugin(Star):
             **({"character_prompts": character_prompts} if character_prompts else {}),
             **({"quiet": True} if quiet else {}),
         )
+        generation_ms = round((time.perf_counter() - image_started) * 1000)
+        delivery_started = time.perf_counter()
         user_visible_result = await self._finish_event(event, result)
+        event.set_extra("nai_image_status", "completed" if result.ok else "failed")
+        self._planner_log(event, self._provider_name(), "image", 0, None,
+            phase="image_end", status="ok" if result.ok else "failed", job_id=result.job_id,
+            elapsed_ms=round((time.perf_counter() - image_started) * 1000), generation_ms=generation_ms,
+            delivery_ms=round((time.perf_counter() - delivery_started) * 1000),
+            image_attempts=result.attempts, error_code=result.error_code)
         logger.info(f"[{PLUGIN_NAME}] 图片任务结束: job={result.job_id}, ok={result.ok}, elapsed_ms={round((time.perf_counter() - image_started) * 1000)}")
         scene_summary = normalized_prompt if len(normalized_prompt) <= 800 else normalized_prompt[:400] + "\n…\n" + normalized_prompt[-400:]
         return "FINAL_IMAGE_TOOL_RESULT: " + json.dumps({
@@ -2884,8 +3020,8 @@ class NovelAIPainterPlugin(Star):
             event.set_extra("nai_planner_provider", self._drawing_llm_id())
             plan = await self._plan_drawing(event, {"prompt": prompt or "根据当前对话绘制当前场景", "entry": "/n"})
             await self._image_tool_entry(event, **plan, accepted=True, entry="command", quiet=True)
-        except ValueError as exc:
-            await self._notify(event, str(exc), "error")
+        except Exception as exc:
+            await self._drawing_planning_failed(event, exc)
 
     async def _raw_draw(self, event: AstrMessageEvent, prompt: str) -> None:
         """The former /n direct-tag path, now available through /nai <Tag>."""

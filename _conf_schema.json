@@ -40,7 +40,7 @@
   },
   "drawing_llm_debug": {
     "description": "记录绘图 LLM 回包预览", "type": "bool", "default": false,
-    "hint": "排查时开启，在日志与请求快照显示最多 2000 字符的返回内容，可能包含画面描述。默认只记录协议、次数、长度和错误类型。"
+    "hint": "排查时开启，在日志与请求快照显示最多 2000 字符的绘图返回内容，可能包含画面描述。默认记录分阶段耗时、Provider、请求大小、图片来源和上游提供的 Token 用量，不记录正文。"
   },
   "drawing_llm_context_messages": {
     "description": "绘图 LLM 读取的最近对话消息数",
