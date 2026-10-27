@@ -22,9 +22,9 @@
 
     git clone https://github.com/zzz27578/astrbot_plugin_novelai_painter.git
 
-安装后进入 AstrBot WebUI 的插件详情页，打开 NovelAI Painter 设置页面完成配置。2.10.5 要求 AstrBot >= 4.27.3，使用统一人设解析接口和不保存到历史的临时消息内容；会话强制人设、Conversation 人设和默认人设与 AstrBot 主 Agent 的选择结果一致。
+安装后进入 AstrBot WebUI 的插件详情页，打开 NovelAI Painter 设置页面完成配置。2.10.6 要求 AstrBot >= 4.27.3，使用统一人设解析接口和不保存到历史的临时消息内容；会话强制人设、Conversation 人设和默认人设与 AstrBot 主 Agent 的选择结果一致。
 
-## 2.10.5 绘图入口与独立 LLM
+## 2.10.6 绘图入口与独立 LLM
 
 先在 AstrBot 中配置一个聊天模型 Provider，再到插件页面“连接与模型 → 独立绘图 LLM”填写或选择其 **Provider ID**。它仅用于暗号 `n` 和 `/n`，图片仍由 NovelAI / 兼容图片服务生成。**普通工具调用始终由主模型写完整参数直接出图，配置独立模型不再自动转述。** 留空关闭暗号和 `/n`，主模型工具不受影响。
 
@@ -47,7 +47,7 @@
 
 `/n 换白裙坐在窗前，保留耳朵和发型` 立即交给独立模型，成功只发图片。单独 `/n` 表示画当前场景；未配置独立模型时给出配置提示，不再把中文直接发给 NAI。原来的直接 Tag 入口移为 `/nai white dress, sitting by a window`，沿用当前绑定/默认卡，不调用任一 LLM；`/nai draw <Tag>` 仍为不套卡的自由绘画。
 
-输出协议默认“自动”：AstrBot OpenAI 兼容 Provider 使用请求内的 `novelai_generate_image` 参数工具，复用主绘图工具的 prompt/subjects/style 字段定义，tool_choice 与主 Agent 一样使用 auto。插件只读取这一次参数提交，校验后出图，不运行聊天工具循环。旧 submit_drawing_plan 回包仍可解析。显式选择 JSON 模式时，OpenAI Chat Completions 兼容请求携带 response_format=json_object；不支持会明确报错，不静默切换协议重发。其他 Provider 仍按技能要求返回 JSON。
+输出协议默认“自动”：AstrBot OpenAI 兼容 Provider 使用请求内的 `novelai_generate_image` 参数工具，复用主绘图工具的 prompt/subjects/style 字段定义；从首次请求就使用 tool_choice=required，减少模型用文字模拟调用后再次纠错的开销。接口不支持时明确提示手动改为 JSON，不静默切换协议重发。插件读取参数并校验后出图，不运行聊天工具循环；拒绝仍可提交 error。旧 submit_drawing_plan 回包仍可解析。显式选择 JSON 模式时，OpenAI Chat Completions 兼容请求携带 response_format=json_object；其他 Provider 仍按技能要求返回 JSON。
 
 2.10.4 重新整理独立调用：“绘图 LLM 调用方式”自动模式跟随主聊天的流式设置；取不到设置时，OpenAI 兼容 Provider 使用流式。可显式选择流式或非流式。JSON 和参数工具均支持，流式内容仅在插件内部接收，等完整最终结果并校验后才请求图片服务。连接中断或缺失最终结果会明确报错，不用部分 JSON 出图，也不自动切换路径再发一遍。
 
@@ -65,9 +65,13 @@
 
 2.10.5 接受 `self` 携带与绑定卡完全一致的冗余 ID，避免无效纠错请求；不一致仍报错。明确“来一张你在床上看书”等请求的空角色数组会补全绑定卡，其他人物或风景不自动绑定。工具模式纠错使用 `tool_choice=required`，并明确区分原生工具调用与文字模拟，仍只纠正一次。
 
-主模型工具出图通常等待图片发送后返回。等待超过 45 秒时（若核心工具超时更短则提前），工具返回“仍在处理”，由插件继续原任务并发图，不追加规划或图片请求，避免 503 重试被核心超时打断。插件卸载会取消这些受管任务。失败、取消和发送失败均记录最终状态；不会声称任务仍在发送。新增 `main_first_drawing_tool` 记录主请求钩子到首次绘图工具调用的时间，区别于包含图片生成的整轮时间；这不是纯 HTTP 耗时。
+2.10.6 主模型工具使用本轮图片调用的独立超时预算，按排队、图片 API、有限重试和发送预留计算，完成或取消后恢复核心原值；不修改全局配置，不延长独立绘图 LLM 预算。正常等待图片发送后再返回，不再固定第 45 秒交接。核心钩子不可用或图片预算将尽时仍保留后台续作兜底，并返回最终受理回执。受理后从本轮工具集合撤下绘图入口；对同一会话，本条插件负责的图片发送由局部工具保护器接管，避免 send_message_to_user 使用占位地址再发一遍；其他会话、文件/语音和未绘图请求保留原行为。插件卸载取消受管任务；失败、取消和发送失败均记录终态。
 
-对照操作见 [延迟诊断测试步骤](DIAGNOSTIC_TEST_GUIDE.md)。验证及剩余问题见 [2.10.5 更新说明](UPDATE_REPORT_2.10.5.md)，前版见 [2.10.4 更新说明](UPDATE_REPORT_2.10.4.md)。
+角色卡的 card 分支增加 ID 必填约束。若模型仍漏填，只有单人物且用户明确选卡/画自己，或请求仅含“全身照”等构图要求时，才从有效上一张选卡、当前绑定或唯一可用卡确定补选；未知角色、多人及歧义请求仍报错。补选不调用模型、不从模型正文提取 ID。
+
+日志按“绘图 HTTP 请求/结果、等待进度、参数校验、图片任务、主模型绘图”分开。每 30 秒的等待行标记 sends_request=false，不重复输出全部 HTTP 数据；首字节等传输细节降为 DEBUG，完整阶段仍可在 WebUI 快照查看。`main_first_drawing_tool` 记录主请求钩子到首次绘图工具调用的时间，不是纯 HTTP 耗时。
+
+对照操作见 [延迟诊断测试步骤](DIAGNOSTIC_TEST_GUIDE.md)。验证及剩余问题见 [2.10.6 更新说明](UPDATE_REPORT_2.10.6.md)，前版见 [2.10.5 更新说明](UPDATE_REPORT_2.10.5.md)。
 
 ## 命令
 

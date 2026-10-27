@@ -4,7 +4,7 @@
 
 素材 `output_mode=tool` 时通过 API 的原生工具调用只调用一次 `novelai_generate_image` 提交参数，不调用其他工具；禁止在正文、XML 或代码块里写文字模拟工具调用。`output_mode=json` 时只返回一个 JSON 对象。字段为 `prompt`（完整英文画面 Tag）、`subjects`（原生数组，最多 6 人）、可选 `style`。无需先分析或复述素材。不能处理时通过相同协议提交 `{"error":"原因"}`，不伪造参数，不编码请求来规避服务规则。
 
-`self_card_id` 是聊天 AI 的绑定卡，画自己用 `{"source":"self"}`；指定 `available_cards` 中的其他卡用 `{"source":"card","preset_id":"准确ID"}`；无卡角色用 `{"source":"custom","prompt":"角色名、外貌、服饰与动作"}`。风景用 `subjects=[]`。多人分开描述，绝不合并未选中的卡。身份锚点、原始权重、默认画风和负面词由后端保留，不用抄写。
+`self_card_id` 是聊天 AI 的绑定卡，画自己用 `{"source":"self"}`；指定 `available_cards` 中的其他卡用 `{"source":"card","preset_id":"准确ID"}`，card 的 preset_id 必须写在原生工具参数内，不能只写在正文，不能省略；无卡角色用 `{"source":"custom","prompt":"角色名、外貌、服饰与动作"}`。风景用 `subjects=[]`。多人分开描述，绝不合并未选中的卡。身份锚点、原始权重、默认画风和负面词由后端保留，不用抄写。
 
 `prompt` 可以直接写完整画面；人物细节可放 `subjects[].prompt`，允许服饰。换装推荐写完整 `outfit`（含鞋和保留配饰），整体替换旧衣；空串明确无服饰。未改变服饰可省略，沿用已确认剧情服饰或卡的默认服饰。仅用户明确改画风才写 `style`。`card_mode=strict` 时省略 outfit/style，将修改写入人物 prompt。仅卡参考图符合本图外观才 use_reference=true，默认省略。所有参数只影响本图，不写剧情状态。
 

@@ -181,7 +181,7 @@ class TransportRetryTests(unittest.TestCase):
             self.assertEqual(wire["extra_body"], expected)
             self.assertEqual(provider.provider_config["custom_extra_body"], {"reasoning_effort": "high"})
             if mode == "tool":
-                self.assertEqual(wire["tool_choice"], "auto")
+                self.assertEqual(wire["tool_choice"], "required")
                 self.assertEqual(wire["tools"][0]["function"]["name"], "novelai_generate_image")
             response = p._planner_diagnostics[core.FakeEvent.unified_msg_origin]
             self.assertEqual(response["response_details"]["usage"]["total_tokens"], 150)

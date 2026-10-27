@@ -255,7 +255,7 @@ class DrawingRoutesTests(unittest.TestCase):
             await p._quick_draw(core.FakeEvent("/n 换白裙"),"换白裙")
             kwargs = p.context.llm_generate.await_args.kwargs
             self.assertEqual(kwargs["tools"].names(), ["novelai_generate_image"])
-            self.assertEqual(p.context.llm_generate.await_args_list[0].kwargs["tool_choice"], "auto")
+            self.assertEqual(p.context.llm_generate.await_args_list[0].kwargs["tool_choice"], "required")
             self.assertEqual(kwargs["tool_choice"],"required")
             self.assertEqual(kwargs["request_max_retries"],1)
             self.assertEqual([tool.name for tool in llm_tools.func_list],before)

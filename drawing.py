@@ -237,6 +237,8 @@ SUBJECT_SCHEMA = {
         "appearance_prompt": {"type": "string", "description": "仅无卡角色的完整外貌；绑定卡不会使用此字段重写身份。"},
         "negative_prompt": {"type": "string", "description": "无卡角色的负面词；绑定卡使用卡内负面词。"},
     }, "required": ["source"],
+    "allOf": [{"if": {"properties": {"source": {"const": "card"}}, "required": ["source"]},
+               "then": {"required": ["preset_id"], "properties": {"preset_id": {"type": "string", "minLength": 1, "pattern": "\\S"}}}}],
 }
 
 TOOL_PARAMETERS = {

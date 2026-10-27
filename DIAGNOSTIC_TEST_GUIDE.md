@@ -1,10 +1,10 @@
-# 2.10.5：独立绘图与主模型对照测试
+# 2.10.6：独立绘图与主模型对照测试
 
-本版修复选卡误报、取消状态及长任务超时，并按需发送上一张图片。真实的 Grok 规划等待仍需用同一 Provider 对照，不能以插件测试通过代替延迟实测。
+本版从首次规划即要求原生工具参数，补齐选卡结构约束，修正主模型出图的 45 秒提前交接与重复发图工具问题。真实的 Grok 规划等待仍需用同一 Provider 对照，不能以插件测试通过代替延迟实测。
 
 ## 最小测试
 
-更新并重载插件，确认版本 **2.10.5**，主聊天和独立绘图都选择同一个 Grok 4.7 Provider ID，并绑定同一张角色卡。
+更新并重载插件，确认版本 **2.10.6**，主聊天和独立绘图都选择同一个 Grok 4.7 Provider ID，并绑定同一张角色卡。
 
 建议先用以下设置执行两次测试，无需跑完多组排列：
 
@@ -24,9 +24,15 @@
 2. 等上一项完成或报错，再新对话发送：`请用绑定角色卡画一张你坐在窗边看书的画面，简短回应。n` 应先正常回复，再由独立模型出图。
 3. 新对话发送同样场景并去掉 n，由主 Grok 直接调用工具。三组均先等前一次完成，再开始下一组。若比较热身差异，在同一对话再重复一次，并注明是否 reset。
 
+成功标准：首次工具模式的 `request.tool_choice` 和 `http_request.wire.tool_choice` 均为 required；原生回包 tools_call_name 含 novelai_generate_image，随后 image_start。若首次仍返回文字模拟调用，请保留该回包与 HTTP 结果；不必反复等待相同错误。接口不支持 required 会明确提示手动切 JSON。
+
+选卡回归可发 `/n 全身照`。card 的 ID 若漏填且对象可以唯一确定，应出现 selection_repair、creates_model_request=false，然后继续出图；不能因为补选再调用一次模型。明确指定其他角色仍应选择该角色，不套当前绑定卡。
+
+主模型直出时检查 image_tool_budget：只调整当前图片工具预算，image_end 后返回最终结果。正常 46–52 秒的出图不应再在第 45 秒出现 image_tool_deferred。若同批次误用 send_message_to_user 发图，应返回 IMAGE_DELIVERY_HANDLED，不能再报 generated_image_url_here 无效。本轮后续可用工具不再包含已受理的绘图入口；新用户消息仍可再次绘图。
+
 若要验证附图优化，开启图片理解，先完成一张图，再分别发 `/n 画一张森林风景` 和 `/n 上一张改成夜景，保留人物`。前者应不附上一张图片，后者应有 `image_sources=previous_drawing`；本轮直接上传的图片仍照常提供。
 
-若服务恰好出现 503，可设重试 1 次验证：同一个 job_id 只有图片 API 重试，超过工具等待阈值会出现 `image_tool_deferred`，随后 `image_end` 记录最终结果；主模型不能再说图片已经完成。不必为测试故意触发限流。
+若服务恰好出现 503，可设重试 1 次验证：同一个 job_id 只有图片 API 重试，随后 image_end 记录最终结果。不必为测试故意触发限流。
 
 若要验证你之前使用的 JSON 模式，只改输出协议为 JSON，再试一次 /n。本版会发送真正的 json_object 格式约束；接口若不支持，会明确提示改用自动/工具模式，不静默重发。
 
@@ -36,7 +42,7 @@
 
 给出每次从收到消息到图片发送或最终报错的完整日志区间，注明 /n、n 或主模型直出，以及协议、调用方式、推理强度。保留 Provider 的报错行，密钥无需提供。
 
-新增日志均带 request_id，图片阶段另有 job_id。WebUI 请求快照保存本轮请求、HTTP 结果与超时信息。
+日志按阶段分类，均带 request_id，图片阶段另有 job_id。只有“绘图 HTTP 请求”代表进入一次实际 HTTP send；“绘图等待进度”每 30 秒记录一次，sends_request=false，不发新请求。首字节等细节在 DEBUG 日志，完整 HTTP 结果仍保留 network_events。WebUI 请求快照保存本轮请求、HTTP 结果与超时信息。
 
 ## 新日志如何定位
 
@@ -61,8 +67,10 @@
 | image_api_request / image_api_response | 真正图片服务的开始和结束，和前面的 LLM 参数生成分开计时 |
 | main_first_drawing_tool.elapsed_ms | 主请求钩子到首次绘图工具的耗时，含 Agent 准备，不是纯 HTTP；不包含此工具后续生图耗时 |
 | request.previous_image_policy / image_sources | 是否因改图或延续画面附带上一张图片 |
-| request.tool_choice=required | 唯一一次工具参数纠错使用原生工具约束，首次仍为 auto |
-| image_tool_deferred | 长任务继续在插件内执行，避免被核心工具超时截断，没有新建绘图请求 |
+| request.tool_choice=required | 首次请求与最多一次纠错都要求原生工具调用 |
+| selection_repair | 在对象明确时补齐漏填卡 ID，不调用模型；来源在 source 中 |
+| image_tool_budget | 只作用于当前图片工具的预算，调用结束后恢复核心原值 |
+| image_tool_deferred | 仅预算将尽或核心钩子不可用的兜底；继续同一个任务，不新建绘图请求 |
 | image_end.delivery_state / deferred | 图片发送状态、是否延续执行；失败和取消也会有终态记录 |
 
 响应头很快、内容很晚：继续查模型/中转生成过程。响应头也很晚：结合 HTTP 错误和上游请求 ID 查连接池、网络或中转等待。正文持续增长而结束很晚：查多余输出/显式推理。http_attempts 大于 1：先找格式纠正或 AstrBot 回退行。仅这些客户端日志不能直接测出服务内部排队、隐藏推理或中转内部重试。

@@ -69,7 +69,7 @@ class ImageLifecycleTests(unittest.TestCase):
             e = core.FakeEvent()
             with patch("main.IMAGE_TOOL_INLINE_SECONDS", 0.01):
                 receipt = await asyncio.wait_for(p.novelai_generate_image(e, "window"), timeout=0.1)
-            self.assertIn("DRAWING_IN_PROGRESS", receipt)
+            self.assertIn("status=accepted_background", receipt)
             self.assertEqual(e.get_extra("nai_image_status"), "running")
             p._finish_event.assert_not_awaited()
             duplicate = await p.novelai_generate_image(e, "window again")
@@ -95,7 +95,7 @@ class ImageLifecycleTests(unittest.TestCase):
             e = core.FakeEvent()
             with patch("main.IMAGE_TOOL_INLINE_SECONDS", 0.01), patch("main.asyncio.sleep", side_effect=retry_wait):
                 receipt = await asyncio.wait_for(p.novelai_generate_image(e, "window"), 0.1)
-                self.assertIn("DRAWING_IN_PROGRESS", receipt)
+                self.assertIn("status=accepted_background", receipt)
                 tasks = list(p._image_tasks)
                 gate.set()
                 await asyncio.gather(*tasks)
@@ -164,7 +164,7 @@ class ImageLifecycleTests(unittest.TestCase):
             # a short configured timeout rather than a minute-long test.
             results = [r async for r in FunctionToolExecutor._execute_local(tool, wrapper, prompt="window")]
             self.assertEqual(len(results), 1)
-            self.assertIn("DRAWING_IN_PROGRESS", results[0].content[0].text)
+            self.assertIn("status=accepted_background", results[0].content[0].text)
             self.assertEqual(e.get_extra("nai_image_status"), "running")
             tasks = list(p._image_tasks)
             gate.set()
@@ -223,7 +223,7 @@ class ImageLifecycleTests(unittest.TestCase):
             await p._quick_draw(e, "给你换白裙坐窗前")
             calls = p.context.llm_generate.await_args_list
             self.assertEqual(len(calls), 2)
-            self.assertEqual(calls[0].kwargs["tool_choice"], "auto")
+            self.assertEqual(calls[0].kwargs["tool_choice"], "required")
             self.assertEqual(calls[1].kwargs["tool_choice"], "required")
             payload = core.planning_payload(calls[1].kwargs)
             self.assertEqual(payload["user_request"], e.message)

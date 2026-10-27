@@ -137,7 +137,7 @@ def parse_plan(text: str) -> dict:
     cleaned = re.sub(r"<(think|analysis)>.*?</\1>", "", text, flags=re.I | re.S).strip().lstrip("\ufeff")
     if not cleaned:
         raise PlanError("绘图 LLM 返回空文本或仅有思考内容。", "empty")
-    if re.match(r"(?:```\s*xml\b|(?:call\s+)?tool\s+novelai_generate_image\b|call\s+tool\s+novelai_generate_image\b)", cleaned, re.I):
+    if re.match(r"(?:```\s*xml\b|(?:call\s+)?tool\s+(?:(?:call|request)\s+)?novelai_generate_image\b)", cleaned, re.I):
         raise PlanError("返回了文本模拟工具调用；请使用原生工具调用，或提交完整 JSON 对象，不能用 XML/文字代替。", "pseudo_tool")
     if cleaned.startswith("["):
         raise PlanError("绘图 LLM 顶层需为对象，不能返回数组。")
@@ -214,6 +214,16 @@ def plan_tools():
     # executing its handler. The caller validates once, then submits the image.
     properties = {key: copy.deepcopy(drawing.TOOL_PARAMETERS["properties"][key])
                   for key in ("prompt", "subjects", "style")}
+    # Keep the request-local OpenAI schema explicit: card requires a selector.
+    # The shared main-tool schema also states this, but some adapters flatten
+    # conditional schemas. Union branches refine the shared field definitions.
+    subject = properties["subjects"]["items"]
+    subject.pop("allOf", None)
+    subject["anyOf"] = [
+        {"properties": {"source": {"enum": ["self", "custom"]}}},
+        {"properties": {"source": {"enum": ["card"]}, "preset_id": {"type": "string", "minLength": 1, "pattern": "\\S"}},
+         "required": ["preset_id"]},
+    ]
     properties["error"] = {"type": "string", "description": "无法处理时说明原因，不编造画面。"}
     return ToolSet([FunctionTool(name="novelai_generate_image", description="根据本轮要求提交一份完整图片生成参数。只调用一次。",
         parameters={"type": "object", "properties": properties, "additionalProperties": False,

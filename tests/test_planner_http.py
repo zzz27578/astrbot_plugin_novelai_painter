@@ -68,7 +68,13 @@ class PlannerHTTPTests(unittest.TestCase):
         tool = planner.plan_tools().openai_schema()[0]["function"]
         self.assertEqual(tool["name"], "novelai_generate_image")
         for key in ("prompt", "subjects", "style"):
-            self.assertEqual(tool["parameters"]["properties"][key], drawing.TOOL_PARAMETERS["properties"][key])
+            planned = tool["parameters"]["properties"][key]
+            public = drawing.TOOL_PARAMETERS["properties"][key]
+            if key == "subjects":
+                self.assertEqual(planned["items"]["properties"], public["items"]["properties"])
+                self.assertIn("anyOf", planned["items"])
+            else:
+                self.assertEqual(planned, public)
         provider = Mock(provider_config={"type": "openai_chat_completion"})
         self.assertEqual(planner_transport.select(provider, "auto", main_streaming=False), "nonstream")
         self.assertEqual(planner_transport.select(provider, "stream", main_streaming=False), "stream")

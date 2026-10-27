@@ -23,6 +23,44 @@ def text_size(text):
     return {"chars": len(text), "utf8_bytes": len(text.encode("utf-8"))}
 
 
+def console_entry(detail):
+    """Keep full snapshots in memory; print one small waiting/progress event."""
+    phase = detail.get("phase", "")
+    row = {k: v for k, v in detail.items() if k not in {"timeline", "snapshots"}
+           and not (k == "response_preview" and not v)}
+    title, level = "绘图事件", "info"
+    if phase.startswith("main_") or phase == "duplicate_tool":
+        title = "主模型绘图"
+    elif phase.startswith("image_"):
+        title = "图片任务"
+    elif phase == "http_request":
+        title = "绘图 HTTP 请求"
+    elif phase in {"http_end", "http_error"}:
+        title = "绘图 HTTP 结果"
+        if phase == "http_end" and isinstance(row.get("http_metrics"), dict):
+            row["http_metrics"] = {k: v for k, v in row["http_metrics"].items() if k != "partial_response_preview"}
+    elif phase.startswith("http_") or phase in {"first_chunk", "first_text", "first_reasoning", "stream_end"}:
+        title, level = "绘图传输细节", "debug"
+    elif phase == "provider_wait":
+        title = "绘图等待进度"
+        row = {k: row[k] for k in ("provider", "protocol", "request_id", "attempt", "phase", "status", "elapsed_ms", "remaining_seconds") if k in row}
+        http = detail.get("http_metrics", {})
+        row.update({k: http[k] for k in ("http_attempts", "headers_received", "body_bytes", "content_chars", "tool_arguments_chars") if k in http})
+        row["sends_request"] = False
+    elif phase == "request":
+        title = "绘图调用参数"
+    elif phase == "received":
+        title = "绘图模型回包"
+        row.pop("response_preview", None)  # Printed once at validation.
+    elif phase == "response":
+        title = "绘图参数校验"
+    elif phase == "selection_repair":
+        title = "绘图选卡"
+    elif phase == "failed":
+        title = "绘图失败"
+    return title, level, row
+
+
 def json_text(value):
     # Only used for known request fields/schema, never for arbitrary SDK objects.
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))

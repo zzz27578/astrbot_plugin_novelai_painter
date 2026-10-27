@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -17,8 +18,8 @@ class DiagnosticsTests(unittest.TestCase):
     make_plugin = core.CoreTests.make_plugin
 
     def logs(self, logger):
-        return [json.loads(call.args[0].split("绘图规划: ", 1)[1]) for call in logger.call_args_list
-                if "绘图规划: " in call.args[0]]
+        return [json.loads(match.group(1)) for call in logger.call_args_list
+                if (match := re.search(r": (\{.*\})$", call.args[0]))]
 
     def test_registered_schema_requires_complete_direct_drawing_parameters(self):
         from astrbot.core.provider.register import llm_tools
@@ -194,7 +195,7 @@ class DiagnosticsTests(unittest.TestCase):
             self.assertEqual(result["phase"], "provider_wait")
             self.assertEqual(result["elapsed_ms"], 30000)
             self.assertEqual(result["remaining_seconds"], 90)
-            self.assertFalse(result["first_token_observable"])
+            self.assertFalse(result["sends_request"])
         asyncio.run(run())
 
     def test_current_message_and_previous_image_have_distinct_sources(self):
