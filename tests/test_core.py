@@ -779,12 +779,13 @@ flat cell shading, clean lineart, masterpiece, best quality"""
         self.assertIn(DEFAULT_NEGATIVE, compatible_prompt)
         self.assertIn("extra arms", compatible_prompt)
 
-    def test_only_429_is_retryable(self):
+    def test_only_explicit_429_and_503_are_retry_candidates(self):
         limited = NovelAIPainterPlugin._http_error(429, b"", {"Retry-After": "7"})
         self.assertTrue(limited.retryable)
         self.assertEqual(limited.retry_after, 7)
         self.assertFalse(NovelAIPainterPlugin._http_error(401, b"").retryable)
-        self.assertFalse(NovelAIPainterPlugin._http_error(503, b"").retryable)
+        self.assertTrue(NovelAIPainterPlugin._http_error(503, b"").retryable)
+        self.assertFalse(NovelAIPainterPlugin._http_error(502, b"").retryable)
 
     def test_zip_decode(self):
         out = io.BytesIO()

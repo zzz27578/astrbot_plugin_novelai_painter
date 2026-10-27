@@ -14,6 +14,9 @@ DEFAULTS = {
     "drawing_llm_output_mode": "auto",
     "drawing_llm_format_retry": True,
     "drawing_llm_debug": False,
+    "drawing_llm_transport": "auto",
+    "drawing_llm_reasoning_effort": "inherit",
+    "drawing_llm_max_tokens": 0,
 }
 
 
@@ -152,7 +155,7 @@ def response_plan(response) -> dict:
     if finish == "content_filter" or refusal:
         raise PlanError("绘图 LLM 服务拒绝了该请求，本次未请求图片服务。", "refusal", False)
     if finish in {"length", "max_tokens"}:
-        raise PlanError("绘图 LLM 输出被截断，请提供完整方案。", "truncated")
+        raise PlanError("绘图 LLM 输出被截断，请调整输出预算或推理强度后重试。", "truncated", False)
     names, args = getattr(response, "tools_call_name", []) or [], getattr(response, "tools_call_args", []) or []
     if names:
         if names != ["submit_drawing_plan"] or len(args) != 1:

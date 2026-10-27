@@ -38,6 +38,22 @@
     "description": "格式或字段错误时纠正一次", "type": "bool", "default": true,
     "hint": "先清理可识别的工具包装和冗余默认字段；仍无效且总超时预算剩余至少 3 秒时，反馈错误纠正一次。验证前不请求图片服务，拒绝/网络失败不重试。"
   },
+  "drawing_llm_transport": {
+    "description": "绘图 LLM 调用方式", "type": "string", "default": "auto",
+    "options": ["auto", "stream", "nonstream"],
+    "labels": {"auto": "自动（OpenAI 兼容使用流式）", "stream": "流式", "nonstream": "非流式（旧路径）"},
+    "hint": "n 和 /n 共用。流式只在插件内部接收，不向聊天发送 Tag；等完整最终结果再生图。非流式用于兼容与耗时对照；失败不自动换路径重复请求。"
+  },
+  "drawing_llm_reasoning_effort": {
+    "description": "绘图 LLM 推理强度", "type": "string", "default": "inherit",
+    "options": ["inherit", "low", "medium", "high"],
+    "labels": {"inherit": "继承 Provider", "low": "低", "medium": "中", "high": "高"},
+    "hint": "仅 OpenAI 兼容接口。仅覆盖本次绘图请求的 reasoning_effort，不影响主聊天；需上游支持。不支持时选继承，错误不会静默重发。"
+  },
+  "drawing_llm_max_tokens": {
+    "description": "绘图 LLM 输出 Token 预算", "type": "int", "default": 0, "min": 0, "max": 16384,
+    "hint": "0 继承 Provider。非 0 仅对绘图请求设置 max_completion_tokens（可能含隐藏推理），需上游支持；预算耗尽会明确报截断，不用残缺方案生图。"
+  },
   "drawing_llm_debug": {
     "description": "记录绘图 LLM 回包预览", "type": "bool", "default": false,
     "hint": "排查时开启，在日志与请求快照显示最多 2000 字符的绘图返回内容，可能包含画面描述。默认记录分阶段耗时、Provider、请求大小、图片来源和上游提供的 Token 用量，不记录正文。"
@@ -295,7 +311,7 @@
     "invisible": true
   },
   "max_api_requests_per_job": {
-    "description": "一次任务 API 尝试次数硬上限（仅 429 策略可超过 1）",
+    "description": "429 策略 API 尝试次数上限（503 次数另计）",
     "type": "int",
     "default": 3,
     "min": 1,
@@ -330,10 +346,14 @@
       "rate_limit_once": "仅 429 自动重试 1 次",
       "rate_limit_twice": "仅 429 自动重试 2 次"
     },
-    "hint": "只在服务明确返回 429 时重试；网络超时、连接中断和其他错误不会重试，以避免重复扣费或重复生图。"
+    "hint": "此选项只控制 429。503 使用独立次数配置；网络超时和连接中断不自动重试。"
+  },
+  "retry_503_count": {
+    "description": "图片服务 HTTP 503 自动重试次数", "type": "int", "default": 0, "min": 0, "max": 3,
+    "hint": "0 关闭，最多额外重试 3 次。只对图片服务明确返回的 HTTP 503 生效，不重新调用绘图 LLM。使用重试基础等待与 Retry-After；服务端若已生成图片，重发可能重复计费。"
   },
   "retry_delay": {
-    "description": "429 重试基础等待（秒）",
+    "description": "429 / 503 重试基础等待（秒）",
     "type": "float",
     "default": 5,
     "min": 1,

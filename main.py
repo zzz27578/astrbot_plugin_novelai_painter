@@ -39,14 +39,15 @@ from astrbot.core.agent.message import TextPart
 from astrbot.core.message.components import Image
 from astrbot.core.message.message_event_result import MessageChain, ResultContentType
 if __package__:
-    from . import drawing, planner, diagnostics
+    from . import drawing, planner, diagnostics, planner_transport
 else:  # Standalone test discovery.
     import drawing
     import planner
     import diagnostics
+    import planner_transport
 
 PLUGIN_NAME = "astrbot_plugin_novelai_painter"
-VERSION = "2.10.2"
+VERSION = "2.10.3"
 STICKER_EMOTION_TOOL_NAME = "novelai_set_emotion"
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 MAX_RESPONSE_BYTES = 48 * 1024 * 1024
@@ -106,7 +107,7 @@ CONFIG_KEYS = {
     "model", "custom_model", "command_prefix", "invoke_mode", "private_access", "group_access",
     "allowed_users", "allowed_groups", "admin_bypass", "legacy_command_enabled", "width", "height",
     "steps", "scale", "sampler", "negative_prompt", "quality_toggle", "images_per_request",
-    "max_api_requests_per_job", "dedupe_window_seconds", "queue_timeout", "retry_mode", "retry_delay",
+    "max_api_requests_per_job", "dedupe_window_seconds", "queue_timeout", "retry_mode", "retry_delay", "retry_503_count",
     "error_notify_mode", "show_queue_notice", "notify_429", "show_retry_notice", "auto_clean_delay",
     "default_preset_id", "persona_preset_map", "llm_auto_reference", "llm_card_mode", "img2img_enabled",
     "reference_enabled", "img2img_strength", "img2img_noise", "img2img_color_correct",
@@ -227,6 +228,7 @@ class NovelAIPainterPlugin(Star):
             "queue_timeout": 120,
             "retry_mode": "none",
             "retry_delay": 5.0,
+            "retry_503_count": 0,
             "error_notify_mode": "final_only",
             "show_queue_notice": True,
             "notify_429": True,
@@ -1299,6 +1301,12 @@ class NovelAIPainterPlugin(Star):
             pass  # Diagnostics must not interfere with the main chat.
         event.set_extra("nai_main_provider", provider_id)
         descriptor = diagnostics.provider_details(provider)
+        try:
+            streaming = self.context.get_config(event.unified_msg_origin).get("provider_settings", {}).get("streaming_response")
+            if isinstance(streaming, bool):
+                descriptor["chat_streaming_configured"] = streaming
+        except Exception:
+            pass
         if isinstance(getattr(req, "model", None), str):
             descriptor["request_model_override"] = req.model
         self._planner_log(event, provider_id, "main", 0, None, phase="main_request_hook", status="observed",
@@ -1413,10 +1421,11 @@ class NovelAIPainterPlugin(Star):
         text = str(getattr(response, "completion_text", "") or "")
         names = getattr(response, "tools_call_name", []) or []
         secrets = [str(self._cfg(key, "") or "") for key in ("api_token", "api_key")]
-        try:
-            secrets += diagnostics.secrets_from(self.context.get_provider_by_id(provider_id))
-        except Exception:
-            pass
+        if mode != "image" and provider_id:
+            try:
+                secrets += diagnostics.secrets_from(self.context.get_provider_by_id(provider_id))
+            except Exception:
+                pass
         detail = {"provider": provider_id, "protocol": mode, "attempt": attempt,
             "request_id": hashlib.sha256(self._event_key(event, "", "generate").encode()).hexdigest()[:10],
             "text_length": len(text), "tool_calls": names,
@@ -1465,7 +1474,9 @@ class NovelAIPainterPlugin(Star):
             self._planner_log(event, provider_id, mode, attempt, None,
                 phase="provider_wait", status="waiting", elapsed_ms=round(elapsed * 1000),
                 remaining_seconds=round(max(0, remaining - elapsed), 1),
-                timing_scope="provider_call_including_sdk", first_token_observable=False)
+                timing_scope="provider_call_including_sdk", first_token_observable=False,
+                stream_chunk_observable=bool(event.get_extra("nai_planner_streaming")),
+                stream_metrics=event.get_extra("nai_planner_stream_metrics", {}))
 
     async def _validate_planned_drawing(self, event, plan, view=None):
         subjects = await self._resolve_drawing_subjects(event, plan["subjects"])
@@ -1549,9 +1560,14 @@ class NovelAIPainterPlugin(Star):
         payload["output_mode"] = mode
         kwargs = {"tools": planner.plan_tools(), "tool_choice": "required"} if mode == "tool" else {}
         try:
-            provider_descriptor = diagnostics.provider_details(self.context.get_provider_by_id(provider_id))
+            provider = self.context.get_provider_by_id(provider_id)
         except Exception:
-            provider_descriptor = {"available": False}
+            provider = None
+        transport = planner_transport.select(provider, str(self._cfg("drawing_llm_transport", "auto")))
+        provider, request_overrides = planner_transport.request_provider(provider,
+            str(self._cfg("drawing_llm_reasoning_effort", "inherit")),
+            max(0, min(16384, int(self._cfg("drawing_llm_max_tokens", 0)))))
+        provider_descriptor = diagnostics.provider_details(provider)
         schema_text = diagnostics.json_text(kwargs["tools"].openai_schema()) if mode == "tool" else ""
         # Bound the whole planning/reformat cycle instead of allowing another
         # full timeout after a slow first response. The SDK also has retries.
@@ -1572,8 +1588,11 @@ class NovelAIPainterPlugin(Star):
             metrics = {"phase": "request", "status": "requesting", "request_chars": len(encoded), "context_messages": len(dialogue),
                 "image_count": len(images), "prepare_ms": prepare_ms,
                 "remaining_seconds": round(remaining, 1),
-                "provider_details": provider_descriptor, "transport": "context.llm_generate/text_chat",
-                "first_token_observable": False, "request_max_retries": 1,
+                "provider_details": provider_descriptor,
+                "transport": "provider.text_chat_stream" if transport == "stream" else "provider.text_chat" if request_overrides else "context.llm_generate/text_chat",
+                "streaming": transport == "stream", "first_token_observable": False,
+                "stream_chunk_observable": transport == "stream",
+                "request_overrides": request_overrides, "request_max_retries": 1,
                 "format_retry_enabled": attempts > 1, "tool_choice": kwargs.get("tool_choice", "none"),
                 "context_source": context_source, "context_messages_configured": count,
                 "context_disabled": count == 0, "history_available": len(view.history) if view else 0,
@@ -1591,11 +1610,26 @@ class NovelAIPainterPlugin(Star):
                 metrics["reply_wait_ms"] = round((started - event.get_extra("nai_planner_queued_at")) * 1000)
             self._planner_log(event, provider_id, mode, attempt, None, **metrics)
             wait_log = asyncio.create_task(self._planner_wait_log(event, provider_id, mode, attempt, call_started, remaining))
+            def stream_record(phase, stream_metrics):
+                event.set_extra("nai_planner_stream_metrics", stream_metrics)
+                self._planner_log(event, provider_id, mode, attempt, None, phase=phase, status="streaming", **stream_metrics)
+            event.set_extra("nai_planner_stream_metrics", {})
+            event.set_extra("nai_planner_streaming", transport == "stream")
             try:
-                response = await asyncio.wait_for(self.context.llm_generate(
-                    chat_provider_id=provider_id, prompt=encoded,
-                    system_prompt=skill, image_urls=images or None, **kwargs),
-                    timeout=remaining)
+                if transport == "stream" or request_overrides:
+                    provider_kwargs = {key: value for key, value in kwargs.items() if key != "tools"}
+                    if "tools" in kwargs:
+                        provider_kwargs["func_tool"] = kwargs["tools"]
+                    provider_kwargs.update(prompt=encoded, system_prompt=skill, image_urls=images or None)
+                    call = planner_transport.collect_stream(provider, provider_kwargs, stream_record) if transport == "stream" else provider.text_chat(**provider_kwargs)
+                else:
+                    call = self.context.llm_generate(chat_provider_id=provider_id, prompt=encoded,
+                        system_prompt=skill, image_urls=images or None, **kwargs)
+                response = await asyncio.wait_for(call, timeout=remaining)
+            except planner.PlanError as exc:
+                self._planner_log(event, provider_id, mode, attempt, None, exc, phase="response", retry=False,
+                    elapsed_ms=round((time.perf_counter() - call_started) * 1000))
+                raise
             except asyncio.TimeoutError as exc:
                 self._planner_log(event, provider_id, mode, attempt, None, planner.PlanError("规划总超时", "timeout", False),
                     phase="response", elapsed_ms=round((time.perf_counter() - call_started) * 1000),
@@ -1625,7 +1659,8 @@ class NovelAIPainterPlugin(Star):
             received_at = time.perf_counter()
             provider_ms = round((received_at - call_started) * 1000)
             self._planner_log(event, provider_id, mode, attempt, response, phase="received", status="received",
-                provider_ms=provider_ms, timing_scope="provider_call_including_sdk")
+                provider_ms=provider_ms, timing_scope="provider_call_including_sdk",
+                **event.get_extra("nai_planner_stream_metrics", {}))
             try:
                 plan = planner.response_plan(response)
                 if not self._contextual_cards_enabled():
@@ -1646,6 +1681,7 @@ class NovelAIPainterPlugin(Star):
             self._planner_log(event, provider_id, mode, attempt, response,
                 phase="response", elapsed_ms=round((time.perf_counter() - call_started) * 1000),
                 provider_ms=provider_ms, validation_ms=round((time.perf_counter() - received_at) * 1000), retry=False,
+                stream_metrics=event.get_extra("nai_planner_stream_metrics", {}),
                 total_ms=round((time.perf_counter() - started) * 1000))
             break
         if self._drawing_llm_id() != provider_id:
@@ -2015,6 +2051,8 @@ class NovelAIPainterPlugin(Star):
             return ProviderError("auth", "图片服务认证失败，请检查 Key 或 Token", retryable=False)
         if status == 402:
             return ProviderError("quota", "图片服务额度不足", retryable=False)
+        if status == 503:
+            return ProviderError("http_503", "图片服务返回 HTTP 503", retryable=True, retry_after=retry_after)
         return ProviderError(f"http_{status}", f"图片服务返回 HTTP {status}", retryable=False)
 
     def _retry_limit(self) -> int:
@@ -2026,8 +2064,17 @@ class NovelAIPainterPlugin(Star):
             hard_limit = 1
         return min(configured, hard_limit)
 
-    def _should_retry(self, error: ProviderError, attempts: int) -> bool:
-        return error.code == "429" and error.retryable and attempts < self._retry_limit()
+    def _503_retries(self) -> int:
+        try:
+            return max(0, min(3, int(self._cfg("retry_503_count", 0))))
+        except (TypeError, ValueError):
+            return 0
+
+    def _should_retry(self, error: ProviderError, attempts: int, failure_counts=None) -> bool:
+        limits = {"429": self._retry_limit() - 1, "http_503": self._503_retries()}
+        failures = failure_counts.get(error.code, 0) if failure_counts is not None else attempts
+        return (error.retryable and error.code in limits and failures <= limits[error.code]
+            and attempts < self._retry_limit() + self._503_retries())
 
     async def _post_image_request(self, url: str, headers: dict[str, str], payload: dict[str, Any], job_id: str) -> str:
         timeout = aiohttp.ClientTimeout(total=180)
@@ -2173,6 +2220,7 @@ class NovelAIPainterPlugin(Star):
                 reference["reference_type"] = effective_reference_type or "character"
             image_b64 = base64.b64encode(image_bytes).decode("ascii") if image_bytes and provider == "novelai_official" else None
             attempts = 0
+            failure_counts = {}
             while True:
                 queue_started = time.perf_counter()
                 try:
@@ -2227,18 +2275,25 @@ class NovelAIPainterPlugin(Star):
                     result = GenerationResult(True, job_id, provider, path=path, message="图片已生成并发送到当前会话。", attempts=attempts)
                     break
                 except ProviderError as exc:
+                    failure_counts[exc.code] = failure_counts.get(exc.code, 0) + 1
+                    retry = self._should_retry(exc, attempts, failure_counts)
                     self._planner_log(event, provider, "image", attempts, None,
                         planner.PlanError(exc.message, exc.code, False), phase="image_api_error", job_id=job_id,
                         elapsed_ms=round((time.perf_counter() - queue_started) * 1000),
-                        retry=self._should_retry(exc, attempts))
+                        retry=retry)
                     logger.warning(f"[{PLUGIN_NAME}] job={job_id} attempt={attempts} provider={provider} code={exc.code}: {exc.message}")
-                    if not self._should_retry(exc, attempts):
+                    if not retry:
                         result = GenerationResult(False, job_id, provider, error_code=exc.code, message=exc.message, attempts=attempts)
                         break
                     configured_delay = max(1.0, min(300.0, float(self._cfg("retry_delay", 5.0) or 5.0)))
                     delay = max(configured_delay, float(exc.retry_after or 0))
+                    self._planner_log(event, provider, "image", attempts, None,
+                        phase="image_retry_wait", status="waiting_retry", job_id=job_id, error_code=exc.code,
+                        delay_seconds=delay, next_attempt=attempts + 1,
+                        max_attempts=self._retry_limit() + self._503_retries())
                     if not quiet and self._as_bool(self._cfg("show_retry_notice", False)):
-                        await self._notify(event, f"图片服务限流，{delay:g} 秒后进行第 {attempts + 1} 次尝试。", "retry")
+                        reason = "图片服务限流" if exc.code == "429" else "图片服务暂时不可用（503）"
+                        await self._notify(event, f"{reason}，{delay:g} 秒后进行第 {attempts + 1} 次尝试。", "retry")
                     # Do not monopolize the global provider slot while waiting
                     # for a Retry-After window.
                     await asyncio.sleep(delay)
@@ -3357,6 +3412,15 @@ class NovelAIPainterPlugin(Star):
                     fields[key] = min(upper, max(lower, int(fields[key])))
                 except (TypeError, ValueError):
                     return self._page_error(f"{key} 必须是整数")
+        for key, upper in (("retry_503_count", 3), ("drawing_llm_max_tokens", 16384)):
+            if key in fields:
+                try:
+                    value = int(fields[key])
+                except (TypeError, ValueError):
+                    return self._page_error(f"{key} 必须是整数")
+                if not 0 <= value <= upper:
+                    return self._page_error(f"{key} 必须在 0–{upper} 之间")
+                fields[key] = value
         for key, limit in (("drawing_llm_provider_id", 200), ("drawing_llm_prompt", 4000)):
             if key in fields:
                 if not isinstance(fields[key], str) or len(fields[key]) > limit:
@@ -3377,6 +3441,8 @@ class NovelAIPainterPlugin(Star):
             "sticker_send_mode": {"after_reply", "same_bubble"},
             "llm_card_mode": {"context", "strict"},
             "drawing_llm_output_mode": {"auto", "tool", "json"},
+            "drawing_llm_transport": {"auto", "stream", "nonstream"},
+            "drawing_llm_reasoning_effort": {"inherit", "low", "medium", "high"},
         }
         for key, options in allowed_enums.items():
             if key in fields and fields[key] not in options:

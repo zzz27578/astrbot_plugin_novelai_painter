@@ -179,14 +179,16 @@ function renderStatus() {
   $("#mode-status").textContent = modes[state.config.invoke_mode] || "未设置";
   const retryMode = state.config.retry_mode || "none";
   const retryAttempts = { none: 1, rate_limit_once: 2, rate_limit_twice: 3 }[retryMode] || 1;
+  const retries503 = Math.max(0, Math.min(3, Number(state.config.retry_503_count) || 0));
+  const retryEnabled = retryMode !== "none" || retries503 > 0;
   $("#guard-status").textContent = `单事件去重 · ${state.config.dedupe_window_seconds || 30} 秒`;
-  $("#limit-status").textContent = `最多 1 张 · ${retryAttempts} 次 API 尝试`;
+  $("#limit-status").textContent = `最多 1 张 · ${retryAttempts + retries503} 次 API 尝试`;
   document.body.classList.toggle("compatible", !official);
   document.body.classList.toggle("custom-model", state.config.model === "custom");
   $$('[data-retry-setting]').forEach((container) => {
     const control = $("input, select", container);
-    if (control) control.disabled = retryMode === "none";
-    container.classList.toggle("setting-disabled", retryMode === "none");
+    if (control) control.disabled = !retryEnabled;
+    container.classList.toggle("setting-disabled", !retryEnabled);
   });
 
   const keyLabel = $("#api-key-label");
@@ -721,7 +723,7 @@ $$('[data-config]').forEach((element) => {
         ? Number(element.value)
         : element.value;
     markDirty();
-    if (["provider", "model", "openai_auth_header", "openai_auth_prefix", "invoke_mode", "dedupe_window_seconds", "retry_mode"].includes(element.dataset.config)) {
+    if (["provider", "model", "openai_auth_header", "openai_auth_prefix", "invoke_mode", "dedupe_window_seconds", "retry_mode", "retry_503_count"].includes(element.dataset.config)) {
       renderStatus();
     }
   });

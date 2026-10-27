@@ -86,10 +86,19 @@ def response_details(response):
             result["response_id" if key == "id" else "server_request_id"] = value[:160]
     choices = field(raw, "choices", [])
     if isinstance(choices, (list, tuple)) and choices:
+        message = field(choices[0], "message")
+        content = field(message, "content")
+        if isinstance(content, str):
+            result["raw_content_chars"] = len(content)
+        result["raw_reasoning_fields"] = {key: len(value) for key in (
+            "reasoning_content", "reasoning", "analysis", "thinking")
+            if isinstance(value := field(message, key), str)}
         reason = field(choices[0], "finish_reason")
         if isinstance(reason, str):
             result["finish_reason"] = reason[:80]
-    usage = field(raw, "usage") or field(response, "usage")
+    raw_usage = field(raw, "usage")
+    usage = raw_usage or field(response, "usage")
+    result["usage_source"] = "raw_completion" if raw_usage else "astrbot_aggregate" if usage is not None else "unavailable"
     tokens = {}
     for key in ("prompt_tokens", "completion_tokens", "total_tokens", "input_tokens", "output_tokens"):
         value = field(usage, key)
