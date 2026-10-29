@@ -29,7 +29,11 @@ def console_entry(detail):
     row = {k: v for k, v in detail.items() if k not in {"timeline", "snapshots"}
            and not (k == "response_preview" and not v)}
     title, level = "绘图事件", "info"
-    if phase.startswith("main_") or phase == "duplicate_tool":
+    if phase.startswith("main_http_"):
+        title = "主模型 HTTP"
+        if phase not in {"main_http_request", "main_http_end", "main_http_error", "main_http_observation"}:
+            level = "debug"
+    elif phase.startswith("main_") or phase == "duplicate_tool":
         title = "主模型绘图"
     elif phase.startswith("image_"):
         title = "图片任务"

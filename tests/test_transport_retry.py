@@ -257,6 +257,7 @@ class TransportRetryTests(unittest.TestCase):
                 await p.drawing_capture_reply(event, LLMResponse("assistant", completion_text="完整的本轮回复"))
                 await p.drawing_after_reply(event)
                 await p.drawing_after_reply(event)
+                await core.drain_drawing_tasks(p)
             else:
                 await p._quick_draw(event, "画窗边的你")
             self.assertEqual(len(calls), 1)

@@ -18,6 +18,12 @@ from astrbot.core.message.components import Image
 from astrbot.core.message.message_event_result import MessageChain
 
 
+async def drain_drawing_tasks(plugin):
+    tasks = list(getattr(plugin, "_planner_tasks", {}))
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 def planning_payload(kwargs):
     """Read reference materials and native messages from a captured request."""
     import planner

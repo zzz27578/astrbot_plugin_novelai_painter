@@ -18,6 +18,18 @@ def is_openai(provider):
     return isinstance(config, dict) and "openai" in str(config.get("type", "")).lower()
 
 
+def observed_provider(provider, record):
+    """Observe an existing main call without changing its body/retry policy."""
+    from openai import AsyncOpenAI
+    if not is_openai(provider) or not isinstance(getattr(provider, "client", None), AsyncOpenAI):
+        return None
+    local = copy.copy(provider)
+    local.provider_config = copy.deepcopy(provider.provider_config)
+    client = provider.client
+    local.client = client.with_options(http_client=borrowed_client(client._client, HTTPObservation(record)))
+    return local
+
+
 def select(provider, transport, *, main_streaming=None):
     supported = callable(getattr(provider, "text_chat_stream", None))
     if transport == "stream":

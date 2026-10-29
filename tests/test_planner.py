@@ -23,6 +23,9 @@ class PlannerTests(unittest.TestCase):
     def make_planner(self, plan=None):
         plugin = self.make_context_plugin()
         plugin.config.update(planner.DEFAULTS)
+        # Existing cases exercise the supported legacy text contract. Native
+        # session sharing and the new default have their own integration tests.
+        plugin.config["drawing_llm_context_mode"] = "legacy"
         plugin.config["drawing_llm_provider_id"] = "drawing-provider"
         plan = plan or {"prompt":"window, sunlight", "subjects":[{"source":"self", "outfit":"white dress", "prompt":"smiling"}]}
         plugin.context.llm_generate = AsyncMock(return_value=LLMResponse("assistant", completion_text=json.dumps(plan)))
@@ -31,6 +34,7 @@ class PlannerTests(unittest.TestCase):
     async def complete_reply(self, plugin, event, text="我坐到窗前，向你微笑。"):
         await plugin.drawing_capture_reply(event, LLMResponse("assistant", completion_text=text))
         await plugin.drawing_after_reply(event)
+        await core.drain_drawing_tasks(plugin)
 
     async def queue_marker(self, plugin, event):
         if planner.marker_request(event.message, "n") is None:
@@ -84,6 +88,7 @@ class PlannerTests(unittest.TestCase):
             await p.drawing_capture_reply(event, LLMResponse("assistant", completion_text="好。"))
             await asyncio.gather(p.drawing_after_reply(event), p.drawing_after_reply(event))
             await p.drawing_after_reply(event)
+            await core.drain_drawing_tasks(p)
             p.context.llm_generate.assert_awaited_once()
             p._call_official.assert_awaited_once()
         asyncio.run(run())
@@ -200,7 +205,9 @@ class PlannerTests(unittest.TestCase):
             kwargs = p.context.llm_generate.await_args.kwargs
             payload = core.planning_payload(kwargs)
             self.assertEqual(payload["previous_drawing"]["subjects"][0]["outfit"], "white dress")
-            self.assertIn(str(copied), kwargs["image_urls"])
+            self.assertEqual(len(kwargs["image_urls"]), 1)
+            self.assertIn("drawing-input-", kwargs["image_urls"][0])
+            self.assertFalse(Path(kwargs["image_urls"][0]).exists())  # Branch-owned input is cleaned after use.
             self.assertTrue(payload["images"]["previous_drawing_attached"])
             self.assertFalse(copied.exists())  # replaced by the new successful image
             reset = core.FakeEvent(); reset.set_extra("_clean_group_context_session", True)
@@ -281,6 +288,7 @@ class PlannerTests(unittest.TestCase):
                 return False
             with patch("astrbot.core.pipeline.respond.stage.call_event_hook", side_effect=send_hook):
                 await stage.process(event)
+            await core.drain_drawing_tasks(p)
             self.assertEqual(len(event.sent), 2)
             self.assertIsInstance(event.sent[1].chain[0], Image)
             p.context.llm_generate.assert_awaited_once()
@@ -298,6 +306,7 @@ class PlannerTests(unittest.TestCase):
             event.result.set_result_content_type(ResultContentType.STREAMING_FINISH)
             await p.drawing_stream_finished(event)
             await p.drawing_after_reply(event)
+            await core.drain_drawing_tasks(p)
             p.context.llm_generate.assert_awaited_once()
             self.assertEqual(core.planning_payload(p.context.llm_generate.await_args.kwargs)["current_reply"], text)
         asyncio.run(run())

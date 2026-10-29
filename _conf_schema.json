@@ -59,10 +59,21 @@
     "hint": "排查时开启，在日志与请求快照显示最多 2000 字符的绘图返回内容，可能包含画面描述。默认记录分阶段耗时、Provider、请求大小、图片来源和上游提供的 Token 用量，不记录正文。"
   },
   "drawing_llm_context_messages": {
-    "description": "绘图 LLM 读取的最近对话消息数",
+    "description": "旧文本模式的最近对话消息数",
     "type": "int",
     "default": 12,
-    "hint": "0-30 条 user/assistant 消息，每条最多 2000 字符；0 不读取旧对话。用户本轮原文与本轮回复仍会提供。"
+    "hint": "仅旧文本模式使用：0-30 条 user/assistant 消息，每条最多 2000 字符；0 不读取旧对话。共享模式按主会话窗口和字符上限取原生消息，不使用此值。"
+  },
+  "drawing_llm_context_mode": {
+    "description": "绘图上下文来源", "type": "string", "default": "shared",
+    "options": ["shared", "legacy"],
+    "labels": {"shared": "共享主会话（推荐）", "legacy": "旧版最近 N 条文本"},
+    "hint": "共享模式：n 使用本轮主 Agent 快照；/n 读取当前会话并使用 AstrBot 同源人设与技能解析。保留原生对话和完整工具记录，不切换聊天模型。"
+  },
+  "drawing_llm_context_chars": {
+    "description": "共享绘图上下文字符上限", "type": "int", "default": 48000,
+    "min": 4096, "max": 128000,
+    "hint": "4096-128000 字符。包含人设、原生历史和本轮绘图材料；超过时按完整轮次裁去最旧历史，不拆开工具调用与结果。人设和最新一轮仍超限会明确报错。"
   },
   "drawing_llm_timeout": {
     "description": "绘图 LLM 总超时预算（秒）",

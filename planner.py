@@ -13,6 +13,8 @@ else:
 DEFAULTS = {
     "drawing_llm_provider_id": "",
     "drawing_llm_context_messages": 12,
+    "drawing_llm_context_mode": "shared",
+    "drawing_llm_context_chars": 48000,
     "drawing_llm_timeout": 60,
     "drawing_llm_use_images": False,
     "drawing_llm_prompt": "",

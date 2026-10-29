@@ -190,6 +190,14 @@ function renderStatus() {
     if (control) control.disabled = !retryEnabled;
     container.classList.toggle("setting-disabled", !retryEnabled);
   });
+  const sharedContext = state.config.drawing_llm_context_mode !== "legacy";
+  for (const [key, disabled] of [["drawing_llm_context_messages", sharedContext], ["drawing_llm_context_chars", !sharedContext]]) {
+    const control = $(`[data-config="${key}"]`);
+    if (control) {
+      control.disabled = disabled;
+      control.closest("label")?.classList.toggle("setting-disabled", disabled);
+    }
+  }
 
   const keyLabel = $("#api-key-label");
   const authHelp = $("#auth-help");
@@ -723,7 +731,7 @@ $$('[data-config]').forEach((element) => {
         ? Number(element.value)
         : element.value;
     markDirty();
-    if (["provider", "model", "openai_auth_header", "openai_auth_prefix", "invoke_mode", "dedupe_window_seconds", "retry_mode", "retry_503_count"].includes(element.dataset.config)) {
+    if (["provider", "model", "openai_auth_header", "openai_auth_prefix", "invoke_mode", "dedupe_window_seconds", "retry_mode", "retry_503_count", "drawing_llm_context_mode"].includes(element.dataset.config)) {
       renderStatus();
     }
   });

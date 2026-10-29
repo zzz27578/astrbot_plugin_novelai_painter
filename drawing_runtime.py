@@ -4,6 +4,47 @@ from __future__ import annotations
 from astrbot.core.agent.tool import FunctionTool, ToolSet
 
 
+def observe_main(event, run_context, record):
+    """Replace only this registered runner's provider with an observing copy.
+
+    Do not patch shared provider methods or touch the session model selection.
+    Unsupported/alternate runners continue without HTTP observations.
+    """
+    from astrbot.core.pipeline.process_stage.follow_up import _ACTIVE_AGENT_RUNNERS
+    if __package__:
+        from .planner_transport import observed_provider
+    else:
+        from planner_transport import observed_provider
+    runner = _ACTIVE_AGENT_RUNNERS.get(event.unified_msg_origin)
+    if (runner is None or runner.run_context is not run_context
+            or getattr(getattr(run_context, "context", None), "event", None) is not event):
+        return False
+    if event.get_extra("nai_main_observation"):
+        return True
+    original = runner.provider
+    provider_id = str(original.provider_config.get("id", ""))
+    def safe_record(phase, metrics):
+        try:
+            record(phase, metrics, provider_id)
+        except Exception:
+            pass  # Diagnostics must never interrupt a main-model response.
+    local = observed_provider(original, safe_record)
+    if local is None:
+        return False
+    runner.provider = local
+    event.set_extra("nai_main_observation", (runner, original, local))
+    return True
+
+
+def restore_observation(event):
+    state = event.get_extra("nai_main_observation")
+    if state:
+        runner, original, local = state
+        if runner.provider is local:
+            runner.provider = original
+        event.set_extra("nai_main_observation", None)
+
+
 def isolate_tools(request):
     tools = getattr(request, "func_tool", None)
     if tools is not None:

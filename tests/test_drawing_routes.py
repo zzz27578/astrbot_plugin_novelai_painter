@@ -88,6 +88,7 @@ class DrawingRoutesTests(unittest.TestCase):
             event.result = MessageEventResult().message("reply").set_result_content_type(ResultContentType.STREAMING_FINISH)
             await p.drawing_stream_finished(event)
             await p.drawing_after_reply(event)
+            await core.drain_drawing_tasks(p)
             p.context.llm_generate.assert_awaited_once()
             self.assertIn("当前场景", core.planning_payload(p.context.llm_generate.await_args.kwargs)["drawing_request"])
         asyncio.run(run())

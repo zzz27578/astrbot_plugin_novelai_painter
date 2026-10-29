@@ -11,7 +11,7 @@ description: 使用 novelai_generate_image 绘制用户明确请求的图片，�
 
 本轮提示若说明绘图暗号已排队，只需正常聊天，完全不必写 Tag、转交意图或调用绘图工具。插件会独立读取用户原话与同一会话的当前上下文，在回复完成后出图。临时素材中的最近绘图记录可用于理解后续指代，但绘图设想不是剧情事实。
 
-独立绘图 LLM 只服务暗号和 `/n`，其规则见 [references/drawing-planner.md](references/drawing-planner.md)，由插件自动加载。以下完整 Tag 示例用于主模型工具调用。
+独立绘图 LLM 只服务暗号和 `/n`。默认共享当前主会话的人设、原生历史及工具结果；`n` 在本轮完整回复发送后固定快照并后台出图，`/n` 直接读取当前会话，不改主模型设置。规则见 [references/drawing-session.md](references/drawing-session.md)，由插件自动加载。历史工具里的完成回执仅适用于过去那轮，不表示本轮图片已生成。旧文本模式使用 [references/drawing-planner.md](references/drawing-planner.md)。以下完整 Tag 示例用于主模型工具调用。
 
 - `subjects` 直接传 JSON 数组，每人一项，不要再编码成字符串。
 - 画 AI 自己用 `source=self`；指定库中角色用 `source=card`、`preset_id`；其他角色用 `source=custom`，可在自己的 `prompt` 或 `appearance_prompt` 写准确角色名或外貌，无需建卡；完整描述已在顶层时不必重复。多人可以混用这些来源。风景、物品用空数组。
