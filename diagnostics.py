@@ -60,6 +60,8 @@ def console_entry(detail):
         title = "绘图参数校验"
     elif phase == "selection_repair":
         title = "绘图选卡"
+    elif phase == "plan_normalized":
+        title = "绘图格式归一"
     elif phase == "failed":
         title = "绘图失败"
     return title, level, row

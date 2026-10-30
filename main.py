@@ -50,7 +50,7 @@ else:  # Standalone test discovery.
     import drawing_session
 
 PLUGIN_NAME = "astrbot_plugin_novelai_painter"
-VERSION = "2.11.0"
+VERSION = "2.11.1"
 # Leave room before the 60-second tool deadline seen in the supplied logs.
 IMAGE_TOOL_INLINE_SECONDS = 45
 STICKER_EMOTION_TOOL_NAME = "novelai_set_emotion"
@@ -1758,6 +1758,8 @@ class NovelAIPainterPlugin(Star):
                 "previous_drawing_attached": bool(previous.get("image") and previous["image"] in images)}}
         skill_file = "drawing-session.md" if native_snapshot else "drawing-planner.md"
         skill = (Path(__file__).parent / "skills" / "novelai-painter" / "references" / skill_file).read_text(encoding="utf-8")
+        contract = planner.json_contract() if mode == "json" else ""
+        skill += contract
         if native_snapshot:
             payload["session_reminders"] = event.get_extra("nai_session_reminders", "")
         payload["output_mode"] = mode
@@ -1794,6 +1796,7 @@ class NovelAIPainterPlugin(Star):
         kwargs["request_max_retries"] = 1
         prepare_ms = round((time.perf_counter() - started) * 1000)
         attempts = 2 if self._as_bool(self._cfg("drawing_llm_format_retry", True), True) else 1
+        provider_total_ms = 0
         for attempt in range(1, attempts + 1):
             current = await self._story_view(event)
             if self._drawing_llm_id() != provider_id or (view and (not current or current.scope != view.scope or current.epoch != view.epoch)):
@@ -1830,6 +1833,9 @@ class NovelAIPainterPlugin(Star):
                 "system_fingerprint": diagnostics.fingerprint(system_prompt),
                 "tool_schema_size": diagnostics.text_size(schema_text),
                 "tool_schema_fingerprint": diagnostics.fingerprint(schema_text) if schema_text else "",
+                "json_contract_size": diagnostics.text_size(contract),
+                "json_contract_fingerprint": diagnostics.fingerprint(contract) if contract else "",
+                "format_retry_count": attempt - 1, "provider_total_ms": provider_total_ms,
                 "total_text_chars": drawing_session.text_chars(request_parts) + len(system_prompt) + len(schema_text),
                 "native_image_count": len(drawing_session.image_urls(native_snapshot)) if native_snapshot else 0,
                 "field_chars": {key: len(diagnostics.json_text(payload.get(key))) for key in (
@@ -1902,11 +1908,13 @@ class NovelAIPainterPlugin(Star):
                     await wait_log
             received_at = time.perf_counter()
             provider_ms = round((received_at - call_started) * 1000)
+            provider_total_ms += provider_ms
             self._planner_log(event, provider_id, mode, attempt, response, phase="received", status="received",
                 provider_ms=provider_ms, timing_scope="provider_call_including_sdk",
                 **event.get_extra("nai_planner_stream_metrics", {}))
+            repairs = []
             try:
-                plan = planner.response_plan(response)
+                plan = planner.response_plan(response, materials=payload, repairs=repairs)
                 if not self._contextual_cards_enabled():
                     for subject in plan["subjects"]:
                         subject.pop("state_scope", None)
@@ -1915,16 +1923,26 @@ class NovelAIPainterPlugin(Star):
                 retry = getattr(exc, "retryable", True) and attempt < attempts and deadline - time.perf_counter() >= 3
                 self._planner_log(event, provider_id, mode, attempt, response, exc,
                     phase="response", elapsed_ms=round((time.perf_counter() - call_started) * 1000),
-                    provider_ms=provider_ms, validation_ms=round((time.perf_counter() - received_at) * 1000), retry=retry)
+                    provider_ms=provider_ms, provider_total_ms=provider_total_ms,
+                    format_retry_count=attempt - 1, validation_issues=getattr(exc, "issues", []),
+                    normalizations=repairs, total_ms=round((time.perf_counter() - started) * 1000),
+                    validation_ms=round((time.perf_counter() - received_at) * 1000), retry=retry)
                 if not retry:
                     raise
                 payload["format_correction"] = {"error": str(exc)[:500],
+                    "issues": getattr(exc, "issues", []),
                     "previous_output": planner.response_output(response)[:16000],
-                    "instruction": "修正格式或字段，重新核对最后一条用户要求（包括换装），提交完整方案。原生工具调用必须使用 API tool_calls，禁止用 XML、代码块或文字模拟。JSON 模式只输出完整 JSON 对象。"}
+                    "instruction": "一次修复 issues 中全部字段，按输出契约重新提交完整方案，不照抄前次错误结构。subjects 每项是带 source 的人物对象，不能是 Tag 字符串；self 不填 self_card_id；不改画风省略 style；只读素材不回传。重新核对用户最新要求。原生工具必须使用 API tool_calls；JSON 模式只返回 JSON 对象。"}
                 continue
+            if repairs:
+                self._planner_log(event, provider_id, mode, attempt, None,
+                    phase="plan_normalized", status="normalized", normalizations=repairs,
+                    creates_model_request=False, changes_scene=False)
             self._planner_log(event, provider_id, mode, attempt, response,
                 phase="response", elapsed_ms=round((time.perf_counter() - call_started) * 1000),
-                provider_ms=provider_ms, validation_ms=round((time.perf_counter() - received_at) * 1000), retry=False,
+                provider_ms=provider_ms, provider_total_ms=provider_total_ms,
+                format_retry_count=attempt - 1, normalizations=repairs,
+                validation_ms=round((time.perf_counter() - received_at) * 1000), retry=False,
                 stream_metrics=event.get_extra("nai_planner_stream_metrics", {}),
                 total_ms=round((time.perf_counter() - started) * 1000))
             break

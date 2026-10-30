@@ -22,7 +22,13 @@
 
     git clone https://github.com/zzz27578/astrbot_plugin_novelai_painter.git
 
-安装后进入 AstrBot WebUI 的插件详情页，打开 NovelAI Painter 设置页面完成配置。2.11.0 要求 AstrBot >= 4.27.3，使用统一人设解析接口和不保存到历史的临时消息内容；会话强制人设、Conversation 人设和默认人设与 AstrBot 主 Agent 的选择结果一致。
+安装后进入 AstrBot WebUI 的插件详情页，打开 NovelAI Painter 设置页面完成配置。当前版本 **2.11.1**，要求 AstrBot >= 4.27.3，使用统一人设解析接口和不保存到历史的临时消息内容；会话强制人设、Conversation 人设和默认人设与 AstrBot 主 Agent 的选择结果一致。
+
+## 2.11.1 JSON 绘图参数修复
+
+JSON 模式现在随请求提供与原生工具同源的完整字段结构及示例，明确 `subjects` 每项是人物对象，结束只读素材后再次提示输出要求。`json_object` 仅保证合法 JSON，字段结构仍由插件校验。`style:null`、与当前输入完全一致的素材回显及经绑定卡验证的多余 `self_card_id` 可在本地处理，不额外调用模型；Tag 字符串数组等不能确定人物归属的错误仍需纠正，最多一次，并集中列出结构错误。
+
+日志新增格式归一记录、字段错误路径、格式重试次数和累计模型调用耗时，区分格式重试与单次请求慢。共享会话、后台任务及角色卡权重规则保留。见 [本版说明](UPDATE_REPORT_2.11.1.md) 与 [测试方法](DIAGNOSTIC_TEST_GUIDE.md)。
 
 ## 2.11.0 绘图入口与共享会话
 

@@ -12,6 +12,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import unquote, urlsplit
 
+if __package__:
+    from . import planner
+else:
+    import planner
+
 MARKER = re.compile(r"\[NovelAI drawing identities\].*?\[End NovelAI drawing identities\]", re.S)
 
 
@@ -196,7 +201,9 @@ def request_parts(snapshot, payload, instruction, limit):
     system = snapshot.system + "\n\n" + instruction
     materials = {k: v for k, v in payload.items() if k not in {"recent_dialogue", "current_reply", "drawing_request"}}
     # The user request and current reply already exist in native messages for n.
-    prompt = "[Drawing turn: submit parameters only]\n" + payload["drawing_request"] + "\n" + json.dumps(materials, ensure_ascii=False, separators=(",", ":"))
+    prompt = ("[Drawing turn: submit parameters only]\n" + payload["drawing_request"] + "\n"
+        + planner.MATERIALS_HEADER + json.dumps(materials, ensure_ascii=False, separators=(",", ":"))
+        + "\n" + planner.MATERIALS_END + "\n" + planner.OUTPUT_REMINDER)
     groups = []
     for row in copy.deepcopy(snapshot.messages):
         if not groups or row["role"] == "user":

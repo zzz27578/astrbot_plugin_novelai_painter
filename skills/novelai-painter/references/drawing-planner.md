@@ -11,3 +11,5 @@
 `previous_drawing`、`previous_user_request` 和上一张附图是本会话已完成的绘图参考。明确修改上一张时只改指定部分；画当前剧情以当前对话为准；新图按新要求组织。图中临时服饰不是已发生的剧情。`preferences` 是用户配置的绘图偏好。`format_correction` 若存在只修正其指出的错误，提交完整方案，不把报错画入图中。
 
 示例：`{"prompt":"full body, sitting by a window, warm sunlight","subjects":[{"source":"self","outfit":"white dress, sandals","prompt":"smiling"}]}`
+
+subjects 每项必须是带 source 的人物对象，不能写 Tag 字符串列表。self 不填 self_card_id；不改画风时省略 style，不填 null。素材中的 available_cards、self_card_id、card_mode、previous_drawing 等均为只读输入，不复制进输出。JSON 模式另附完整输出契约；纠错时一次处理 issues 中所有错误，按本轮用户目标提交新方案。

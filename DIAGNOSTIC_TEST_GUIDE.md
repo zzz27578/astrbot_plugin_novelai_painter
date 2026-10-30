@@ -1,17 +1,17 @@
-# 2.11.0：共享会话绘图与主模型对照测试
+# 2.11.1：JSON 参数修复与主模型对照测试
 
-本版默认共享当前主会话的人设和原生历史，`n` 在回复后提交后台任务，释放聊天流水线。真实的 Grok 规划等待仍需用同一 Provider 对照，不能以插件测试通过代替延迟实测。
+本版补齐 JSON 输出字段结构，并减少不必要的格式重试。继续共享当前主会话的人设和原生历史，`n` 在回复后提交后台任务，释放聊天流水线。真实的 Grok 单次规划等待仍需用同一 Provider 对照，不能以插件测试通过代替延迟实测。
 
 ## 最小测试
 
-更新并重载插件，确认版本 **2.11.0**，主聊天和独立绘图都选择同一个 Grok 4.7 Provider ID，并绑定同一张角色卡。
+更新并重载插件，确认版本 **2.11.1**，主聊天和独立绘图都选择同一个 Grok 4.7 Provider ID，并绑定同一张角色卡。本次先验证 JSON 修复，不需要为了测试更换上游或调高超时。
 
 建议先用以下设置执行两次测试，无需跑完多组排列：
 
 | 设置 | 取值 |
 |---|---|
-| 绘图输出协议 | 自动（OpenAI 兼容使用与主绘图同名的参数工具） |
-| 绘图调用方式 | 自动（跟随主聊天的流式设置） |
+| 绘图输出协议 | JSON 文本；保持与这份故障日志一致 |
+| 绘图调用方式 | 保持当前设置；日志中的测试为非流式 |
 | 绘图推理强度 | 继承 |
 | 绘图输出 Token 预算 | 0 |
 | 绘图上下文来源 | 共享主会话（默认） |
@@ -19,7 +19,7 @@
 | 旧文本模式的最近消息数 | 可以保持 0，但共享模式不使用此值；只有选择旧文本模式才关闭旧历史 |
 | 读取附图和最近成图 | 首次关闭 |
 | 格式错误纠正一次 | 开启；日志能区分首次请求与唯一一次纠错 |
-| 规划超时 | 保持原来的 120 秒 |
+| 规划超时 | 保持当前值，不因测试提高；模型 Provider 自身超时另计 |
 | 记录绘图回包预览 | 开启，超时时也可保留有限正文/参数片段；测试后可关闭 |
 
 1. 在一段已有聊天中发送：`请用绑定角色卡画一张你坐在窗边看书的画面，简短回应。` 等主 Grok 直接工具出图完成。
@@ -31,7 +31,9 @@
 
 若需要对照原输入逻辑，只切换“旧版最近 N 条文本”，保留原消息数，其余设置不变，再测一次 `/n`。共享历史可能增加输入长度，不能预先假定一定更快。
 
-成功标准：首次工具模式的 `request.tool_choice` 和 `http_request.wire.tool_choice` 均为 required；原生回包 tools_call_name 含 novelai_generate_image，随后 image_start。若首次仍返回文字模拟调用，请保留该回包与 HTTP 结果；不必反复等待相同错误。接口不支持 required 会明确提示手动切 JSON。
+JSON 修复的成功标准：`request.json_contract_size.chars>0`、`http_request.wire.response_format_type=json_object`，回包的 `subjects` 为人物对象数组。有效参数或可确定的格式冗余应只有一次规划 HTTP 请求，随后 `image_start`。出现 `plan_normalized` 时，`creates_model_request=false`，不应因此发起第二次请求。`style:null` 不会清空卡画风；只读回显仅在与本次素材完全一致时移除。
+
+`subjects=["1girl", ...]` 仍需纠正，不会自动当成自身卡。若出现格式问题，检查 `validation_issues` 是否集中给出结构错误及字段路径（最多 16 项），最多纠正一次；成功后的 `response.format_retry_count` 应为 0 或 1。`provider_total_ms` 累计已经完成的规划调用时间，图片 API 耗时另计。首次仍慢且没有重试时，继续比较 HTTP 指标，不把它算成格式纠正耗时。
 
 选卡回归可发 `/n 全身照`。card 的 ID 若漏填且对象可以唯一确定，应出现 selection_repair、creates_model_request=false，然后继续出图；不能因为补选再调用一次模型。明确指定其他角色仍应选择该角色，不套当前绑定卡。
 
@@ -41,7 +43,7 @@
 
 若服务恰好出现 503，可设重试 1 次验证：同一个 job_id 只有图片 API 重试，随后 image_end 记录最终结果。不必为测试故意触发限流。
 
-若要验证你之前使用的 JSON 模式，只改输出协议为 JSON，再试一次 /n。本版会发送真正的 json_object 格式约束；接口若不支持，会明确提示改用自动/工具模式，不静默重发。
+若 JSON 测试后仍需与工具协议对照，只改输出协议为“自动”或“绘图参数工具”，其余不变。首次 `request.tool_choice` 和 `http_request.wire.tool_choice` 应为 required；原生回包 tools_call_name 含 novelai_generate_image。该对照会改变协议和工具集合，不能据此断言两次请求的缓存条件相同；不必反复排列测试。接口不支持当前约束时会明确提示，不静默切协议重发。
 
 如果仍慢，保留当前设置并提供日志，不需要继续反复调整超时、推理预算或流式开关。已有图片 503 重试配置保持生效，它只重试图片 API。
 
@@ -66,6 +68,11 @@
 | http_request / wire | 实际 HTTP 请求开始；记录最终字段、模型、消息角色、工具名、stream、格式约束 |
 | wire.tools=[novelai_generate_image] | 正在使用与主模型同名的绘图参数工具 |
 | wire.response_format_type=json_object | JSON 模式已发送 API 格式约束 |
+| request.json_contract_size / json_contract_fingerprint | 本轮 JSON 输出结构说明的大小和指纹；工具模式为空 |
+| response.validation_issues | 一次列出的结构错误，带字段路径；供唯一一次格式纠正使用 |
+| plan_normalized / normalizations | 本地移除可确定的格式冗余，记录字段和处理方式，不发模型请求、不改变场景 |
+| response.format_retry_count | 已发生的格式纠正次数，0 为首次，1 为唯一一次纠正；不是网络重试次数 |
+| response.provider_total_ms | 此次绘图所有已完成规划调用的累计耗时；不含图片 API，超时另看 timeout 行 |
 | http_attempts | 实际 HTTP send 累计次数；格式纠正、AstrBot Key/兼容性回退均会增加，不包含中转内部重试 |
 | network_events | 支持 httpcore trace 时记录连接/TLS/发送请求头/接收响应头的阶段；复用连接时可能没有连接建立事件 |
 | http_headers / headers_ms | 已收到响应头；耗时包含本地连接池、网络和上游等待，不能等同于纯上游时间 |

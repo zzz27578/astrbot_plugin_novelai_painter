@@ -32,7 +32,7 @@
     "description": "绘图 LLM 输出协议", "type": "string", "default": "auto",
     "options": ["auto", "tool", "json"],
     "labels": {"auto": "自动（OpenAI 兼容优先参数工具）", "tool": "绘图参数工具", "json": "JSON 文本"},
-    "hint": "工具模式从首次请求即要求原生参数提交（tool_choice=required），card 必须带角色卡 ID。不支持强制工具调用时可手动选 JSON；JSON 模式发送 json_object 格式约束。不静默切换协议重发。"
+    "hint": "工具模式从首次请求即要求原生参数提交（tool_choice=required），card 必须带角色卡 ID。不支持时可手动选 JSON：发送 json_object，并附同源字段结构及示例，插件校验人物对象和只读素材。格式纠错最多一次，不静默切换协议重发。"
   },
   "drawing_llm_format_retry": {
     "description": "格式或字段错误时纠正一次", "type": "bool", "default": true,
