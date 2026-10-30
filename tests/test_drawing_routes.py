@@ -108,6 +108,7 @@ class DrawingRoutesTests(unittest.TestCase):
                 {"role":"user","content":"我们在窗前。"},{"role":"assistant","content":"我穿白裙坐下。"}])
             event = core.FakeEvent("/n")
             async for _ in p.cmd_draw(event): pass
+            await core.drain_drawing_tasks(p)
             self.assertFalse(event.call_llm); self.assertTrue(event.stopped)
             payload = core.planning_payload(p.context.llm_generate.await_args.kwargs)
             self.assertEqual(payload["current_reply"], "")
@@ -170,6 +171,7 @@ class DrawingRoutesTests(unittest.TestCase):
             p.context.llm_generate.assert_not_awaited()
             self.persist_turn(p,event)
             await p._quick_draw(self.drawing_event("/n 改上一张的视角，其他不变","edit"),"改上一张的视角，其他不变")
+            await core.drain_drawing_tasks(p)
             payload=core.planning_payload(p.context.llm_generate.await_args.kwargs)
             self.assertEqual(payload["previous_drawing"]["subjects"][0]["outfit"],"white dress")
             self.assertEqual(payload["previous_user_request"],event.message)
@@ -179,6 +181,7 @@ class DrawingRoutesTests(unittest.TestCase):
         async def run(value):
             p = self.make_planner(); p.context.llm_generate.return_value = LLMResponse("assistant",completion_text=json.dumps(value))
             await p._quick_draw(core.FakeEvent("/n 换白裙"),"换白裙")
+            await core.drain_drawing_tasks(p)
             p.context.llm_generate.assert_awaited_once(); p._call_official.assert_awaited_once()
         plan={"prompt":"window", "subjects":'[{"source":"self","outfit":"white dress"}]',
             "operation":"generate","reference_type":""}
@@ -197,7 +200,9 @@ class DrawingRoutesTests(unittest.TestCase):
             timeouts=[]
             real_wait_for=asyncio.wait_for
             async def wait_for(awaitable, timeout):
-                timeouts.append(timeout)
+                # Queue waiting has its own budget, separate from planning.
+                if p._planner_diagnostics[core.FakeEvent.unified_msg_origin]["phase"] == "request":
+                    timeouts.append(timeout)
                 return await real_wait_for(awaitable,timeout)
             async def generate(**kwargs):
                 self.assertEqual(p._planner_diagnostics[core.FakeEvent.unified_msg_origin]["phase"],"request")
@@ -209,6 +214,7 @@ class DrawingRoutesTests(unittest.TestCase):
             p.context.llm_generate.side_effect=generate
             with patch("main.time.perf_counter",side_effect=lambda:clock[0]),patch("main.asyncio.wait_for",side_effect=wait_for):
                 await p._quick_draw(core.FakeEvent("/n 换白裙"),"换白裙")
+                await core.drain_drawing_tasks(p)
             self.assertEqual(p.context.llm_generate.await_count,expected)
             self.assertEqual(timeouts[0],60)
             if expected==2:
@@ -224,6 +230,7 @@ class DrawingRoutesTests(unittest.TestCase):
             p._call_official.return_value = str(image)
             event = self.drawing_event("/n 只在这张图换白裙", "direct")
             async for _ in p.cmd_draw(event): pass
+            await core.drain_drawing_tasks(p)
             next_event = self.drawing_event("画上一张的侧面，其他不变n", "next")
             req = ProviderRequest(prompt=next_event.message)
             await p.drawing_marker_event(next_event)
@@ -254,6 +261,7 @@ class DrawingRoutesTests(unittest.TestCase):
                 p.context.llm_generate.return_value]
             before = [tool.name for tool in llm_tools.func_list]
             await p._quick_draw(core.FakeEvent("/n 换白裙"),"换白裙")
+            await core.drain_drawing_tasks(p)
             kwargs = p.context.llm_generate.await_args.kwargs
             self.assertEqual(kwargs["tools"].names(), ["novelai_generate_image"])
             self.assertEqual(p.context.llm_generate.await_args_list[0].kwargs["tool_choice"], "required")
@@ -271,6 +279,7 @@ class DrawingRoutesTests(unittest.TestCase):
             raw = p.context.llm_generate.return_value.completion_text
             p.context.llm_generate.return_value = LLMResponse("assistant",completion_text="<think>Consider composition.</think>\n方案如下：\n```json\n"+raw+"\n```\n完成。")
             await p._quick_draw(core.FakeEvent("/n 画窗边"),"画窗边")
+            await core.drain_drawing_tasks(p)
             p.context.llm_generate.assert_awaited_once()
             p._call_official.assert_awaited_once()
         asyncio.run(run())
@@ -286,6 +295,7 @@ class DrawingRoutesTests(unittest.TestCase):
                 return LLMResponse("assistant",completion_text=bad) if len(calls)==1 else good
             p.context.llm_generate.side_effect = generate
             await p._quick_draw(core.FakeEvent("/n 换白裙"),"换白裙")
+            await core.drain_drawing_tasks(p)
             self.assertEqual(len(calls),2)
             self.assertIn("format_correction",calls[1])
             self.assertEqual(calls[1]["format_correction"]["previous_output"],bad)
@@ -300,6 +310,7 @@ class DrawingRoutesTests(unittest.TestCase):
             p = self.make_planner(); p._notify = AsyncMock()
             p.context.llm_generate.return_value = LLMResponse("assistant",completion_text=text)
             await p._quick_draw(core.FakeEvent("/n 画窗边"),"画窗边")
+            await core.drain_drawing_tasks(p)
             self.assertEqual(p.context.llm_generate.await_count,expected)
             p._call_official.assert_not_awaited(); p._notify.assert_awaited_once()
         asyncio.run(run('我无法处理该请求。',1))
@@ -370,6 +381,7 @@ class DrawingRoutesTests(unittest.TestCase):
                 return LLMResponse("assistant",completion_text="window, sunlight")
             p.context.llm_generate.side_effect = bad_after_reset
             await p._quick_draw(core.FakeEvent("/n 画窗边"),"画窗边")
+            await core.drain_drawing_tasks(p)
             p.context.llm_generate.assert_awaited_once()
             p._call_official.assert_not_awaited()
             p._notify.assert_awaited_once()

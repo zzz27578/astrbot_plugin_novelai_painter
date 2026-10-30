@@ -158,6 +158,7 @@ class PlannerTests(unittest.TestCase):
             p = self.make_planner()
             event = core.FakeEvent("/n 换白裙坐到窗前")
             replies = [reply async for reply in p.cmd_draw(event)]
+            await core.drain_drawing_tasks(p)
             self.assertEqual(replies, [])
             self.assertFalse(event.call_llm)
             self.assertTrue(event.stopped)
@@ -349,6 +350,7 @@ class PlannerTests(unittest.TestCase):
             event.get_messages = lambda:[image]
             with patch.object(Image,"convert_to_file_path", new_callable=AsyncMock, return_value="user.png") as convert:
                 await p._quick_draw(event,"按附图的姿势重新画")
+                await core.drain_drawing_tasks(p)
             self.assertEqual(convert.await_count, int(enabled))
             self.assertEqual(p.context.llm_generate.await_args.kwargs["image_urls"], ["user.png"] if enabled else None)
         asyncio.run(run(False)); asyncio.run(run(True))
@@ -357,13 +359,14 @@ class PlannerTests(unittest.TestCase):
         async def run():
             p = self.make_planner()
             p._save_config = Mock(); p._sync_sticker_emotion_tool = Mock()
-            fields = {"drawing_llm_provider_id":"visual-provider", "drawing_llm_timeout":999,
+            fields = {"drawing_llm_provider_id":"visual-provider", "drawing_llm_timeout":999, "drawing_llm_queue_timeout":9999,
                 "drawing_llm_context_messages":999, "drawing_llm_use_images":True, "drawing_llm_prompt":"保留构图",
                 "drawing_trigger":"出图", "drawing_llm_output_mode":"tool", "drawing_llm_format_retry":"false", "drawing_llm_debug":"true"}
             with patch("main.request", SimpleNamespace(json=AsyncMock(return_value=fields))), patch("main.json_response", side_effect=lambda value:value):
                 result = await p.page_save_config()
             self.assertTrue(result["saved"])
             self.assertEqual(p.config["drawing_llm_timeout"],180)
+            self.assertEqual(p.config["drawing_llm_queue_timeout"],3600)
             self.assertEqual(p.config["drawing_llm_context_messages"],30)
             self.assertTrue(p.config["drawing_llm_use_images"])
             self.assertEqual(p.config["drawing_trigger"], "出图")

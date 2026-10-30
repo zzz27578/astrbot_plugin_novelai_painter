@@ -20,6 +20,7 @@ class ImageLifecycleTests(unittest.TestCase):
             p = self.make_planner({"prompt": "window", "subjects": [
                 {"source": "self", "preset_id": "p1", "outfit": "bunny suit, heels"}]})
             await p._quick_draw(core.FakeEvent("/n 换兔女郎服装"), "换兔女郎服装")
+            await core.drain_drawing_tasks(p)
             p.context.llm_generate.assert_awaited_once()
             p._call_official.assert_awaited_once()
             prompt = p._call_official.await_args.args[0]
@@ -221,6 +222,7 @@ class ImageLifecycleTests(unittest.TestCase):
                 '```xml\ncall tool novelai_generate_image with prompt is window subjects is [{"source":"self"}]\n```'), good]
             e = core.FakeEvent("/n 给你换白裙坐窗前")
             await p._quick_draw(e, "给你换白裙坐窗前")
+            await core.drain_drawing_tasks(p)
             calls = p.context.llm_generate.await_args_list
             self.assertEqual(len(calls), 2)
             self.assertEqual(calls[0].kwargs["tool_choice"], "required")

@@ -40,10 +40,11 @@ class DrawingContractFixes(unittest.TestCase):
                 tools_call_name=["novelai_generate_image"], tools_call_args=[plan])
             event = core.FakeEvent("/n 全身照")
             await p._quick_draw(event, "全身照")
+            await core.drain_drawing_tasks(p)
             p.context.llm_generate.assert_awaited_once()
             self.assertEqual(p.context.llm_generate.await_args.kwargs["tool_choice"], "required")
             p._call_official.assert_awaited_once()
-            canonical = event.get_extra("nai_planner_plan")["subjects"][0]
+            canonical = p._finish_event.await_args.args[0].get_extra("nai_planner_plan")["subjects"][0]
             self.assertEqual(canonical["preset_id"], "p1")
             self.assertEqual(canonical["outfit"], "white dress, shoes")
             self.assertNotIn("preset_id", plan["subjects"][0])

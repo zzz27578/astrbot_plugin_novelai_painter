@@ -44,6 +44,7 @@ class TransportRetryTests(unittest.TestCase):
                 p.lock.release()
             with patch("main.asyncio.sleep", side_effect=wait):
                 await p._quick_draw(core.FakeEvent("/n window"), "window")
+                await core.drain_drawing_tasks(p)
             p.context.llm_generate.assert_awaited_once()
             self.assertEqual(p._call_official.await_count, 2)
             p._finish_event.assert_awaited_once()
@@ -115,6 +116,7 @@ class TransportRetryTests(unittest.TestCase):
             p.context.get_provider_by_id = Mock(return_value=provider)
             p._notify = AsyncMock()
             await p._quick_draw(core.FakeEvent("/n window"), "window")
+            await core.drain_drawing_tasks(p)
             p.context.llm_generate.assert_not_awaited()
             p._call_official.assert_not_awaited()
             self.assertIn("完整最终结果", p._notify.await_args.args[1])
@@ -260,6 +262,7 @@ class TransportRetryTests(unittest.TestCase):
                 await core.drain_drawing_tasks(p)
             else:
                 await p._quick_draw(event, "画窗边的你")
+                await core.drain_drawing_tasks(p)
             self.assertEqual(len(calls), 1)
             payload = core.planning_payload(calls[0])
             self.assertEqual(payload["user_request"], event.message)
@@ -281,6 +284,7 @@ class TransportRetryTests(unittest.TestCase):
                 provider_config={"type": "openai_chat_completion"}, text_chat_stream=stream))
             p._notify = AsyncMock()
             await p._quick_draw(core.FakeEvent("/n window"), "window")
+            await core.drain_drawing_tasks(p)
             self.assertEqual(len(calls), 1)
             p._call_official.assert_not_awaited()
             self.assertIn("截断", p._notify.await_args.args[1])

@@ -71,9 +71,11 @@ class PlannerJSONContractTests(unittest.TestCase):
             p.context.llm_generate.return_value = LLMResponse("assistant", completion_text=json.dumps(raw))
             event = self.snapshot_event()
             await p._quick_draw(event, "画窗边的你")
+            await core.drain_drawing_tasks(p)
             p.context.llm_generate.assert_awaited_once()
             p._call_official.assert_awaited_once()
-            self.assertNotIn("style", event.get_extra("nai_planner_plan"))
+            branch = p._finish_event.await_args.args[0]
+            self.assertNotIn("style", branch.get_extra("nai_planner_plan"))
             self.assertIn("{atelier pontdarc}", p._call_official.await_args.args[0])
             self.assertIn("{{elf (isekai ojisan)}}", p._call_official.await_args.args[0])
             self.assertEqual(json.loads(p.context.llm_generate.return_value.completion_text), raw)
@@ -154,6 +156,7 @@ class PlannerJSONContractTests(unittest.TestCase):
             p.context.llm_generate.side_effect = generate
             event = self.snapshot_event()
             await p._quick_draw(event, "画窗边的你")
+            await core.drain_drawing_tasks(p)
             self.assertEqual(p.context.llm_generate.await_count, 2)
             p._call_official.assert_awaited_once()
             row = p._planner_diagnostics[event.unified_msg_origin]["snapshots"]["response"]
@@ -168,6 +171,7 @@ class PlannerJSONContractTests(unittest.TestCase):
                 completion_text='{"prompt":"2girls, park","subjects":["1girl","other girl"],"style":null}')
             p._notify = AsyncMock()
             await p._quick_draw(self.snapshot_event(), "画两个人")
+            await core.drain_drawing_tasks(p)
             self.assertEqual(p.context.llm_generate.await_count, 2)
             p._call_official.assert_not_awaited()
             p._notify.assert_awaited_once()
@@ -208,6 +212,7 @@ class PlannerJSONContractTests(unittest.TestCase):
                     await core.drain_drawing_tasks(p)
                 else:
                     await p._quick_draw(event, "画窗边的你")
+                    await core.drain_drawing_tasks(p)
             p.context.llm_generate.assert_awaited_once()
             p._call_official.assert_awaited_once()
             records = [json.loads(call.args[0].split(": ", 1)[1]) for call in logs.call_args_list if ": {" in call.args[0]]
@@ -246,6 +251,7 @@ class PlannerJSONContractTests(unittest.TestCase):
                 p.context.get_provider_by_id = Mock(return_value=provider)
                 event = self.snapshot_event()
                 await p._quick_draw(event, "画窗边的你")
+                await core.drain_drawing_tasks(p)
                 self.assertEqual(len(bodies), 1)
                 p._call_official.assert_awaited_once()
                 self.assertEqual(provider.provider_config, original)

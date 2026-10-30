@@ -227,6 +227,7 @@ class DiagnosticsTests(unittest.TestCase):
             p._plan_drawing = AsyncMock(side_effect=OSError("private file path"))
             with patch("main.logger.info") as logger:
                 await p._quick_draw(core.FakeEvent("/n window"), "window")
+                await core.drain_drawing_tasks(p)
             result = self.logs(logger)[-1]
             self.assertEqual(result["phase"], "failed")
             self.assertEqual(result["exception_type"], "OSError")

@@ -65,7 +65,8 @@
         <label class="field"><span>绘图上下文来源</span><select data-config="drawing_llm_context_mode"><option value="shared">共享主会话（推荐）</option><option value="legacy">旧版最近 N 条文本</option></select><small>n 使用本轮主 Agent 快照；/n 按当前会话解析人设与技能。绘图请求单独选模型，不切换聊天模型。</small></label>
         <label class="field"><span>共享上下文字符上限</span><input data-config="drawing_llm_context_chars" type="number" min="4096" max="128000" /><small>默认 48000 字符。按完整轮次裁去旧历史，保留工具调用与结果配对；本轮内容过长时明确报错。</small></label>
         <label class="field"><span>旧文本模式的最近消息数</span><input data-config="drawing_llm_context_messages" type="number" min="0" max="30" /><small>仅旧文本模式使用；0 关闭旧历史，每条最多 2000 字符。共享模式不使用此值。</small></label>
-        <label class="field"><span>规划总超时预算（秒）</span><input data-config="drawing_llm_timeout" type="number" min="5" max="180" /><small>首次规划与一次格式纠正共同使用此预算，重试只用剩余时间；等待主模型和图片服务另计。</small></label>
+        <label class="field"><span>独立绘图排队超时（秒）</span><input data-config="drawing_llm_queue_timeout" type="number" min="1" max="3600" /><small>默认 600 秒。同一会话的 n、/n 依次出图，等待期间可以继续聊天；超时会提示，后续任务仍可执行。</small></label>
+        <label class="field"><span>规划总超时预算（秒）</span><input data-config="drawing_llm_timeout" type="number" min="5" max="180" /><small>首次规划与一次格式纠正共同使用此预算，重试只用剩余时间；等待主模型、排队和图片服务另计。</small></label>
         <label class="switch-row"><input data-config="drawing_llm_format_retry" type="checkbox" /><span><b>格式错误纠正一次</b><small>先清理可识别的包装和冗余默认字段；仍无效且预算足够才反馈纠正。拒绝、超时和网络错误停止。</small></span></label>
         <label class="switch-row"><input data-config="drawing_llm_debug" type="checkbox" /><span><b>记录绘图回包预览</b><small>排查时开启，日志和任务快照显示最多 2000 字符的绘图返回内容，可能包含画面描述。默认记录阶段耗时、Provider、输入大小、图片来源和 Token 用量，不记录正文。</small></span></label>
         <label class="switch-row"><input data-config="drawing_llm_use_images" type="checkbox" /><span><b>读取附图和按需读取成图</b><small>需要视觉模型。本轮附图最多两张；仅改图或延续画面时附带上一张成图，普通新图保留上次方案文字。成图参考最多保留 30 分钟。</small></span></label>

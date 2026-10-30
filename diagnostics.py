@@ -62,6 +62,10 @@ def console_entry(detail):
         title = "绘图选卡"
     elif phase == "plan_normalized":
         title = "绘图格式归一"
+    elif phase in {"background_submitted", "task_started", "background_cancelled"}:
+        title = "绘图队列"
+    elif phase in {"task_context_invalid", "task_history_changed"}:
+        title = "绘图会话"
     elif phase == "failed":
         title = "绘图失败"
     return title, level, row

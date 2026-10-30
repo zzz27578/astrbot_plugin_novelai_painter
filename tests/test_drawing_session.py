@@ -98,6 +98,7 @@ class DrawingSessionTests(unittest.TestCase):
                     patch("astrbot.core.astr_main_agent.build_skills_prompt", return_value="Core selected skills"):
                 skills.return_value.list_skills.return_value = [SimpleNamespace(name="painting", source_type="user")]
                 await p._quick_draw(event, "画当前场景")
+                await core.drain_drawing_tasks(p)
             call = p.context.llm_generate.await_args.kwargs
             self.assertIn("You are the elf in this chat.", call["system_prompt"])
             self.assertIn("Core selected skills", call["system_prompt"])

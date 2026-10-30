@@ -1,10 +1,23 @@
-# 2.11.1：JSON 参数修复与主模型对照测试
+# 2.11.2：后台绘图队列与主模型对照测试
 
-本版补齐 JSON 输出字段结构，并减少不必要的格式重试。继续共享当前主会话的人设和原生历史，`n` 在回复后提交后台任务，释放聊天流水线。真实的 Grok 单次规划等待仍需用同一 Provider 对照，不能以插件测试通过代替延迟实测。
+本版修复继续聊天导致后台绘图误取消，并让同一会话的 `n`、`/n` 按进入后台队列的顺序执行。保留 JSON 参数修复及共享上下文。真实的 Grok 单次规划等待仍需用同一 Provider 对照，不能以插件测试通过代替延迟实测。
+
+## 先验证本次问题
+
+更新重载后确认 **2.11.2**，保持原 Provider、协议和调用方式。
+
+1. 发送 `画一张窗边看书的画面 n`，主聊天回复后、图片尚未返回时，再发普通聊天“继续聊天，告诉我书里写了什么”。普通聊天应能继续，第一张仍对应原本的窗边画面，不再因历史变化取消。
+2. 第一张仍在运行时，再发 `画一张花园散步的画面 n`，等主回复后再发 `/n 画一张夜晚街景`。三张应按后台入队顺序完成；后两张开始规划前应等待前序任务发送或失败。普通聊天不用等队列完成。
+3. 单独测试 `/n`：发 `/n 画一张山间风景`，尚未出图时发普通聊天。主模型应正常回答，绘图也应继续；`/n` 自己不会另发聊天 AI 回复。
+4. 另开一组测试，在一张运行、另一张等待时执行真正的 reset。两张旧任务都应停止，随后新请求正常执行。无需为测试手工改历史；若核心正常发生上下文压缩，保留该阶段日志即可。
+
+检查 `background_submitted.queue_position`、`task_started.queue_wait_ms` 和 `image_end`。`holds_chat_pipeline=false` 表示独立绘图不继续占用聊天流水线；等待不消耗规划预算。新增“独立绘图排队超时”默认为 600 秒，保留默认即可，只有实际队列等待超过该值才报排队超时。
+
+`task_history_changed` 的 `status=preserved` 表示历史发生变化但保留了当前任务，沿用自己的固定上下文；`task_context_invalid.reason` 则说明真正失效的原因，如生命周期重置、对话切换或历史已清空。两者都不是新的模型 HTTP 请求。
 
 ## 最小测试
 
-更新并重载插件，确认版本 **2.11.1**，主聊天和独立绘图都选择同一个 Grok 4.7 Provider ID，并绑定同一张角色卡。本次先验证 JSON 修复，不需要为了测试更换上游或调高超时。
+更新并重载插件，确认版本 **2.11.2**，主聊天和独立绘图都选择同一个 Grok 4.7 Provider ID，并绑定同一张角色卡。要复测之前的 JSON 故障，保留 JSON 模式，不需要为了测试更换上游或调高超时。
 
 建议先用以下设置执行两次测试，无需跑完多组排列：
 
@@ -20,6 +33,7 @@
 | 读取附图和最近成图 | 首次关闭 |
 | 格式错误纠正一次 | 开启；日志能区分首次请求与唯一一次纠错 |
 | 规划超时 | 保持当前值，不因测试提高；模型 Provider 自身超时另计 |
+| 独立绘图排队超时 | 保持默认 600 秒；与图片 API 队列超时、规划预算分别计时 |
 | 记录绘图回包预览 | 开启，超时时也可保留有限正文/参数片段；测试后可关闭 |
 
 1. 在一段已有聊天中发送：`请用绑定角色卡画一张你坐在窗边看书的画面，简短回应。` 等主 Grok 直接工具出图完成。
@@ -61,6 +75,10 @@ JSON 修复的成功标准：`request.json_contract_size.chars>0`、`http_reques
 | request.request_layout=shared_session | 2.11.0 共享当前主会话的系统提示和原生历史 |
 | context_source / native_message_count / native_tool_pairs | 快照来源、实际历史消息数量及完整工具配对数量 |
 | background_submitted / holds_chat_pipeline=false | 已提交后台任务，回复钩子不继续等待绘图；此行不代表又发起了一次 HTTP 请求 |
+| background_submitted.queue_position / queue_timeout_seconds | 当前会话中入队时的位置、允许排队等待的秒数；n 和 /n 共用队列 |
+| task_started.queue_wait_ms | 真正轮到本任务时的队列等待时间，此后才开始模型规划预算 |
+| task_history_changed / status=preserved | 历史正常改变，任务仍使用固定上下文，没有因服饰缓存代次变化而取消 |
+| task_context_invalid.reason | 实际失效原因：lifecycle_changed、conversation_changed、history_cleared 或 conversation_unavailable |
 | main_http_observation.http_observable | 当前内置主 Agent 是否成功挂接实际 HTTP 观测 |
 | main_http_request / main_http_end | 主模型每次实际请求和完成；首个绘图工具之前那次才是写参数请求，生图后的回复请求要分开看 |
 | main_http_end.http_metrics.usage.cached_tokens | 上游实际返回的缓存 Token；未提供时不能判断是否命中 |
